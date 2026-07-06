@@ -88,7 +88,7 @@ rebuild, not a schema change.
 ### 2.2 Situation
 A per-work singleton Markdown scratchpad (`situation.md` at the work root, no frontmatter): the
 user's outline/instructions for the current scene. Read/written through
-`getSituation`/`putSituation` (atomic replace, optimistic `baseUpdatedAt`), tracked by the
+`getSituation`/`putSituation` (atomic replace, optimistic `baseHash` content token), tracked by the
 reconciler, change-detected via a `contentHash` row in the index `meta` table. Served over
 `GET/PUT /works/:w/situation` (03 §routes) and included in prompts as an always-full-fidelity
 region (06).
@@ -504,13 +504,17 @@ replaceSectionContent(sectionId, text, {baseHash})
     → {ok: true, contentHash} | {ok: false, conflict: {currentHash}}
 replaceSectionSpan(sectionId, {startChar, endChar}, text, {runId?, baseHash})
     → same shape                                  // span offsets are valid against baseHash's text
-putSituation(text, {baseUpdatedAt})
-    → {ok: true, updatedAt} | {ok: false, conflict: {currentText, updatedAt}}
+putSituation(text, {baseHash})
+    → {ok: true, updatedAt, hash} | {ok: false, conflict: {currentText, updatedAt, hash}}
 ```
 
 A `conflict` result is what the API surfaces as HTTP 409 and what agent commits degrade to a
-`state: "conflict"` artifact (05 §commit) — the target changed (or was consolidated away) while
-the writer worked. Sections use `contentHash` as the token; snippets use `rev`.
+`state: "conflict"` artifact (05 §commit) — the target changed while the writer worked.
+Sections use `contentHash` as the token; snippets use `rev`; the situation uses the xxh64 hash
+of its text (mtime is display-only — coarse filesystem timestamps can collide across writes).
+A target that has *vanished* (deleted or consolidated away) surfaces as a typed NotFound error
+rather than a conflict result — the conflict shape carries the current state, which a missing
+target cannot supply — and the API maps it to 404.
 
 ---
 
@@ -924,7 +928,7 @@ interface StorageService {
 
   // situation
   getSituation(): { text, updatedAt };
-  putSituation(text, { baseUpdatedAt }): OkOrConflict;
+  putSituation(text, { baseHash }): OkOrConflict;
 
   // sections
   listSections(): SectionRowSource[];               // index-backed; route inlines summary text

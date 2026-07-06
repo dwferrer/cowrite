@@ -165,7 +165,7 @@ The situation is a per-work singleton markdown scratchpad stored at `<work>/situ
 | Method & path | Req → Res | Notes |
 |---|---|---|
 | `GET /api/works/:w/situation` | → `{text, updatedAt}` | Empty string when absent. |
-| `PUT /api/works/:w/situation` | `{text, baseUpdatedAt}` → `{updatedAt}` | Atomic replace; client debounces 1 s. `409 conflict {currentText, currentUpdatedAt}` when `baseUpdatedAt` is stale (an external edit landed) — the UI shows a theirs/mine prompt instead of silent last-writer-wins. Emits `situation.changed`. |
+| `PUT /api/works/:w/situation` | `{text, baseHash}` → `{updatedAt, hash}` | Atomic replace; client debounces 1 s. `409 conflict {currentText, currentHash}` when `baseHash` is stale (an external edit landed) — the UI shows a theirs/mine prompt instead of silent last-writer-wins. Emits `situation.changed`. |
 
 ### 3.7 Tasks (agent work)
 
@@ -454,7 +454,7 @@ export const ErrorCode = z.enum([
   "validation",            // 400 — Zod issues in details
   "forbidden_host",        // 403 — Host/Origin allowlist rejection (§5.4)
   "not_found",             // 404
-  "conflict",              // 409 — stale baseRev/baseHash/baseUpdatedAt; details carry current
+  "conflict",              // 409 — stale baseRev/baseHash; details carry current
   "busy",                  // 409 — interactive lane occupied; details: {runningTaskId}
   "readonly",              // 409 — second-instance lock (02 §locking)
   "payload_too_large",     // 413

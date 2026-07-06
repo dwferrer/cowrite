@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "01J2P10000000000000001HZQA",
+  "kind": "chapter",
+  "orderKey": "a0",
+  "title": "The Lighthouse Keeper",
+  "titleSource": "agent",
+  "frozenAt": "2026-07-01T09:00:00Z",
+  "contentHash": "xxh64:4cb884f4b6e00233",
+  "enrichments": {
+    "shortSummary": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-01T10:00:00Z",
+      "sourceHash": "xxh64:4cb884f4b6e00233"
+    },
+    "longSummary": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-01T10:00:00Z",
+      "sourceHash": "xxh64:4cb884f4b6e00233"
+    },
+    "illustration": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-01T10:00:00Z",
+      "sourceHash": "xxh64:4cb884f4b6e00233",
+      "sourceWordCount": 113,
+      "entities": ["01J2N8W2KQ00000000007F3AKQ"],
+      "prompt": "lighthouse gallery at dusk, fog rolling over a small harbor",
+      "workflow": "default",
+      "workflowHash": "xxh64:00000000000000aa",
+      "seed": 7,
+      "attempts": 1,
+      "score": 8,
+      "guidance": null
+    }
+  }
+}

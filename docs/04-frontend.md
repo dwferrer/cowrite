@@ -220,7 +220,7 @@ REST surface consumed (full contract in 03 §3):
 | `GET /api/works/:w/snippets/:s/revisions` | revision cycler | full `RevisionEvent[]` |
 | `POST /api/works/:w/editing` | editor open/close signal (§7.1) | `{ snippetId: Ulid \| null }` |
 | `POST /api/works/:w/consolidations/:undoToken/undo` | undo toast (§4.3) | 409 `conflict` after grace expiry |
-| `GET /api/works/:w/situation` / `PUT …` | situation pane | `PUT` carries `baseUpdatedAt`; 409 → theirs/mine |
+| `GET /api/works/:w/situation` / `PUT …` | situation pane | `PUT` carries `baseHash`; 409 → theirs/mine |
 | `GET /api/works/:w/world` (+ entry CRUD, image upload/delete) | world panel | |
 | `POST /api/works/:w/tasks` | all agent actions | `TaskSpec` → `202 Task`; 409 `busy` / `config_missing` |
 | `POST /api/works/:w/tasks/:t/cancel` | cancel button | |
@@ -826,9 +826,9 @@ Layout grid (all widths persisted):
 - Toggle: header button or `Ctrl+;`. Width 320 px default, drag-resizable 240–480.
 - **Own scroll container**, independent of the document.
 - One markdown textarea (instruction styling, §8.2), always editable — no edit mode; it's a
-  scratchpad. Saves via `PUT /situation { text, baseUpdatedAt }`, debounced **1,000 ms** after
+  scratchpad. Saves via `PUT /situation { text, baseHash }`, debounced **1,000 ms** after
   idle plus on blur; a subtle "saved" tick confirms.
-- **Concurrency:** `baseUpdatedAt` is the `updatedAt` the pane last loaded. A 409 (the file
+- **Concurrency:** `baseHash` is the content hash the pane last loaded. A 409 (the file
   changed externally — e.g. the reconciler adopted an Obsidian edit) surfaces the standard
   theirs/mine prompt; "mine" resubmits with the fresh timestamp. An incoming
   `situation.changed` while the pane is dirty shows a "changed on disk — review" chip instead of
@@ -989,7 +989,7 @@ the document renders on sections+snippets (world decorations pop in a beat later
 | SSE drops | backoff reconnect (0.5→8 s) with `Last-Event-ID`; `resync` → invalidate all work queries; >10 s down → thin offline banner |
 | Server restarted mid-task | heartbeat loss ends the stream; streaming block shows buffered text + "connection lost"; on reconnect, task state re-derived from `GET /works/:w/runs/:r` for the watched task (run records are durable; `GET /tasks[/:t]` is in-memory and empty/404 after a restart — never polled for recovery), and keep/discard resolves via the proposal apply/discard routes (§8.4) — the run file is the durable source, so nothing expires |
 | 409 on save (stale rev/hash) | rollback optimistic write, reload, keep draft open, toast |
-| External-edit conflict | server-driven theirs/mine choice surfaces as a modal (02 §8); "mine" resubmits with fresh `baseHash`/`baseUpdatedAt`; applies to sections, world bodies, and the situation pane alike |
+| External-edit conflict | server-driven theirs/mine choice surfaces as a modal (02 §8); "mine" resubmits with a fresh `baseHash`; applies to sections, world bodies, and the situation pane alike |
 | Consolidation touches UI-referenced snippets | editor-open snippets are excluded server-side via the editing signal (§7.1); selection/peek refs to consumed ids are cleared by the reducer; orphaned crash-copy drafts surface once as recoverable text, then GC (§4.1) |
 | Undo grace expired | undo route returns 409 `conflict` → toast "Undo window has passed"; the toast also auto-dismisses at the grace deadline |
 | Edit conflict (agent run vs user edit) | inline apply-anyway/discard via proposal routes (§8.4) |

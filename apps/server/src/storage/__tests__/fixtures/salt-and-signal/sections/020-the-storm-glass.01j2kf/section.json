@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "01J2P20000000000000001J2KF",
+  "kind": "chapter",
+  "orderKey": "a1",
+  "title": "The Storm Glass",
+  "titleSource": "user",
+  "frozenAt": "2026-07-05T22:10:00Z",
+  "contentHash": "xxh64:87c907e0189e232b",
+  "enrichments": {
+    "shortSummary": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-05T22:20:00Z",
+      "sourceHash": "xxh64:17e4c38badb5b09e"
+    },
+    "longSummary": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-05T22:20:00Z",
+      "sourceHash": "xxh64:17e4c38badb5b09e"
+    },
+    "illustration": {
+      "source": "agent",
+      "runId": "01J2P300000000000000ENR001",
+      "generatedAt": "2026-07-01T10:00:00Z",
+      "sourceHash": "xxh64:87c907e0189e232b",
+      "sourceWordCount": 88,
+      "entities": ["01J2N9000000000000009B1XTE"],
+      "prompt": "a storm glass on a cluttered harbor-office shelf, crystals feathering",
+      "workflow": "default",
+      "workflowHash": "xxh64:00000000000000aa",
+      "seed": 11,
+      "attempts": 1,
+      "score": 8,
+      "guidance": null
+    }
+  }
+}

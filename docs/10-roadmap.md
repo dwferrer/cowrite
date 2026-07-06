@@ -28,6 +28,14 @@ Work/section/snippet/world/situation storage per 02: file formats, atomic writes
 fractional order keys, revision log, SQLite index + full rebuild, reconciler for external edits,
 work locking. **Demo:** create a work with the CLI/API, hand-edit files, watch the index rebuild.
 
+**The dev CLI (first-class, grows with every stage).** `apps/server` ships a `cli` entry that is
+a complete alternate front-end to the storage layer and, later, the agent harness — the primary
+tool for live testing against real models without going through the web app. Stage 1: works /
+snippets / situation / world / search / reconcile / rebuild. Stage 3 adds `continue`, `instruct`,
+`quick-edit` (streaming to stdout), `prompt render` (dump the exact assembled prompt, no model
+call), and `context preview` (fidelity map + token counts). Stages 4–5 add `consolidate`,
+`enrich`, and `illustrate`. Anything the web app can trigger, the CLI can trigger headlessly.
+
 ### Stage 2 — API + web shell
 Fastify routes and the SSE event bus per 03 (canonical `WorkEvent` union, ring buffer + resume),
 config loading (`~/.cowrite/config.jsonc`, env overrides, first-run setup screen), works list and

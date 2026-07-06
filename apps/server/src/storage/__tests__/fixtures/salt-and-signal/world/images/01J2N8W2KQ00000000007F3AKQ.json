@@ -1,0 +1,15 @@
+{
+  "source": "agent",
+  "runId": "01J2P300000000000000ENR001",
+  "generatedAt": "2026-07-03T09:15:00Z",
+  "sourceHash": null,
+  "sourceWordCount": null,
+  "entities": ["01J2N8W2KQ00000000007F3AKQ"],
+  "prompt": "portrait of a weathered lighthouse keeper, oilskin coat, lamp light",
+  "workflow": "default",
+  "workflowHash": "xxh64:00000000000000aa",
+  "seed": 3,
+  "attempts": 1,
+  "score": 7,
+  "guidance": null
+}
