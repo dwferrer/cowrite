@@ -1,0 +1,28 @@
+{
+  "name": "cowrite",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Illustrated co-writing with an LLM: a snappy web interface over a powerful agent harness.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @cowrite/server start",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

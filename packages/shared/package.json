@@ -1,0 +1,21 @@
+{
+  "name": "@cowrite/shared",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Shared Zod schemas and types: the single contract between server and web.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}
