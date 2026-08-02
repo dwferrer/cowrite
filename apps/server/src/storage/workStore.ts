@@ -20,7 +20,7 @@ import {
   worldEntriesDir,
   worldImagesDir,
 } from './lib/paths.js'
-import type { WorkSummary } from './storageTypes.js'
+import type { WorkListing } from './storageTypes.js'
 
 /**
  * Work lifecycle file store (spec 02 §2.1, §5.2, §11): create/list/trash works and
@@ -101,9 +101,10 @@ export async function writeWorkMeta(workDirPath: string, meta: WorkMeta): Promis
 /**
  * Scan every `<dataDir>/works/<slug>/work.json`. Unparsable or missing metadata yields a warning
  * entry instead of throwing — a broken work must never hide the healthy ones. Sorted by
- * slug for determinism.
+ * slug for determinism. `counts` stays null here (no SQLite in this store); the
+ * StorageService facade fills it from each work's index (read-only, lock-free).
  */
-export async function listWorks(dataDir: string): Promise<WorkSummary[]> {
+export async function listWorks(dataDir: string): Promise<WorkListing[]> {
   const root = worksRoot(dataDir)
   let entries: Dirent[]
   try {
@@ -112,13 +113,13 @@ export async function listWorks(dataDir: string): Promise<WorkSummary[]> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw err
   }
-  const summaries: WorkSummary[] = []
+  const summaries: WorkListing[] = []
   for (const entry of entries) {
     if (!entry.isDirectory()) continue
     const slug = entry.name
     try {
       const meta = await readWorkMeta(workDir(dataDir, slug))
-      summaries.push({ slug, ok: true, meta })
+      summaries.push({ slug, ok: true, meta, counts: null })
     } catch (err) {
       summaries.push({
         slug,

@@ -1,0 +1,40 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildBlocks > flattens sections (header + body) then snippets then the frontier bar 1`] = `
+[
+  {
+    "fold": "full",
+    "key": "h:01ARZ3NDEKTSV4RRFFQ69G5F01",
+    "kind": "sectionHeader",
+    "ordinal": 1,
+  },
+  {
+    "fold": "full",
+    "key": "b:01ARZ3NDEKTSV4RRFFQ69G5F01",
+    "kind": "sectionBody",
+  },
+  {
+    "fold": "full",
+    "key": "h:01ARZ3NDEKTSV4RRFFQ69G5F02",
+    "kind": "sectionHeader",
+    "ordinal": 2,
+  },
+  {
+    "fold": "full",
+    "key": "b:01ARZ3NDEKTSV4RRFFQ69G5F02",
+    "kind": "sectionBody",
+  },
+  {
+    "key": "s:01ARZ3NDEKTSV4RRFFQ69G5F51",
+    "kind": "snippet",
+  },
+  {
+    "key": "s:01ARZ3NDEKTSV4RRFFQ69G5F52",
+    "kind": "snippet",
+  },
+  {
+    "key": "frontier",
+    "kind": "frontierBar",
+  },
+]
+`;

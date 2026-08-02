@@ -8,6 +8,7 @@ import {
   type IndexDb,
   needsRebuild,
   openIndex,
+  readWorkCounts,
   type SectionRow,
   type SnippetRow,
 } from './db.js'
@@ -49,6 +50,8 @@ function makeSection(id: string, orderKey: string, parentId: string | null = nul
     illustrationHash: null,
     illustrationWidth: null,
     illustrationHeight: null,
+    shortSummary: null,
+    longSummary: null,
   }
 }
 
@@ -86,7 +89,7 @@ function makeRun(id: string, lane: 'high' | 'low', promptTokens: number | null):
 }
 
 describe('openIndex / closeIndex / needsRebuild', () => {
-  it('creates the §7.1 schema with user_version 1 and WAL mode', () => {
+  it('creates the §7.1 schema at the current user_version in WAL mode', () => {
     const db = openIndex(dbPath())
     expect(db.handle.pragma('user_version', { simple: true })).toBe(INDEX_SCHEMA_VERSION)
     expect(db.handle.pragma('journal_mode', { simple: true })).toBe('wal')
@@ -191,6 +194,43 @@ describe('query API', () => {
     expect(db.listSectionRows()).toHaveLength(3)
   })
 
+  it('round-trips the inlined summary text columns (schema v2)', () => {
+    const id = '01J2KF0000000000000000SC09'
+    db.upsertSection({
+      ...makeSection(id, 'a0'),
+      shortSummary: 'A short one.\n',
+      longSummary: 'A longer one.\n',
+    })
+    const row = db.getSection(id)
+    expect(row?.shortSummary).toBe('A short one.\n')
+    expect(row?.longSummary).toBe('A longer one.\n')
+    expect(db.listSectionRows()[0]?.shortSummary).toBe('A short one.\n')
+  })
+
+  it('workCounts matches readWorkCounts (one shared aggregate encoding)', () => {
+    db.upsertSection(makeSection('01J2KF0000000000000000SC01', 'a0')) // wordCount 10
+    db.upsertSnippet(makeSnippet('01J2KF0000000000000000SN0A', 'a0')) // wordCount 5
+    db.upsertWorldEntry(
+      {
+        id: '01J2KF0000000000000000WD01',
+        name: 'Mara',
+        shortSummary: null,
+        imagePath: null,
+        filePath: 'world/entries/mara.wd01.md',
+        updatedAt: '2026-07-09T00:00:00Z',
+      },
+      [],
+    )
+    const live = db.workCounts()
+    expect(live).toEqual({
+      snippetCount: 1,
+      sectionCount: 1,
+      wordCount: 15,
+      updatedAt: '2026-07-09T00:00:00Z',
+    })
+    expect(readWorkCounts(dbPath())).toEqual(live)
+  })
+
   it('staleSections returns only rows with a stale flag set', () => {
     const fresh = '01J2KF0000000000000000SC04'
     const stale = '01J2KF0000000000000000SC05'
@@ -290,5 +330,62 @@ describe('query API', () => {
     expect(db.listFileRows()).toEqual([{ ...row, size: 11 }])
     db.deleteFile('work.json')
     expect(db.getFile('work.json')).toBeNull()
+  })
+})
+
+describe('readWorkCounts (works-list, read-only, no lock)', () => {
+  it('returns null for a missing index and for a foreign schema version', () => {
+    expect(readWorkCounts(dbPath())).toBeNull()
+    const db = openIndex(dbPath())
+    db.handle.pragma(`user_version = ${INDEX_SCHEMA_VERSION + 1}`)
+    closeIndex(db)
+    expect(readWorkCounts(dbPath())).toBeNull()
+  })
+
+  it('aggregates counts, word totals and max(updated_at) across snippets ∪ world', () => {
+    const db = openIndex(dbPath())
+    db.upsertSection(makeSection('01J2KF0000000000000000SC01', 'a0')) // wordCount 10
+    db.upsertSnippet(makeSnippet('01J2KF0000000000000000SN0A', 'a0')) // wordCount 5
+    db.upsertSnippet(makeSnippet('01J2KF0000000000000000SN0B', 'a1')) // wordCount 5
+    db.upsertWorldEntry(
+      {
+        id: '01J2KF0000000000000000WD01',
+        name: 'Mara',
+        shortSummary: null,
+        imagePath: null,
+        filePath: 'world/entries/mara.wd01.md',
+        updatedAt: '2026-07-09T00:00:00Z', // later than the snippets' updated_at
+      },
+      [],
+    )
+    closeIndex(db)
+    expect(readWorkCounts(dbPath())).toEqual({
+      snippetCount: 2,
+      sectionCount: 1,
+      wordCount: 20,
+      updatedAt: '2026-07-09T00:00:00Z',
+    })
+  })
+
+  it('answers while a writer connection holds the WAL database open', () => {
+    const writer = openIndex(dbPath())
+    try {
+      writer.upsertSnippet(makeSnippet('01J2KF0000000000000000SN0C', 'a0'))
+      const counts = readWorkCounts(dbPath())
+      expect(counts?.snippetCount).toBe(1)
+      expect(counts?.updatedAt).toBe('2026-07-06T00:00:00Z')
+    } finally {
+      closeIndex(writer)
+    }
+  })
+
+  it('reads null updatedAt from an empty index', () => {
+    closeIndex(openIndex(dbPath()))
+    expect(readWorkCounts(dbPath())).toEqual({
+      snippetCount: 0,
+      sectionCount: 0,
+      wordCount: 0,
+      updatedAt: null,
+    })
   })
 })

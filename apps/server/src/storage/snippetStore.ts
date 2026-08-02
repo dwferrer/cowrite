@@ -437,6 +437,22 @@ export async function restoreSnippet(
 }
 
 /**
+ * Delete a frontier snippet: the .md file AND its revision log go together (03 §3.3 —
+ * the log is the snippet's history, not an independent artifact; frontier deletes are
+ * deliberate user actions, so the §8 never-delete rule that binds the reconciler does
+ * not apply). Throws SnippetNotFoundError when the snippet is not in the frontier.
+ */
+export async function deleteSnippet(
+  workDirPath: string,
+  snippetId: string,
+  opts: { filePathHint?: string } = {},
+): Promise<void> {
+  const current = await readSnippet(workDirPath, snippetId, opts.filePathHint)
+  await fsp.rm(current.filePath, { force: true })
+  await fsp.rm(revisionLogPath(workDirPath, snippetId), { force: true })
+}
+
+/**
  * All revision events for a snippet, oldest first. Torn-tail tolerant via readJsonl
  * (§9.1); a missing log reads as empty. Lines that parse as JSON but fail the schema
  * indicate real corruption and throw.

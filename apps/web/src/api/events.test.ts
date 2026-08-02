@@ -1,0 +1,478 @@
+import type { SectionRow, SnippetDto } from '@cowrite/shared'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { renderHook, waitFor } from '@testing-library/react'
+import { createElement } from 'react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useDocUiStore } from '../state/docUiStore.js'
+import { applyWorkEvent, useWorkEvents, useWorkStatusStore } from './events.js'
+import { qk } from './queries.js'
+
+vi.mock('./editingSignal.js', () => ({ signalEditing: vi.fn() }))
+
+import { signalEditing } from './editingSignal.js'
+
+const W = '01ARZ3NDEKTSV4RRFFQ69G5FA0'
+const S1 = '01ARZ3NDEKTSV4RRFFQ69G5FA1'
+const S2 = '01ARZ3NDEKTSV4RRFFQ69G5FA2'
+const S3 = '01ARZ3NDEKTSV4RRFFQ69G5FA3'
+const NOW = '2026-08-02T00:00:00.000Z'
+const HASH_A = 'xxh64:0123456789abcdef'
+const HASH_B = 'xxh64:fedcba9876543210'
+
+function snippet(id: string, orderKey: string, rev = 1, text = 'text'): SnippetDto {
+  return {
+    id,
+    orderKey,
+    text,
+    rev,
+    authorship: 'user',
+    originRunId: null,
+    updatedAt: NOW,
+    revisionCount: rev,
+  }
+}
+
+function section(id: string, over: Partial<SectionRow> = {}): SectionRow {
+  return {
+    id,
+    parentId: null,
+    kind: 'chapter',
+    orderKey: 'a0',
+    title: 'Chapter',
+    titleSource: 'agent',
+    isLeaf: true,
+    wordCount: 100,
+    contentHash: HASH_A,
+    shortSummary: null,
+    longSummary: null,
+    illustration: null,
+    stale: { short: false, long: false, illustration: false },
+    ...over,
+  }
+}
+
+function makeClient(): QueryClient {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } })
+}
+
+beforeEach(() => {
+  useWorkStatusStore.getState().reset()
+  useDocUiStore.setState({ selection: null, editing: null, peekRevision: null, followBottom: true })
+  vi.mocked(signalEditing).mockClear()
+})
+
+describe('applyWorkEvent — storage-originated rows (04 §4.3)', () => {
+  it('snippet.created inserts by orderKey and dedupes the SSE echo', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.snippets(W), [snippet(S1, 'a0'), snippet(S3, 'c0')])
+
+    applyWorkEvent(qc, W, { type: 'snippet.created', snippet: snippet(S2, 'b0') })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))?.map((s) => s.id)).toEqual([S1, S2, S3])
+
+    // echo of our own POST: same id again — unchanged
+    applyWorkEvent(qc, W, { type: 'snippet.created', snippet: snippet(S2, 'b0') })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))).toHaveLength(3)
+  })
+
+  it('snippet.revised patches the item, skips stale echoes, drops the revisions query', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    qc.setQueryData(qk.snippets(W), [snippet(S1, 'a0', 2, 'old')])
+
+    applyWorkEvent(qc, W, { type: 'snippet.revised', snippet: snippet(S1, 'a0', 3, 'new') })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))?.[0]?.text).toBe('new')
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.revisions(W, S1) })
+
+    // echo with the same rev — no downgrade
+    applyWorkEvent(qc, W, { type: 'snippet.revised', snippet: snippet(S1, 'a0', 3, 'other') })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))?.[0]?.text).toBe('new')
+  })
+
+  it('snippet.deleted removes the item and clears dangling docUi refs', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.snippets(W), [snippet(S1, 'a0'), snippet(S2, 'b0')])
+    useDocUiStore.setState({
+      selection: { kind: 'snippet', id: S1 },
+      peekRevision: { snippetId: S1, rev: 1 },
+    })
+
+    applyWorkEvent(qc, W, { type: 'snippet.deleted', id: S1 })
+
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))?.map((s) => s.id)).toEqual([S2])
+    expect(useDocUiStore.getState().selection).toBeNull()
+    expect(useDocUiStore.getState().peekRevision).toBeNull()
+  })
+
+  it('section.changed patches the row and invalidates sectionText only on hash change', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    qc.setQueryData(qk.sections(W), [section(S1)])
+
+    // same hash — no content invalidation
+    applyWorkEvent(qc, W, {
+      type: 'section.changed',
+      section: section(S1, { title: 'Renamed' }),
+    })
+    expect(qc.getQueryData<SectionRow[]>(qk.sections(W))?.[0]?.title).toBe('Renamed')
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: qk.sectionText(W, S1) })
+
+    // hash change — content invalidated
+    applyWorkEvent(qc, W, {
+      type: 'section.changed',
+      section: section(S1, { contentHash: HASH_B }),
+    })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sectionText(W, S1) })
+  })
+
+  it('sections.restructured invalidates the tree', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    applyWorkEvent(qc, W, { type: 'sections.restructured' })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
+  })
+
+  it('consolidation.applied invalidates sections + snippets and clears refs', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    useDocUiStore.setState({ selection: { kind: 'section', id: S2 } })
+
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S2],
+      title: 'Chapter 3',
+      undoToken: 'tok',
+    })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
+    expect(useDocUiStore.getState().selection).toBeNull()
+  })
+
+  it('consolidation.undone invalidates sections + snippets', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    applyWorkEvent(qc, W, { type: 'consolidation.undone', sectionIds: [S2] })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
+  })
+
+  it('enrichment.updated patches the inlined section row', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.sections(W), [section(S1)])
+
+    applyWorkEvent(qc, W, {
+      type: 'enrichment.updated',
+      sectionId: S1,
+      kind: 'short',
+      section: section(S1, { shortSummary: 'A crossing at night.' }),
+    })
+
+    expect(qc.getQueryData<SectionRow[]>(qk.sections(W))?.[0]?.shortSummary).toBe(
+      'A crossing at night.',
+    )
+  })
+
+  it('world.changed invalidates the world list', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    applyWorkEvent(qc, W, { type: 'world.changed', entryId: S1 })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.world(W) })
+  })
+
+  it('situation.changed patches the cache (incl. hash) when the pane is clean', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.situation(W), { text: 'old', updatedAt: NOW, hash: HASH_A })
+    useWorkStatusStore.getState().setSituationAcked({ text: 'old', hash: HASH_A })
+
+    applyWorkEvent(qc, W, { type: 'situation.changed', text: 'new', updatedAt: NOW, hash: HASH_B })
+
+    expect(qc.getQueryData<{ text: string; hash: string }>(qk.situation(W))).toMatchObject({
+      text: 'new',
+      hash: HASH_B,
+    })
+    expect(useWorkStatusStore.getState().situationAcked).toEqual({ text: 'new', hash: HASH_B })
+    expect(useWorkStatusStore.getState().situationChangedOnDisk).toBeNull()
+  })
+
+  it('situation.changed shows the changed-on-disk chip when the pane is dirty', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.situation(W), { text: 'old', updatedAt: NOW, hash: HASH_A })
+    useWorkStatusStore.getState().setSituationAcked({ text: 'old', hash: HASH_A })
+    useWorkStatusStore.getState().setSituationDirty(true)
+
+    applyWorkEvent(qc, W, { type: 'situation.changed', text: 'disk', updatedAt: NOW, hash: HASH_B })
+
+    // cache untouched — never clobber unsaved edits
+    expect(qc.getQueryData<{ text: string }>(qk.situation(W))?.text).toBe('old')
+    expect(useWorkStatusStore.getState().situationChangedOnDisk).toEqual({
+      text: 'disk',
+      updatedAt: NOW,
+      hash: HASH_B,
+    })
+  })
+
+  it('situation.changed matching the acked hash is a self-echo: no chip, no patch', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.situation(W), { text: 'mine', updatedAt: NOW, hash: HASH_A })
+    useWorkStatusStore.getState().setSituationAcked({ text: 'mine', hash: HASH_A })
+    useWorkStatusStore.getState().setSituationDirty(true) // even while dirty
+
+    applyWorkEvent(qc, W, { type: 'situation.changed', text: 'mine', updatedAt: NOW, hash: HASH_A })
+
+    expect(useWorkStatusStore.getState().situationChangedOnDisk).toBeNull()
+  })
+
+  it('situation.changed matching the in-flight save text is suppressed too', () => {
+    const qc = makeClient()
+    useWorkStatusStore.getState().setSituationAcked({ text: 'old', hash: HASH_A })
+    useWorkStatusStore.getState().setSituationDirty(true)
+    useWorkStatusStore.getState().setSituationInFlightText('being saved')
+
+    // the echo of the in-flight PUT can outrun its HTTP response
+    applyWorkEvent(qc, W, {
+      type: 'situation.changed',
+      text: 'being saved',
+      updatedAt: NOW,
+      hash: HASH_B,
+    })
+
+    expect(useWorkStatusStore.getState().situationChangedOnDisk).toBeNull()
+  })
+
+  it('readonly.changed sets the banner and patches the work detail', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.work(W), { id: W, readonly: false })
+
+    applyWorkEvent(qc, W, { type: 'readonly.changed', readonly: true, reason: 'second instance' })
+
+    expect(useWorkStatusStore.getState().readonlyBanner).toEqual({
+      readonly: true,
+      reason: 'second instance',
+    })
+    expect(qc.getQueryData<{ readonly: boolean }>(qk.work(W))?.readonly).toBe(true)
+  })
+
+  it('resync triggers the broad invalidation sweep', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    applyWorkEvent(qc, W, { type: 'resync' })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.work(W) })
+  })
+
+  it('the first hello and a same-stream hello (reconnect, no gap) do NOT refetch', () => {
+    // Regression: `hello` used to invalidate everything on every connection, turning
+    // every clean reconnect into a full refetch storm.
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-1', seq: 0 })
+    expect(invalidate).not.toHaveBeenCalled()
+    expect(useWorkStatusStore.getState().eventCursor).toEqual({ streamId: 'stream-1', seq: 0 })
+
+    // the same stream continuing after a reconnect — replay covered any gap
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-1', seq: 7 })
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
+  it('a genuinely new stream invalidates work queries EXCEPT sectionText', async () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-1', seq: 3 })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-2', seq: 0 })
+
+    expect(invalidate).toHaveBeenCalledTimes(1)
+    const filters = invalidate.mock.calls[0]?.[0] as {
+      queryKey: unknown
+      predicate: (q: { queryKey: readonly unknown[] }) => boolean
+    }
+    expect(filters.queryKey).toEqual(qk.work(W))
+    expect(filters.predicate({ queryKey: qk.sections(W) })).toBe(true)
+    expect(filters.predicate({ queryKey: qk.sectionText(W, S1) })).toBe(false)
+  })
+
+  it('new-stream invalidation waits for in-flight mutations (optimistic delete survives)', async () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-1', seq: 3 })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    // an optimistic delete's DELETE is still on the wire
+    let resolveMutation: (() => void) | undefined
+    const mutation = qc.getMutationCache().build(qc, {
+      mutationFn: () =>
+        new Promise<void>((resolve) => {
+          resolveMutation = resolve
+        }),
+    })
+    const done = mutation.execute(undefined)
+    await waitFor(() => expect(qc.isMutating()).toBe(1))
+
+    applyWorkEvent(qc, W, { type: 'hello', streamId: 'stream-2', seq: 0 })
+    expect(invalidate).not.toHaveBeenCalled() // deferred — nothing resurrected
+
+    resolveMutation?.()
+    await done
+    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1))
+  })
+
+  it('task.* events are Stage 3 no-ops that touch nothing', () => {
+    const qc = makeClient()
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    const setData = vi.spyOn(qc, 'setQueryData')
+
+    applyWorkEvent(qc, W, {
+      type: 'task.delta',
+      taskId: S1,
+      target: 'frontier',
+      text: 'The ferry…',
+    })
+    applyWorkEvent(qc, W, { type: 'task.completed', taskId: S1 })
+
+    expect(invalidate).not.toHaveBeenCalled()
+    expect(setData).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Hook wiring with a fake EventSource
+// ---------------------------------------------------------------------------
+
+class FakeEventSource {
+  static CONNECTING = 0 as const
+  static OPEN = 1 as const
+  static CLOSED = 2 as const
+  static instances: FakeEventSource[] = []
+
+  url: string
+  readyState = 0
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  listeners = new Map<string, ((evt: MessageEvent<string>) => void)[]>()
+  closed = false
+
+  constructor(url: string) {
+    this.url = url
+    FakeEventSource.instances.push(this)
+  }
+
+  addEventListener(type: string, listener: (evt: MessageEvent<string>) => void): void {
+    const existing = this.listeners.get(type) ?? []
+    this.listeners.set(type, [...existing, listener])
+  }
+
+  close(): void {
+    this.closed = true
+    this.readyState = 2
+  }
+
+  emit(type: string, data: unknown, lastEventId = ''): void {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener({ data: JSON.stringify(data), lastEventId } as MessageEvent<string>)
+    }
+  }
+}
+
+describe('useWorkEvents', () => {
+  it('opens one EventSource, applies parsed events, and cleans up on unmount', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    FakeEventSource.instances = []
+    const qc = makeClient()
+    qc.setQueryData(qk.snippets(W), [snippet(S1, 'a0')])
+
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      createElement(QueryClientProvider, { client: qc }, children)
+
+    const factory = (url: string) => new FakeEventSource(url) as unknown as EventSource
+    const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
+      wrapper,
+    })
+
+    // StrictMode-free render: exactly one connection to the events route
+    expect(FakeEventSource.instances).toHaveLength(1)
+    const source = FakeEventSource.instances[0] as FakeEventSource
+    expect(source.url).toBe(`/api/works/${W}/events`)
+
+    source.onopen?.()
+    expect(useWorkStatusStore.getState().connected).toBe(true)
+
+    source.emit('snippet.created', { type: 'snippet.created', snippet: snippet(S2, 'b0') })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))?.map((s) => s.id)).toEqual([S1, S2])
+
+    // a malformed payload is dropped (logged in dev), not thrown
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    source.emit('snippet.created', { type: 'snippet.created', snippet: { id: 'nope' } })
+    expect(qc.getQueryData<SnippetDto[]>(qk.snippets(W))).toHaveLength(2)
+    expect(consoleError).toHaveBeenCalled()
+    consoleError.mockRestore()
+
+    unmount()
+    expect(source.closed).toBe(true)
+    expect(useWorkStatusStore.getState().connected).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('schedules a backoff reconnect and resumes via the ?lastEventId query param', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    vi.useFakeTimers()
+    FakeEventSource.instances = []
+    const qc = makeClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      createElement(QueryClientProvider, { client: qc }, children)
+    const factory = (url: string) => new FakeEventSource(url) as unknown as EventSource
+
+    const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
+      wrapper,
+    })
+
+    const first = FakeEventSource.instances[0] as FakeEventSource
+    // deliver one event carrying an SSE id — that becomes the resume cursor
+    first.emit(
+      'snippet.created',
+      { type: 'snippet.created', snippet: snippet(S2, 'b0') },
+      'stream-1:5',
+    )
+    expect(useWorkStatusStore.getState().eventCursor).toEqual({ streamId: 'stream-1', seq: 5 })
+
+    first.readyState = 2 // CLOSED — the browser gave up
+    first.onerror?.()
+
+    expect(FakeEventSource.instances).toHaveLength(1)
+    vi.advanceTimersByTime(500) // first backoff step
+    expect(FakeEventSource.instances).toHaveLength(2)
+    // a manual reconnect cannot set Last-Event-ID — the query param carries the cursor
+    const second = FakeEventSource.instances[1] as FakeEventSource
+    expect(second.url).toBe(
+      `/api/works/${W}/events?lastEventId=${encodeURIComponent('stream-1:5')}`,
+    )
+
+    unmount()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('re-asserts the editing signal on every open while a snippet editor is open', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    FakeEventSource.instances = []
+    const qc = makeClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      createElement(QueryClientProvider, { client: qc }, children)
+    const factory = (url: string) => new FakeEventSource(url) as unknown as EventSource
+
+    const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
+      wrapper,
+    })
+    useDocUiStore.setState({
+      editing: { kind: 'snippet', id: S1, workId: W, draft: 'mid-edit' },
+    })
+    vi.mocked(signalEditing).mockClear()
+
+    // Regression: the server clears the signal at zero SSE subscribers, so a reconnect
+    // must re-POST the open editor or consolidation could eat the passage being edited.
+    const source = FakeEventSource.instances[0] as FakeEventSource
+    source.onopen?.()
+    expect(signalEditing).toHaveBeenCalledWith(W, S1)
+
+    unmount()
+    vi.unstubAllGlobals()
+  })
+})

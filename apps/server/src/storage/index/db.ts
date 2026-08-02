@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
  * rebuild-needed check (§7.3), and a thin typed query API for §7.2's consumers.
  */
 
-export const INDEX_SCHEMA_VERSION = 1
+export const INDEX_SCHEMA_VERSION = 2
 
 // DDL exactly per spec 02 §7.1 (user_version is set by openIndex in the same transaction).
 const DDL = `
@@ -40,7 +40,9 @@ CREATE TABLE sections (
   illustration_stale  INTEGER NOT NULL DEFAULT 0,
   illustration_hash   TEXT,             -- xxh64 of the PNG bytes => SectionRow.illustrationVersion
   illustration_width  INTEGER,          -- pixel dims, read from the PNG header at index time
-  illustration_height INTEGER
+  illustration_height INTEGER,
+  short_summary TEXT,                   -- summary-*.md text, inlined so GET /sections and the
+  long_summary  TEXT                    -- SSE hydrator answer with zero per-row file reads (v2)
 );
 CREATE INDEX ix_sections_tree ON sections(parent_id, order_key);
 
@@ -120,6 +122,10 @@ export interface SectionRow {
   illustrationHash: string | null
   illustrationWidth: number | null
   illustrationHeight: number | null
+  /** summary-short.md text (null = no file) — inlined per v2 so reads skip the files. */
+  shortSummary: string | null
+  /** summary-long.md text (null = no file). */
+  longSummary: string | null
 }
 
 export interface SnippetRow {
@@ -225,7 +231,8 @@ const SECTION_SELECT = `SELECT id, parent_id AS parentId, kind, order_key AS ord
   content_hash AS contentHash, frozen_at AS frozenAt,
   short_summary_stale AS shortSummaryStale, long_summary_stale AS longSummaryStale,
   illustration_stale AS illustrationStale, illustration_hash AS illustrationHash,
-  illustration_width AS illustrationWidth, illustration_height AS illustrationHeight
+  illustration_width AS illustrationWidth, illustration_height AS illustrationHeight,
+  short_summary AS shortSummary, long_summary AS longSummary
 FROM sections`
 
 const SNIPPET_SELECT = `SELECT id, order_key AS orderKey, authorship, origin_run_id AS originRunId,
@@ -241,6 +248,19 @@ const RUN_SELECT = `SELECT id, kind, lane, model, started_at AS startedAt, ended
   status, prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
   file_path AS filePath
 FROM agent_runs`
+
+/** The ONE encoding of the works-list/WorkDetail aggregates (03 §3.1): counts, total
+ *  words (frontier snippets + section prose), and max(updated_at) across snippets ∪
+ *  world entries (null on an empty work). Shared by `IndexDb.workCounts` (open handle)
+ *  and `readWorkCounts` (read-only, no lock) so the two can never drift. */
+const WORK_COUNTS_SQL = `SELECT
+  (SELECT COUNT(*) FROM snippets) AS snippetCount,
+  (SELECT COUNT(*) FROM sections) AS sectionCount,
+  (SELECT COALESCE(SUM(word_count), 0) FROM snippets)
+    + (SELECT COALESCE(SUM(word_count), 0) FROM sections) AS wordCount,
+  (SELECT MAX(u) FROM (
+     SELECT MAX(updated_at) AS u FROM snippets
+     UNION ALL SELECT MAX(updated_at) FROM world_entries)) AS updatedAt`
 
 /** Quote each whitespace-separated token as an FTS5 phrase, restricted to title+body. */
 function toFtsMatch(query: string): string | null {
@@ -337,8 +357,9 @@ export class IndexDb {
     this.prepare(
       `INSERT OR REPLACE INTO sections (id, parent_id, kind, order_key, title, title_source,
         dir_path, word_count, content_hash, frozen_at, short_summary_stale, long_summary_stale,
-        illustration_stale, illustration_hash, illustration_width, illustration_height)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        illustration_stale, illustration_hash, illustration_width, illustration_height,
+        short_summary, long_summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       row.id,
       row.parentId,
@@ -356,6 +377,8 @@ export class IndexDb {
       row.illustrationHash,
       row.illustrationWidth,
       row.illustrationHeight,
+      row.shortSummary,
+      row.longSummary,
     )
   }
 
@@ -548,6 +571,11 @@ export class IndexDb {
     }))
   }
 
+  /** The works-list/WorkDetail aggregates off this open index (one shared encoding). */
+  workCounts(): WorkCounts {
+    return this.prepare(WORK_COUNTS_SQL).get() as WorkCounts
+  }
+
   /** Token sums grouped by lane and kind — the usage panel's query (§7.2). */
   usageByLane(): LaneUsageRow[] {
     return this.prepare(
@@ -594,7 +622,9 @@ export class IndexDb {
 
 /**
  * Open (creating if absent) the index at `indexPath` in WAL mode. A fresh database gets
- * the §7.1 DDL and `PRAGMA user_version = 1` in one transaction. An existing database
+ * the §7.1 DDL and `PRAGMA user_version = INDEX_SCHEMA_VERSION` in one transaction (the
+ * mismatch on an old file is what routes it through the §7.3 full rebuild). An existing
+ * database
  * with a different user_version throws — callers must check `needsRebuild` first and
  * delete the file before reopening (§7.3).
  */
@@ -619,6 +649,38 @@ export function openIndex(indexPath: string): IndexDb {
   } catch (err) {
     db.close()
     throw err
+  }
+}
+
+/** Cheap works-list aggregates for one work, read straight off its index (03 §3.1). */
+export interface WorkCounts {
+  snippetCount: number
+  sectionCount: number
+  /** Total words: frontier snippets + section prose (the index word_count columns). */
+  wordCount: number
+  /** max(updated_at) across snippets and world entries; null when the work is empty. */
+  updatedAt: string | null
+}
+
+/**
+ * Read the works-list counts from an existing `.cowrite/index.sqlite` via a READ-ONLY
+ * connection — no work lock, no reconcile, no writes (this feeds the works-list screen,
+ * which must stay fast and must never contend with a live writer). Returns null when the
+ * index is missing, on a different schema version, or unreadable — callers surface null
+ * counts rather than opening the work.
+ */
+export function readWorkCounts(indexPath: string): WorkCounts | null {
+  if (!fs.existsSync(indexPath)) return null
+  let db: Database.Database | null = null
+  try {
+    db = new Database(indexPath, { readonly: true, fileMustExist: true })
+    const version = db.pragma('user_version', { simple: true }) as number
+    if (version !== INDEX_SCHEMA_VERSION) return null
+    return db.prepare(WORK_COUNTS_SQL).get() as WorkCounts
+  } catch {
+    return null // corrupt/locked-out index: the works list shows the work without counts
+  } finally {
+    db?.close()
   }
 }
 

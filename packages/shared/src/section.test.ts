@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { BoundaryProposal, ConsolidatedSnippet, SectionMeta } from './section.js'
+import {
+  BoundaryProposal,
+  ConsolidatedSnippet,
+  SectionContent,
+  SectionContentPatch,
+  SectionMeta,
+  SectionRow,
+  SummariesUpdate,
+} from './section.js'
 
 const sectionId = '01J2KF3M8QAB4CD5W0ZNXGT7R9'
 const runId = '01J2P5H8A3N1Y7S4QE2GBV6MKD'
@@ -132,5 +140,55 @@ describe('BoundaryProposal', () => {
   it('rejects a boundary with an invalid snippet id (agent garbage is Zod-gated, 02 §12)', () => {
     const bad = { boundaries: [{ afterSnippetId: 'snippet-7', kind: 'chapter', title: 'X' }] }
     expect(BoundaryProposal.safeParse(bad).success).toBe(false)
+  })
+})
+
+describe('SectionRow (03 §3.2 / 04 §4.5 DTO)', () => {
+  const row = {
+    id: sectionId,
+    parentId: null,
+    kind: 'chapter',
+    orderKey: 'a1',
+    title: 'The Ferry',
+    titleSource: 'agent',
+    isLeaf: true,
+    wordCount: 3200,
+    contentHash: 'xxh64:0123456789abcdef',
+    shortSummary: 'Mara crosses at night; the glass cracks.',
+    longSummary: null, // scene-level: lazy via GET …/summaries
+    illustration: { version: 'xxh64:fedcba9876543210', width: 1024, height: 640 },
+    stale: { short: false, long: true, illustration: false },
+  }
+
+  it('round-trips a leaf row with a nested illustration descriptor', () => {
+    expect(SectionRow.parse(row)).toEqual(row)
+  })
+
+  it('illustration null = none, including user-suppressed', () => {
+    expect(SectionRow.parse({ ...row, illustration: null }).illustration).toBeNull()
+  })
+
+  it('requires the full stale-flags object', () => {
+    expect(SectionRow.safeParse({ ...row, stale: { short: false } }).success).toBe(false)
+    expect(
+      SectionRow.safeParse({ ...row, illustration: { version: 'v1', width: 1024 } }).success,
+    ).toBe(false)
+  })
+})
+
+describe('SectionContent / SummariesUpdate', () => {
+  it('content carries the optimistic-concurrency hash both ways', () => {
+    const content = { markdown: '# Ch. 7\n\nMara…', contentHash: 'xxh64:0123456789abcdef' }
+    expect(SectionContent.parse(content)).toEqual(content)
+    expect(
+      SectionContentPatch.parse({ markdown: 'new text', baseHash: 'xxh64:0123456789abcdef' })
+        .baseHash,
+    ).toBe('xxh64:0123456789abcdef')
+    expect(SectionContentPatch.safeParse({ markdown: 'new text' }).success).toBe(false)
+  })
+
+  it('summaries update is partial: either side may be omitted', () => {
+    expect(SummariesUpdate.parse({})).toEqual({})
+    expect(SummariesUpdate.parse({ short: 'A tighter hook.' }).long).toBeUndefined()
   })
 })

@@ -13,6 +13,7 @@
     "build": "pnpm -r build",
     "start": "pnpm --filter @cowrite/server start",
     "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @cowrite/web test:e2e",
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."

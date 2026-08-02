@@ -16,3 +16,17 @@ export const SituationDto = z.object({
   hash: Hash,
 })
 export type SituationDto = z.infer<typeof SituationDto>
+
+/** PUT /situation body (03 §3.6) — atomic replace; 409 conflict carries theirs/mine. */
+export const SituationPut = z.object({
+  text: z.string(),
+  baseHash: Hash.nullable(), // null on the first write (no situation.md yet)
+})
+export type SituationPut = z.infer<typeof SituationPut>
+
+/** PUT /situation response. */
+export const SituationPutRes = z.object({
+  updatedAt: IsoTime,
+  hash: Hash,
+})
+export type SituationPutRes = z.infer<typeof SituationPutRes>

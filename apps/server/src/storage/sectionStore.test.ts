@@ -10,6 +10,7 @@ import {
   clearSuppression,
   findSection,
   getSectionContent,
+  getSummaries,
   putIllustration,
   putSummary,
   readSectionMeta,
@@ -316,6 +317,27 @@ describe('putSummary', () => {
     await expect(
       putSummary(workDir, meta.id, 'short', 'x', { source: 'agent', runId: ulid() }),
     ).rejects.toThrow(/leaf-only/)
+  })
+})
+
+describe('getSummaries', () => {
+  it('reads both summary files, null for missing ones (03 §3.2 lazy fetch)', async () => {
+    const meta = newMeta('a0')
+    await makeSection(sectionsDir(workDir), 10, 'ch', meta, 'prose here')
+    expect(await getSummaries(workDir, meta.id)).toEqual({ short: null, long: null })
+
+    await putSummary(workDir, meta.id, 'short', 'S text', { source: 'user' })
+    expect(await getSummaries(workDir, meta.id)).toEqual({ short: 'S text', long: null })
+
+    await putSummary(workDir, meta.id, 'long', 'L text', { source: 'agent', runId: ulid() })
+    expect(await getSummaries(workDir, meta.id)).toEqual({ short: 'S text', long: 'L text' })
+  })
+
+  it('reads null/null on an interior section and throws for unknown ids', async () => {
+    const meta = newMeta('a0', { kind: 'part' })
+    await makeSection(sectionsDir(workDir), 10, 'part', meta)
+    expect(await getSummaries(workDir, meta.id)).toEqual({ short: null, long: null })
+    await expect(getSummaries(workDir, ulid())).rejects.toBeInstanceOf(SectionNotFoundError)
   })
 })
 

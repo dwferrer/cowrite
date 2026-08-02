@@ -342,6 +342,23 @@ export async function putSummary(
 }
 
 /**
+ * Read both summary files for a section — the GET …/summaries lazy fetch (03 §3.2).
+ * A missing file reads as null (never generated, or an interior section); staleness is
+ * the index's concern, not this read's. Throws SectionNotFoundError for unknown ids.
+ */
+export async function getSummaries(
+  workDirPath: string,
+  sectionId: string,
+  dirPathHint?: string,
+): Promise<{ short: string | null; long: string | null }> {
+  const node = await findSection(workDirPath, sectionId, dirPathHint)
+  return {
+    short: await readIfExists(summaryPath(node.dirPath, 'short')),
+    long: await readIfExists(summaryPath(node.dirPath, 'long')),
+  }
+}
+
+/**
  * Atomic PNG write + IllustrationMeta into section.json's illustration slot (§2.5).
  * Overwrites any prior image or tombstone — an explicit put is the user/pipeline intent.
  */

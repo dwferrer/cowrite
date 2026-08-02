@@ -7,6 +7,7 @@ import type {
   WorkMeta,
   WorldEntryMeta,
 } from '@cowrite/shared'
+import type { SnippetRow, WorkCounts } from './index/db.js'
 
 /**
  * Shared-internal result and row types for the entity file stores (spec 02 §6.6, §11).
@@ -42,14 +43,30 @@ export type SituationWriteResult = OkOrConflict<
   { currentText: string; updatedAt: IsoTime; hash: Hash }
 >
 
+/** upsertWorldEntry — token is the xxh64 of the entry's current BODY (03 §3.5 PATCH
+ *  `baseHash`; mirrors sections' shape). No token ⇒ last-write-wins, as before. */
+export type WorldEntryWriteResult = OkOrConflict<
+  { entry: WorldEntry },
+  { currentHash: Hash; currentText: string }
+>
+
 // ---------------------------------------------------------------------------
 // Store row sources
 // ---------------------------------------------------------------------------
 
-/** One entry per `works/*` directory; unparsable works surface as warnings, never throw. */
-export type WorkSummary =
-  | { slug: string; ok: true; meta: WorkMeta }
+/**
+ * One entry per `works/*` directory; unparsable works surface as warnings, never throw.
+ * (Named WorkListing because the shared DTO owns the name `WorkSummary` — 03 §3.1.)
+ * `counts` are cheap works-list numbers read from the work's existing index without the
+ * work lock; null when the index is absent, stale-versioned, or unreadable. The store
+ * fills `counts: null`; the StorageService facade populates it.
+ */
+export type WorkListing =
+  | { slug: string; ok: true; meta: WorkMeta; counts: WorkCounts | null }
   | { slug: string; ok: false; warning: string }
+
+/** Frontier snippet index row joined with its full text — the SnippetDto source (03 §3.3). */
+export type SnippetWithText = SnippetRow & { text: string }
 
 /** Parsed frontier snippet file — the source a SQLite `snippets` row is built from (§7.1). */
 export interface SnippetFile {

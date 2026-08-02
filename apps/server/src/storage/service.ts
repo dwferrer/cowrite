@@ -11,8 +11,12 @@ import type {
   SituationDto,
   SnippetMeta,
   WorkMeta,
+  WorkSettings,
 } from '@cowrite/shared'
-import { IllustrationMeta as IllustrationMetaSchema } from '@cowrite/shared'
+import {
+  IllustrationMeta as IllustrationMetaSchema,
+  WorkMeta as WorkMetaSchema,
+} from '@cowrite/shared'
 import { StorageError } from './errors.js'
 import { type StorageChangeListener, StorageEvents, type Unsubscribe } from './events.js'
 import {
@@ -21,15 +25,19 @@ import {
   needsRebuild,
   openIndex,
   type RunByArtifact,
+  readWorkCounts,
   type SectionRow,
   type SnippetRow,
+  type WorkCounts,
 } from './index/db.js'
 import {
+  fileRowFor,
   ingestRunFile,
   recomputeSectionStaleness,
   refreshSituation,
   removeEntityRows,
   removeFileRow,
+  toWorkRelative,
   upsertSnippetFromDisk,
   upsertWorldEntryFromDisk,
 } from './index/ingest.js'
@@ -40,6 +48,7 @@ import {
   cowriteDir,
   indexPath,
   workDir as workDirOf,
+  workMetaPath,
   worldImageRelPath,
   worldImageSidecarPath,
   worldImageSidecarRelPath,
@@ -54,12 +63,22 @@ import { OrderKeyReservations } from './snippetStore.js'
 import type {
   SectionWriteResult,
   SituationWriteResult,
+  SnippetFile,
+  SnippetWithText,
   SnippetWriteResult,
-  WorkSummary,
+  WorkListing,
   WorldEntry,
+  WorldEntryWriteResult,
 } from './storageTypes.js'
 import type { TrashedWork } from './workStore.js'
-import { type CreatedWork, createWork, listWorks, readWorkMeta, trashWork } from './workStore.js'
+import {
+  type CreatedWork,
+  createWork,
+  listWorks,
+  readWorkMeta,
+  trashWork,
+  writeWorkMeta,
+} from './workStore.js'
 import * as world from './worldStore.js'
 
 /**
@@ -106,9 +125,15 @@ export interface OpenWorkOptions {
 export interface WorkHandle {
   readonly slug: string
   readonly workDir: string
+  /** Current validated work.json metadata; refreshed by updateWork. */
   readonly work: WorkMeta
   /** true when another live instance holds the lock, or after a nonce takeover. */
   readonly readOnly: boolean
+  /** ISO instant of the last completed reconcile on this handle; null before the first. */
+  readonly lastReconcileAt: string | null
+
+  /** Validated title/settings patch of work.json (03 §3.1 PATCH) + 'work.changed'. */
+  updateWork(patch: { title?: string; settings?: WorkSettings }): Promise<WorkMeta>
 
   // situation (§2.2). The §6.6 token is the content hash; updatedAt is display-only.
   getSituation(): Promise<SituationDto>
@@ -119,6 +144,8 @@ export interface WorkHandle {
   // (never a conflict result: the conflict shape cannot represent a missing target);
   // the API layer maps it to 404.
   listSections(): SectionRow[]
+  /** One index row by id (point lookup, no file I/O); null for an unknown section. */
+  getSection(sectionId: string): SectionRow | null
   getSectionContent(sectionId: string): Promise<{ text: string; contentHash: string }>
   replaceSectionContent(
     sectionId: string,
@@ -136,6 +163,7 @@ export interface WorkHandle {
     title: string,
     opts: { source: 'user' | 'agent' },
   ): Promise<{ applied: boolean }>
+  getSummaries(sectionId: string): Promise<{ short: string | null; long: string | null }>
   putSummary(
     sectionId: string,
     kind: 'short' | 'long',
@@ -145,11 +173,24 @@ export interface WorkHandle {
   putIllustration(sectionId: string, png: Uint8Array, meta: IllustrationMeta): Promise<void>
   suppressIllustration(sectionId: string): Promise<void>
   clearSuppression(sectionId: string): Promise<void>
+  /**
+   * Absolute PNG path + version (content hash) for streaming the section illustration
+   * (03 §3.9) — the route does its containment check, then streams. null when the
+   * section has no illustration, including the §2.5 suppressed tombstone. Throws
+   * SectionNotFoundError for an unknown section.
+   */
+  sectionIllustrationPath(sectionId: string): { absPath: string; version: string } | null
 
   // frontier (§2.4, §4, §6.1, §6.6). As with sections, a vanished target throws a typed
   // NotFound error — SnippetNotFoundError, or RevisionNotFoundError for an unknown
   // revision — for the API layer to map to 404; conflicts are returned, never thrown.
   listSnippets(): SnippetRow[]
+  /** Rows + full text + revisionCount in orderKey order — the SnippetDto list (03 §3.3). */
+  listSnippetsWithText(): Promise<SnippetWithText[]>
+  /** One snippet row + full text. Throws SnippetNotFoundError for the API's 404. */
+  getSnippet(snippetId: string): Promise<SnippetWithText>
+  /** Remove the snippet file AND its revision log (03 §3.3); emits 'snippet.removed'. */
+  deleteSnippet(snippetId: string): Promise<void>
   reserveOrderKey(): Promise<string>
   /** Release a reservation whose task ended without committing (§4). */
   releaseOrderKey(orderKey: string): void
@@ -180,10 +221,11 @@ export interface WorkHandle {
   ): { opId: string }
   undoConsolidation(opId: string): void
 
-  // world (§2.6)
+  // world (§2.6). upsert honors the optional §6.6-style baseHash token (body hash);
+  // without one it stays last-write-wins, and a conflict is returned, never thrown.
   listWorldEntries(): Promise<WorldEntry[]>
   getWorldEntry(entryId: string): Promise<WorldEntry>
-  upsertWorldEntry(input: world.WorldEntryUpsert): Promise<WorldEntry>
+  upsertWorldEntry(input: world.WorldEntryUpsert): Promise<WorldEntryWriteResult>
   deleteWorldEntry(entryId: string): Promise<void>
   matchWorldEntries(text: string): Promise<WorldEntry[]>
   putWorldImage(
@@ -191,6 +233,18 @@ export interface WorkHandle {
     png: Uint8Array,
     meta: IllustrationMeta,
   ): Promise<{ imagePath: string }>
+  /**
+   * Clear the entry's image pointer and remove the PNG + sidecar (03 §3.5 DELETE):
+   * NotFound for an unknown entry, idempotent no-op when there is no image, one
+   * `world.updated` when something actually changed.
+   */
+  deleteWorldImage(entryId: string): Promise<void>
+  /**
+   * Absolute PNG path + version (content hash from the index files table) for streaming
+   * the world image (03 §3.9). null when the entry has no image (or the referenced file
+   * vanished). Throws WorldEntryNotFoundError for an unknown entry.
+   */
+  worldImagePath(entryId: string): { absPath: string; version: string } | null
   listIllustrationMetas(): Promise<
     Array<{ kind: 'section' | 'world'; id: string; meta: IllustrationMeta }>
   >
@@ -201,7 +255,12 @@ export interface WorkHandle {
   readRun(runId: string): Promise<RunEvent[]>
   queryRunsByArtifact(kind: RunArtifact['kind'], artifactId: string): RunByArtifact[]
 
-  // maintenance & events (§7.3, §8, §11)
+  /** The works-list/WorkDetail aggregates straight off the index (03 §3.1). */
+  workCounts(): WorkCounts
+
+  // maintenance & events (§7.3, §8, §11). reconcile is timer-safe: it runs behind the
+  // per-work mutex, and unchanged files take the (size, mtime) no-read fast path, so a
+  // 30 s cadence on an idle work costs one stat sweep and writes nothing (§8).
   reconcile(): Promise<ReconcileReport>
   rebuildIndex(): Promise<void>
   search(query: string): FtsHit[]
@@ -210,8 +269,13 @@ export interface WorkHandle {
 }
 
 export interface StorageService {
-  /** Scans every `<dataDir>/works/<slug>/work.json`; broken works surface as warnings (§11). */
-  listWorks(): Promise<WorkSummary[]>
+  /**
+   * Scans every `<dataDir>/works/<slug>/work.json`; broken works surface as warnings
+   * (§11). Healthy entries carry the work id (meta.id) plus cheap counts read from the
+   * work's existing index via a read-only open — no work lock, no reconcile; counts are
+   * null when the index is absent, stale-versioned, or unreadable (works-list screen).
+   */
+  listWorks(): Promise<WorkListing[]>
   createWork(title: string): Promise<CreatedWork>
   /** Move the whole work dir to `<dataDir>/.trash/` — never a hard delete (§5.2). */
   trashWork(slug: string): Promise<TrashedWork>
@@ -220,7 +284,12 @@ export interface StorageService {
 
 export function createStorage(dataDir: string): StorageService {
   return {
-    listWorks: () => listWorks(dataDir),
+    listWorks: async () => {
+      const works = await listWorks(dataDir)
+      return works.map((w) =>
+        w.ok ? { ...w, counts: readWorkCounts(indexPath(workDirOf(dataDir, w.slug))) } : w,
+      )
+    },
     createWork: (title) => createWork(dataDir, title),
     trashWork: (slug) => trashWork(dataDir, slug),
     openWork: (slug, opts) => openWork(dataDir, slug, opts),
@@ -239,11 +308,12 @@ export async function openWork(
   opts: OpenWorkOptions = {},
 ): Promise<WorkHandle> {
   const dir = workDirOf(dataDir, slug)
-  const work = await readWorkMeta(dir) // throws for an unknown or broken work
+  let workMeta = await readWorkMeta(dir) // throws for an unknown or broken work
 
   let readOnly = false
   let closed = false
   let editingSnippetId: string | null = null
+  let lastReconcileAt: string | null = null
   const events = new StorageEvents()
   const mutex = new Mutex()
   const reservations = new OrderKeyReservations()
@@ -349,13 +419,65 @@ export async function openWork(
   const snippetPathHint = (snippetId: string): string | undefined =>
     db.getSnippet(snippetId)?.filePath
 
+  /** Join a parsed snippet file with its index row into the text-carrying read shape.
+   *  The file is the truth for meta/text; revisionCount comes from the index row, with
+   *  a log-line-count fallback when the row is missing (index is only a cache, §7.3). */
+  const snippetWithText = async (
+    file: SnippetFile,
+    row: SnippetRow | null,
+  ): Promise<SnippetWithText> => ({
+    id: file.meta.id,
+    orderKey: file.meta.orderKey,
+    authorship: file.meta.authorship,
+    originRunId: file.meta.originRunId,
+    rev: file.meta.rev,
+    revisionCount:
+      row?.revisionCount ?? Math.max((await snippets.getRevisions(dir, file.meta.id)).length, 1),
+    wordCount: file.wordCount,
+    updatedAt: file.meta.updatedAt,
+    filePath: toWorkRelative(dir, file.filePath),
+    text: file.text,
+  })
+
   const handle: WorkHandle = {
     slug,
     workDir: dir,
-    work,
+    get work() {
+      return workMeta
+    },
     get readOnly() {
       return readOnly
     },
+    get lastReconcileAt() {
+      return lastReconcileAt
+    },
+
+    updateWork: (patch) =>
+      mutate(async () => {
+        const next = WorkMetaSchema.parse({
+          ...workMeta,
+          ...(patch.title === undefined ? {} : { title: patch.title }),
+          ...(patch.settings === undefined ? {} : { settings: patch.settings }),
+        })
+        await writeWorkMeta(dir, next)
+        workMeta = next
+        // Index meta + files-row refresh, so the next reconcile does not re-report our
+        // own write as an external change (§8 walk set includes work.json).
+        const fileRow = await fileRowFor(dir, workMetaPath(dir))
+        db.transaction(() => {
+          db.setMeta('workId', next.id)
+          db.setMeta('levelScheme', JSON.stringify(next.levelScheme))
+          if (fileRow) db.upsertFile(fileRow)
+        })
+        if (patch.settings !== undefined) {
+          // illustrationStaleWordDeltaPct feeds §6.5 staleness — re-derive every section.
+          for (const row of db.listSectionRows()) {
+            await recomputeSectionStaleness(db, dir, row.id)
+          }
+        }
+        events.emit({ type: 'work.changed' })
+        return next
+      }),
 
     // -- situation ----------------------------------------------------------
     getSituation: () => situation.getSituation(dir),
@@ -371,6 +493,7 @@ export async function openWork(
 
     // -- sections -------------------------------------------------------------
     listSections: () => db.listSectionRows(),
+    getSection: (id) => db.getSection(id),
     getSectionContent: (id) => sections.getSectionContent(dir, id, sectionDirHint(id)),
     replaceSectionContent: (id, text, o) =>
       mutate(async () => {
@@ -399,6 +522,7 @@ export async function openWork(
         }
         return res
       }),
+    getSummaries: (id) => sections.getSummaries(dir, id, sectionDirHint(id)),
     putSummary: (id, kind, text, o) =>
       mutate(async () => {
         const meta = await sections.putSummary(dir, id, kind, text, o, sectionDirHint(id))
@@ -428,9 +552,38 @@ export async function openWork(
         await reindexSection(id)
         events.emit({ type: 'enrichment.updated', sectionId: id, enrichment: 'illustration' })
       }),
+    sectionIllustrationPath: (id) => {
+      const row = db.getSection(id)
+      if (row === null) throw new sections.SectionNotFoundError(id)
+      // illustration_hash is only set when a PNG exists — absent and suppressed
+      // (tombstoned, PNG deleted) both read as null (03 §3.9: 404 either way).
+      if (row.illustrationHash === null) return null
+      return {
+        absPath: path.join(dir, ...row.dirPath.split('/'), 'illustration.png'),
+        version: row.illustrationHash,
+      }
+    },
 
     // -- frontier ----------------------------------------------------------------
     listSnippets: () => db.listSnippetRows(),
+    listSnippetsWithText: async () => {
+      // Files are the truth for text and order (§1); index rows contribute the cached
+      // revisionCount and are matched by id.
+      const rows = new Map(db.listSnippetRows().map((r) => [r.id, r]))
+      const files = await snippets.listSnippetFiles(dir)
+      return Promise.all(files.map((f) => snippetWithText(f, rows.get(f.meta.id) ?? null)))
+    },
+    getSnippet: async (id) => {
+      const row = db.getSnippet(id)
+      const file = await snippets.readSnippet(dir, id, row?.filePath)
+      return snippetWithText(file, row)
+    },
+    deleteSnippet: (id) =>
+      mutate(async () => {
+        await snippets.deleteSnippet(dir, id, { filePathHint: snippetPathHint(id) })
+        removeEntityRows(db, 'snippet', id) // also drops the .md + revision-log file rows
+        events.emit({ type: 'snippet.removed', snippetId: id })
+      }),
     reserveOrderKey: () => mutate(() => snippets.reserveOrderKey(dir, reservations)),
     releaseOrderKey: (orderKey) => {
       reservations.release(orderKey)
@@ -486,10 +639,12 @@ export async function openWork(
     getWorldEntry: (id) => world.getWorldEntry(dir, id),
     upsertWorldEntry: (input) =>
       mutate(async () => {
-        const entry = await world.upsertWorldEntry(dir, input)
-        await upsertWorldEntryFromDisk(db, dir, entry.filePath)
-        events.emit({ type: 'world.updated', entryId: entry.meta.id })
-        return entry
+        const res = await world.upsertWorldEntry(dir, input)
+        if (res.ok) {
+          await upsertWorldEntryFromDisk(db, dir, res.entry.filePath)
+          events.emit({ type: 'world.updated', entryId: res.entry.meta.id })
+        }
+        return res
       }),
     deleteWorldEntry: (id) =>
       mutate(async () => {
@@ -509,6 +664,37 @@ export async function openWork(
         events.emit({ type: 'world.updated', entryId: id })
         return res
       }),
+    deleteWorldImage: (id) =>
+      mutate(async () => {
+        const { removed } = await world.deleteWorldImage(dir, id) // NotFound for unknown ids
+        if (!removed) return // idempotent: nothing to reindex, no event
+        removeFileRow(db, dir, worldImageRelPath(id))
+        removeFileRow(db, dir, worldImageSidecarRelPath(id))
+        const entry = await world.getWorldEntry(dir, id)
+        await upsertWorldEntryFromDisk(db, dir, entry.filePath)
+        events.emit({ type: 'world.updated', entryId: id })
+      }),
+    worldImagePath: (entryId) => {
+      const row = db.getWorldEntry(entryId)
+      if (row === null) throw new world.WorldEntryNotFoundError(entryId)
+      if (row.imagePath === null) return null
+      // §5.4 spells `image` entry-relative ('../images/…'); §10.6 work-relative. Accept
+      // both — same policy as index ingestion — and answer from the files table, whose
+      // row only exists for the resolution that was actually on disk (and carries the
+      // xxh64 the route serves as the immutable version).
+      const entryAbs = path.join(dir, ...row.filePath.split('/'))
+      const candidates = [
+        path.resolve(path.dirname(entryAbs), row.imagePath),
+        path.resolve(dir, row.imagePath),
+      ]
+      for (const candidate of candidates) {
+        const rel = toWorkRelative(dir, candidate)
+        if (rel.startsWith('..')) continue // escaped the work dir: never streamable
+        const file = db.getFile(rel)
+        if (file) return { absPath: candidate, version: file.xxh64 }
+      }
+      return null
+    },
     listIllustrationMetas: async () => {
       const out: Array<{ kind: 'section' | 'world'; id: string; meta: IllustrationMeta }> = []
       for (const node of await sections.walkSectionTree(dir)) {
@@ -554,8 +740,15 @@ export async function openWork(
     readRun: (runId) => readRun(dir, runId),
     queryRunsByArtifact: (kind, artifactId) => db.runsByArtifact(kind, artifactId),
 
+    workCounts: () => db.workCounts(),
+
     // -- maintenance & events ---------------------------------------------------------
-    reconcile: () => mutate(() => reconcile({ workDir: dir, db, emit: (e) => events.emit(e) })),
+    reconcile: () =>
+      mutate(async () => {
+        const report = await reconcile({ workDir: dir, db, emit: (e) => events.emit(e) })
+        lastReconcileAt = new Date().toISOString()
+        return report
+      }),
     rebuildIndex: () =>
       mutate(async () => {
         // Reads (listSections & co.) are synchronous and un-mutexed, so the live db must

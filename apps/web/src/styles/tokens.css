@@ -1,0 +1,111 @@
+/*
+ * Design tokens (docs/04-frontend.md §12 theming, §6 tints).
+ * Light/dark via prefers-color-scheme; every component reads custom properties only.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* type */
+  --font-ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-prose: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --prose-size: 17px;
+  --prose-leading: 28px;
+  --prose-measure: 68ch;
+
+  /* spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --radius-1: 6px;
+  --radius-2: 10px;
+
+  /* light theme */
+  --bg: oklch(0.985 0.003 90);
+  --bg-raised: oklch(1 0 0);
+  --bg-sunken: oklch(0.955 0.004 90);
+  --fg: oklch(0.32 0.01 250);
+  --fg-muted: oklch(0.52 0.012 250);
+  --fg-faint: oklch(0.68 0.01 250);
+  --border: oklch(0.88 0.005 250);
+  --border-strong: oklch(0.78 0.008 250);
+  --accent: oklch(0.55 0.12 250);
+  --accent-bg: oklch(0.94 0.03 250);
+  --danger: oklch(0.55 0.18 25);
+  --danger-bg: oklch(0.95 0.03 25);
+  --warn: oklch(0.65 0.13 80);
+  --warn-bg: oklch(0.95 0.05 90);
+  --ok: oklch(0.58 0.13 150);
+
+  /* dialogue tint (§6.2): slight hue rotation of body text, no background */
+  --dlg: oklch(0.42 0.06 250);
+
+  /* provenance tints (§6.4) */
+  --prov-user: oklch(0.55 0.06 240);
+  --prov-agent: oklch(0.55 0.07 300);
+
+  /* world-key underline (§6.3) */
+  --wi-underline: oklch(0.6 0.08 200);
+
+  /* instruction surfaces (§8.2): amber-tinted, sans, never looks like prose */
+  --instr-bg: oklch(0.96 0.035 85);
+  --instr-border: oklch(0.85 0.06 85);
+
+  --shadow-1: 0 1px 3px oklch(0 0 0 / 0.08), 0 4px 16px oklch(0 0 0 / 0.06);
+  --shadow-2: 0 2px 8px oklch(0 0 0 / 0.12), 0 12px 32px oklch(0 0 0 / 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: oklch(0.21 0.008 250);
+    --bg-raised: oklch(0.25 0.01 250);
+    --bg-sunken: oklch(0.18 0.008 250);
+    --fg: oklch(0.88 0.008 250);
+    --fg-muted: oklch(0.7 0.01 250);
+    --fg-faint: oklch(0.55 0.01 250);
+    --border: oklch(0.32 0.01 250);
+    --border-strong: oklch(0.42 0.012 250);
+    --accent: oklch(0.72 0.11 250);
+    --accent-bg: oklch(0.3 0.05 250);
+    --danger: oklch(0.68 0.16 25);
+    --danger-bg: oklch(0.28 0.05 25);
+    --warn: oklch(0.75 0.12 80);
+    --warn-bg: oklch(0.28 0.05 90);
+    --ok: oklch(0.7 0.12 150);
+    --dlg: oklch(0.8 0.06 250);
+    --prov-user: oklch(0.68 0.07 240);
+    --prov-agent: oklch(0.68 0.08 300);
+    --wi-underline: oklch(0.65 0.08 200);
+    --instr-bg: oklch(0.27 0.03 85);
+    --instr-border: oklch(0.4 0.05 85);
+    --shadow-1: 0 1px 3px oklch(0 0 0 / 0.3), 0 4px 16px oklch(0 0 0 / 0.25);
+    --shadow-2: 0 2px 8px oklch(0 0 0 / 0.4), 0 12px 32px oklch(0 0 0 / 0.35);
+  }
+}
+
+/* app-shell reset */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}

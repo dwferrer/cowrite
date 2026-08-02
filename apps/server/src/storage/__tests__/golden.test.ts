@@ -97,6 +97,9 @@ describe('golden fixture: salt-and-signal (§5.3/§5.4)', () => {
         illustrationHash: await xxh64OfBuffer(sec1Png),
         illustrationWidth: 96,
         illustrationHeight: 64,
+        // schema v2: the summary-*.md text rides the row (zero-file-read reads)
+        shortSummary: await readWorkFile(`${SEC1_DIR}/summary-short.md`),
+        longSummary: await readWorkFile(`${SEC1_DIR}/summary-long.md`),
       },
       {
         id: SEC2,
@@ -118,6 +121,8 @@ describe('golden fixture: salt-and-signal (§5.3/§5.4)', () => {
         illustrationHash: await xxh64OfBuffer(sec2Png),
         illustrationWidth: 64,
         illustrationHeight: 64,
+        shortSummary: await readWorkFile(`${SEC2_DIR}/summary-short.md`),
+        longSummary: await readWorkFile(`${SEC2_DIR}/summary-long.md`),
       },
     ])
 

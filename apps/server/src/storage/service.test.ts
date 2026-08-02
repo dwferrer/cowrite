@@ -1,13 +1,15 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { IllustrationMeta, WorkSettings } from '@cowrite/shared'
 import { ulid } from 'ulid'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { StorageChange } from './events.js'
-import { openIndex } from './index/db.js'
-import { buildFixtureWork } from './index/fixture.js'
+import { needsRebuild, openIndex } from './index/db.js'
+import { buildFixtureWork, FIX } from './index/fixture.js'
 import { xxh64OfString } from './lib/hash.js'
-import { indexPath, lockPath, runsDir, shortId } from './lib/paths.js'
+import { indexPath, lockPath, revisionLogPath, runsDir, shortId } from './lib/paths.js'
+import { SectionNotFoundError } from './sectionStore.js'
 import {
   createStorage,
   NotImplementedError,
@@ -15,6 +17,8 @@ import {
   type StorageService,
   type WorkHandle,
 } from './service.js'
+import { SnippetNotFoundError } from './snippetStore.js'
+import { WorldEntryNotFoundError } from './worldStore.js'
 
 /**
  * End-to-end integration of the storage top layer (spec 02 §11) against a real temp
@@ -141,13 +145,14 @@ describe('storage service end-to-end', () => {
   })
 
   it('stores world entries with keys and matches them by alias', async () => {
-    const entry = await handle.upsertWorldEntry({
+    const upserted = await handle.upsertWorldEntry({
       name: 'Mara Voss',
       keys: ['Mara', 'the keeper'],
       createdBy: 'user',
       body: 'Keeper of the Cinder Point light.',
     })
-    entryId = entry.meta.id
+    if (!upserted.ok) throw new Error('unexpected world upsert conflict')
+    entryId = upserted.entry.meta.id
 
     const matched = await handle.matchWorldEntries('Then Mara raised the lamp.')
     expect(matched.map((m) => m.meta.id)).toEqual([entryId])
@@ -556,6 +561,334 @@ describe('openWork failure paths (§9.3, §10.7)', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled)
       consoleError.mockRestore()
+      await handle.close()
+    }
+  })
+})
+
+/**
+ * The Stage 2 API-support surface (03 §3): text-carrying snippet reads, snippet delete,
+ * summaries read, work PATCH, world optimistic concurrency, image path resolution for
+ * streaming routes, works-list counts, and the reconcile cadence hooks. Tests run in
+ * order and share one work.
+ */
+describe('storage service API-support surface', () => {
+  let dataDir: string
+  let storage: StorageService
+  let handle: WorkHandle
+  let workDirPath: string
+  const events: StorageChange[] = []
+
+  let sA = ''
+  let sB = ''
+  let secId = ''
+  let entryId = ''
+
+  const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9])
+
+  function illustrationFixture(sourceWordCount: number | null): IllustrationMeta {
+    return IllustrationMeta.parse({
+      source: 'agent',
+      runId: ulid(),
+      generatedAt: new Date().toISOString(),
+      sourceHash: null,
+      sourceWordCount,
+      entities: [],
+      prompt: 'a lighthouse in a storm',
+      workflow: 'default',
+      workflowHash: null,
+      seed: 7,
+      attempts: 1,
+      score: 8,
+      guidance: null,
+    })
+  }
+
+  beforeAll(async () => {
+    dataDir = await mkdtemp(path.join(os.tmpdir(), 'cowrite-service-api-'))
+    storage = createStorage(dataDir)
+    const created = await storage.createWork('Gap Coverage')
+    workDirPath = created.dirPath
+    handle = await storage.openWork(created.slug)
+    handle.onChange((e) => events.push(e))
+
+    sA = (await handle.appendSnippet('Alpha snippet text.', { author: 'user' })).id
+    sB = (await handle.appendSnippet('Beta snippet text.', { author: 'user' })).id
+    await handle.reviseSnippet(sB, 'Beta snippet text, revised.', { author: 'user', baseRev: 1 })
+
+    // A leaf section with prose + both summary files, adopted via reconcile (§8) the
+    // same way the consolidation engine will materialize one.
+    secId = ulid()
+    const secDir = path.join(workDirPath, 'sections', `010-opening.${shortId(secId)}`)
+    await mkdir(secDir, { recursive: true })
+    const content = 'Opening prose for the gap-coverage work.\n'
+    await writeFile(path.join(secDir, 'content.md'), content)
+    await writeFile(path.join(secDir, 'summary-short.md'), 'Short summary.\n')
+    await writeFile(path.join(secDir, 'summary-long.md'), 'Long summary, at length.\n')
+    await writeFile(
+      path.join(secDir, 'section.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: secId,
+        kind: 'chapter',
+        orderKey: 'a0',
+        title: 'Opening',
+        titleSource: 'user',
+        frozenAt: null,
+        contentHash: await xxh64OfString(content),
+        enrichments: { shortSummary: null, longSummary: null, illustration: null },
+      }),
+    )
+    await handle.reconcile()
+
+    const upserted = await handle.upsertWorldEntry({
+      name: 'Cinder Point',
+      keys: ['the point'],
+      createdBy: 'user',
+      body: 'A basalt headland.',
+    })
+    if (!upserted.ok) throw new Error('unexpected world upsert conflict')
+    entryId = upserted.entry.meta.id
+  })
+
+  afterAll(async () => {
+    await handle.close().catch(() => {})
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('listWorks carries the work id and cheap index-backed counts (03 §3.1)', async () => {
+    // A second work that has never been opened has no index — its counts are null.
+    await storage.createWork('Never Opened')
+
+    const works = await storage.listWorks()
+    expect(works.map((w) => w.slug).sort()).toEqual(['gap-coverage', 'never-opened'])
+
+    const opened = works.find((w) => w.slug === 'gap-coverage')
+    if (opened?.ok !== true) throw new Error('expected a healthy listing')
+    expect(opened.meta.id).toBe(handle.work.id)
+    expect(opened.counts).toMatchObject({ snippetCount: 2, sectionCount: 1 })
+    expect(opened.counts?.wordCount).toBeGreaterThan(0)
+    expect(opened.counts?.updatedAt).toMatch(/^\d{4}-/)
+
+    const unopened = works.find((w) => w.slug === 'never-opened')
+    if (unopened?.ok !== true) throw new Error('expected a healthy listing')
+    expect(unopened.counts).toBeNull()
+  })
+
+  it('listSnippetsWithText returns rows + text + revisionCount in orderKey order', async () => {
+    const list = await handle.listSnippetsWithText()
+    expect(list.map((s) => s.id)).toEqual([sA, sB])
+    expect(list.map((s) => s.text)).toEqual(['Alpha snippet text.', 'Beta snippet text, revised.'])
+    expect(list.map((s) => s.revisionCount)).toEqual([1, 2])
+    expect(list[0]?.filePath).toMatch(/^frontier\/snippets\//)
+
+    const one = await handle.getSnippet(sB)
+    expect(one.text).toBe('Beta snippet text, revised.')
+    expect(one.rev).toBe(2)
+    await expect(handle.getSnippet(ulid())).rejects.toBeInstanceOf(SnippetNotFoundError)
+  })
+
+  it('deleteSnippet removes the file AND the revision log, drops rows, emits removal', async () => {
+    const before = await handle.getSnippet(sB)
+    const snippetAbs = path.join(workDirPath, ...before.filePath.split('/'))
+    const logAbs = revisionLogPath(workDirPath, sB)
+    await stat(snippetAbs) // both exist before the delete
+    await stat(logAbs)
+
+    await handle.deleteSnippet(sB)
+
+    await expect(stat(snippetAbs)).rejects.toThrow()
+    await expect(stat(logAbs)).rejects.toThrow()
+    expect(handle.listSnippets().map((r) => r.id)).toEqual([sA])
+    expect((await handle.listSnippetsWithText()).map((s) => s.id)).toEqual([sA])
+    expect(events).toContainEqual({ type: 'snippet.removed', snippetId: sB })
+
+    // gone = typed NotFound (API maps to 404), for delete and reads alike
+    await expect(handle.deleteSnippet(sB)).rejects.toBeInstanceOf(SnippetNotFoundError)
+    await expect(handle.getSnippet(sB)).rejects.toBeInstanceOf(SnippetNotFoundError)
+
+    // the index agrees with a full rebuild (§7.3)
+    await handle.rebuildIndex()
+    expect(handle.listSnippets().map((r) => r.id)).toEqual([sA])
+  })
+
+  it('getSummaries reads both summary files; unknown sections are typed NotFound', async () => {
+    expect(await handle.getSummaries(secId)).toEqual({
+      short: 'Short summary.\n',
+      long: 'Long summary, at length.\n',
+    })
+    await expect(handle.getSummaries(ulid())).rejects.toBeInstanceOf(SectionNotFoundError)
+  })
+
+  it('updateWork patches title/settings, refreshes the index, emits work.changed', async () => {
+    const settings = WorkSettings.parse({ illustrationStaleWordDeltaPct: 40 })
+    const next = await handle.updateWork({ title: 'Gap Coverage, Revised', settings })
+    expect(next.title).toBe('Gap Coverage, Revised')
+    expect(handle.work.title).toBe('Gap Coverage, Revised')
+    expect(handle.work.settings.illustrationStaleWordDeltaPct).toBe(40)
+    expect(events).toContainEqual({ type: 'work.changed' })
+
+    const onDisk = JSON.parse(await readFile(path.join(workDirPath, 'work.json'), 'utf8'))
+    expect(onDisk.title).toBe('Gap Coverage, Revised')
+    expect(onDisk.settings.illustrationStaleWordDeltaPct).toBe(40)
+
+    // Our own write refreshed the files row: the next reconcile reports no drift.
+    const report = await handle.reconcile()
+    expect(report.changed).toEqual([])
+    expect(report.adopted).toEqual([])
+    expect(report.removed).toEqual([])
+
+    await expect(handle.updateWork({ title: '' })).rejects.toThrow() // schema-invalid
+  })
+
+  it('world upsert honors baseHash through the handle and emits no event on conflict', async () => {
+    const eventsBefore = events.filter((e) => e.type === 'world.updated').length
+    const stale = await handle.upsertWorldEntry({
+      id: entryId,
+      name: 'Cinder Point',
+      createdBy: 'user',
+      body: 'a lost update',
+      baseHash: await xxh64OfString('not the current body'),
+    })
+    expect(stale.ok).toBe(false)
+    if (!stale.ok) {
+      expect(stale.conflict.currentText).toBe('A basalt headland.')
+      expect(stale.conflict.currentHash).toBe(await xxh64OfString('A basalt headland.'))
+    }
+    expect(events.filter((e) => e.type === 'world.updated')).toHaveLength(eventsBefore)
+
+    const fresh = await handle.upsertWorldEntry({
+      id: entryId,
+      name: 'Cinder Point',
+      createdBy: 'user',
+      body: 'A basalt headland, updated.',
+      baseHash: await xxh64OfString('A basalt headland.'),
+    })
+    expect(fresh.ok).toBe(true)
+    expect((await handle.getWorldEntry(entryId)).body).toBe('A basalt headland, updated.')
+    expect(events.filter((e) => e.type === 'world.updated')).toHaveLength(eventsBefore + 1)
+  })
+
+  it('sectionIllustrationPath: absent → null, present → path+version, tombstone → null', async () => {
+    expect(handle.sectionIllustrationPath(secId)).toBeNull()
+    expect(() => handle.sectionIllustrationPath(ulid())).toThrow(SectionNotFoundError)
+
+    await handle.putIllustration(secId, PNG_BYTES, illustrationFixture(7))
+    const resolved = handle.sectionIllustrationPath(secId)
+    expect(resolved).not.toBeNull()
+    expect(resolved?.absPath.endsWith('illustration.png')).toBe(true)
+    expect(path.isAbsolute(resolved?.absPath ?? '')).toBe(true)
+    expect(resolved?.version).toMatch(/^xxh64:[0-9a-f]{16}$/)
+    await stat(resolved?.absPath ?? '') // streamable: the PNG really is there
+
+    await handle.suppressIllustration(secId)
+    expect(handle.sectionIllustrationPath(secId)).toBeNull() // suppressed tombstone
+  })
+
+  it('worldImagePath: no image → null, uploaded → path+version, unknown → NotFound', async () => {
+    expect(handle.worldImagePath(entryId)).toBeNull()
+    expect(() => handle.worldImagePath(ulid())).toThrow(WorldEntryNotFoundError)
+
+    await handle.putWorldImage(entryId, PNG_BYTES, illustrationFixture(null))
+    const resolved = handle.worldImagePath(entryId)
+    expect(resolved).not.toBeNull()
+    expect(path.isAbsolute(resolved?.absPath ?? '')).toBe(true)
+    expect(resolved?.absPath.endsWith(`${entryId}.png`)).toBe(true)
+    expect(resolved?.version).toMatch(/^xxh64:[0-9a-f]{16}$/)
+    await stat(resolved?.absPath ?? '')
+  })
+
+  it('deleteWorldImage clears the pointer, removes PNG + sidecar, emits ONE world.updated', async () => {
+    const imageAbs = handle.worldImagePath(entryId)?.absPath
+    if (imageAbs === undefined) throw new Error('fixture image missing')
+    const sidecarAbs = imageAbs.replace(/\.png$/, '.json')
+    await stat(sidecarAbs) // sidecar exists before the delete
+
+    const updatesBefore = events.filter((e) => e.type === 'world.updated').length
+    await handle.deleteWorldImage(entryId)
+
+    expect((await handle.getWorldEntry(entryId)).meta.image).toBeNull()
+    expect(handle.worldImagePath(entryId)).toBeNull()
+    await expect(stat(imageAbs)).rejects.toThrow()
+    await expect(stat(sidecarAbs)).rejects.toThrow()
+    expect(events.filter((e) => e.type === 'world.updated')).toHaveLength(updatesBefore + 1)
+
+    // idempotent no-op: no second event, no error
+    await handle.deleteWorldImage(entryId)
+    expect(events.filter((e) => e.type === 'world.updated')).toHaveLength(updatesBefore + 1)
+
+    // unknown entry is a typed NotFound (API maps to 404)
+    await expect(handle.deleteWorldImage(ulid())).rejects.toBeInstanceOf(WorldEntryNotFoundError)
+
+    // the index agrees with a full rebuild (files are truth, §7.3)
+    await handle.rebuildIndex()
+    expect(handle.worldImagePath(entryId)).toBeNull()
+  })
+
+  it('reconcile is timer-safe (idle no-op) and stamps lastReconcileAt', async () => {
+    expect(handle.lastReconcileAt).toMatch(/^\d{4}-\d{2}-\d{2}T/) // set by openWork
+    const before = handle.lastReconcileAt
+    // Two immediate back-to-back reconciles, as a 30 s timer would fire them on an
+    // idle work: pure (size, mtime) fast path, empty report, nothing rewritten.
+    for (let i = 0; i < 2; i++) {
+      const report = await handle.reconcile()
+      expect(report.changed).toEqual([])
+      expect(report.adopted).toEqual([])
+      expect(report.removed).toEqual([])
+      expect(report.unrecognized).toEqual([])
+      expect(report.renumbered).toBe(0)
+    }
+    expect(handle.lastReconcileAt).not.toBeNull()
+    expect((handle.lastReconcileAt ?? '') >= (before ?? '')).toBe(true)
+  })
+})
+
+describe('index schema v2: inlined summaries, point lookups, version-mismatch rebuild', () => {
+  let dataDir: string
+
+  beforeAll(async () => {
+    dataDir = await mkdtemp(path.join(os.tmpdir(), 'cowrite-schema-v2-'))
+    await mkdir(path.join(dataDir, 'works'), { recursive: true })
+    await buildFixtureWork(path.join(dataDir, 'works'))
+  })
+
+  afterAll(async () => {
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('a stale user_version routes through the full rebuild and serves index-only reads', async () => {
+    const storage = createStorage(dataDir)
+    const first = await storage.openWork('salt-and-signal')
+    const idxPath = indexPath(path.join(dataDir, 'works', 'salt-and-signal'))
+    expect(first.listSections()[0]?.shortSummary).toBe('Keeper watches the harbor.\n')
+    await first.close()
+
+    // Simulate an index written by an older build: same file, foreign user_version.
+    const tampered = openIndex(idxPath)
+    tampered.handle.pragma('user_version = 1')
+    tampered.close()
+    expect(needsRebuild(idxPath)).toBe(true)
+
+    // Reopen: the mismatch takes the existing delete-and-rebuild path (§7.3)…
+    const handle = await storage.openWork('salt-and-signal')
+    try {
+      expect(needsRebuild(idxPath)).toBe(false)
+
+      // …and every summary-bearing read answers from the rebuilt rows, no file I/O.
+      const row = handle.getSection(FIX.sec1)
+      expect(row?.shortSummary).toBe('Keeper watches the harbor.\n')
+      expect(row?.longSummary).toBe('A longer summary of chapter one.\n')
+      expect(handle.getSection(FIX.sec2)?.shortSummary).toBeNull()
+      expect(handle.getSection(ulid())).toBeNull() // point lookup: unknown id → null
+
+      // the WorkDetail aggregates ride the same index (shared with readWorkCounts)
+      expect(handle.workCounts()).toEqual({
+        snippetCount: 3,
+        sectionCount: 2,
+        wordCount: expect.any(Number),
+        updatedAt: '2026-07-06T14:02:11Z',
+      })
+    } finally {
       await handle.close()
     }
   })

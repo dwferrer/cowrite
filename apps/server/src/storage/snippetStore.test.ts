@@ -7,6 +7,7 @@ import { compareOrderKeys, keyBetween } from './lib/orderKeys.js'
 import { frontierRevisionsDir, frontierSnippetsDir, shortId } from './lib/paths.js'
 import {
   appendSnippet,
+  deleteSnippet,
   getRevisions,
   listSnippetFiles,
   OrderKeyConflictError,
@@ -227,6 +228,31 @@ describe('restoreSnippet', () => {
     promise.catch(() => {}) // assertions below re-await; keep the rejection handled
     await expect(promise).rejects.toThrow(/no revision 7/)
     await expect(promise).rejects.toBeInstanceOf(RevisionNotFoundError)
+  })
+})
+
+describe('deleteSnippet', () => {
+  it('removes the snippet file AND its revision log (03 §3.3)', async () => {
+    const keep = await appendSnippet(workDir, 'survivor', { author: 'user' })
+    const doomed = await appendSnippet(workDir, 'doomed', { author: 'user' })
+    await reviseSnippet(workDir, doomed.id, 'doomed v2', { author: 'user', baseRev: 1 })
+
+    await deleteSnippet(workDir, doomed.id)
+
+    await expect(readSnippet(workDir, doomed.id)).rejects.toBeInstanceOf(SnippetNotFoundError)
+    expect(await getRevisions(workDir, doomed.id)).toEqual([]) // log gone: reads as empty
+    expect((await listSnippetFiles(workDir)).map((f) => f.meta.id)).toEqual([keep.id])
+    expect(await fsp.readdir(frontierRevisionsDir(workDir))).toEqual([
+      `${keep.id}.jsonl`, // the survivor's log is untouched
+    ])
+  })
+
+  it('throws SnippetNotFoundError for an unknown id (and a stale hint still resolves)', async () => {
+    await expect(deleteSnippet(workDir, ulid())).rejects.toBeInstanceOf(SnippetNotFoundError)
+    const meta = await appendSnippet(workDir, 'x', { author: 'user' })
+    // a wrong hint must fall back to the scan, not delete the wrong file
+    await deleteSnippet(workDir, meta.id, { filePathHint: 'frontier/snippets/999.zzzzzz.md' })
+    expect(await listSnippetFiles(workDir)).toEqual([])
   })
 })
 

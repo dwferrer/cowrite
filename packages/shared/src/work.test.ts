@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { ConsolidationSettings, WorkMeta, WorkSettings } from './work.js'
+import {
+  ConsolidationSettings,
+  WorkDetail,
+  WorkMeta,
+  WorkPatch,
+  WorkSettings,
+  WorkSummary,
+} from './work.js'
 
 const workId = '01J2P7Q4V2M8Z6T1RD5FCW9XKB'
 
@@ -65,5 +72,51 @@ describe('WorkSettings', () => {
     expect(ConsolidationSettings.safeParse({ maxFrontierWords: 0 }).success).toBe(false)
     expect(ConsolidationSettings.safeParse({ debounceMs: -1 }).success).toBe(false)
     expect(ConsolidationSettings.safeParse({ activeWindowWords: 1.5 }).success).toBe(false)
+  })
+})
+
+describe('WorkSummary / WorkDetail (03 §3.1 DTOs)', () => {
+  const summary = {
+    id: workId,
+    title: 'Salt and Signal',
+    slug: 'salt-and-signal',
+    wordCount: 42_000,
+    snippetCount: 12,
+    sectionCount: 9,
+    updatedAt: '2026-07-06T14:02:11Z',
+  }
+
+  it('round-trips a full summary and accepts null counts (cheap-list semantics)', () => {
+    expect(WorkSummary.parse(summary)).toEqual(summary)
+    const cheap = WorkSummary.parse({
+      ...summary,
+      wordCount: null,
+      snippetCount: null,
+      sectionCount: null,
+    })
+    expect(cheap.wordCount).toBeNull()
+  })
+
+  it('WorkDetail adds settings, levelScheme, and the readonly lock flag', () => {
+    const detail = WorkDetail.parse({
+      ...summary,
+      settings: WorkSettings.parse({}),
+      levelScheme: ['book', 'chapter'],
+      readonly: false,
+    })
+    expect(detail.readonly).toBe(false)
+    expect(WorkDetail.safeParse(summary).success).toBe(false)
+  })
+})
+
+describe('WorkPatch', () => {
+  it('keeps a sparse settings patch sparse — no materialized defaults', () => {
+    const patch = WorkPatch.parse({ settings: { consolidation: { mode: 'review' } } })
+    expect(patch.settings).toEqual({ consolidation: { mode: 'review' } })
+    expect(WorkPatch.parse({})).toEqual({})
+  })
+
+  it('rejects an empty title', () => {
+    expect(WorkPatch.safeParse({ title: '' }).success).toBe(false)
   })
 })

@@ -4,7 +4,9 @@ import path from 'node:path'
 import { IllustrationMeta } from '@cowrite/shared'
 import { ulid } from 'ulid'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { xxh64OfString } from './lib/hash.js'
 import { shortId, worldEntriesDir, worldImagesDir } from './lib/paths.js'
+import type { WorldEntry } from './storageTypes.js'
 import {
   deleteWorldEntry,
   getWorldEntry,
@@ -13,9 +15,17 @@ import {
   putWorldImage,
   upsertWorldEntry,
   WorldEntryNotFoundError,
+  type WorldEntryUpsert,
 } from './worldStore.js'
 
 let workDir: string
+
+/** Tokenless upserts are last-write-wins and can never conflict — unwrap the ok arm. */
+async function upsertOk(dir: string, input: WorldEntryUpsert): Promise<WorldEntry> {
+  const res = await upsertWorldEntry(dir, input)
+  if (!res.ok) throw new Error('unexpected world upsert conflict')
+  return res.entry
+}
 
 beforeEach(async () => {
   workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'cowrite-world-'))
@@ -27,7 +37,7 @@ afterEach(async () => {
 
 describe('upsertWorldEntry', () => {
   it('creates an entry with §5.4 frontmatter and defaults', async () => {
-    const entry = await upsertWorldEntry(workDir, {
+    const entry = await upsertOk(workDir, {
       name: 'Mara Voss',
       keys: ['Mara', 'Voss', 'the keeper'],
       shortSummary: 'Lighthouse keeper of Cinder Point.',
@@ -41,7 +51,7 @@ describe('upsertWorldEntry', () => {
     expect(read.meta.image).toBeNull()
 
     // An entry with no keys is fully legitimate (§2.6).
-    const keyless = await upsertWorldEntry(workDir, {
+    const keyless = await upsertOk(workDir, {
       name: 'The Storm Glass',
       createdBy: 'agent',
       body: 'An instrument.',
@@ -50,13 +60,13 @@ describe('upsertWorldEntry', () => {
   })
 
   it('updates in place by id, keeping the file path and unspecified fields', async () => {
-    const created = await upsertWorldEntry(workDir, {
+    const created = await upsertOk(workDir, {
       name: 'Mara Voss',
       keys: ['Mara'],
       createdBy: 'user',
       body: 'v1',
     })
-    const updated = await upsertWorldEntry(workDir, {
+    const updated = await upsertOk(workDir, {
       id: created.meta.id,
       name: 'Mara "the Keeper" Voss', // name change must NOT move the file
       createdBy: 'user',
@@ -69,12 +79,58 @@ describe('upsertWorldEntry', () => {
     expect(read.meta.name).toBe('Mara "the Keeper" Voss')
     expect(await listWorldEntries(workDir)).toHaveLength(1)
   })
+
+  it('honors baseHash: fresh token writes, stale token returns the conflict shape (§6.6)', async () => {
+    const created = await upsertOk(workDir, { name: 'Mara', createdBy: 'user', body: 'v1' })
+    const freshToken = await xxh64OfString('v1')
+    const ok = await upsertWorldEntry(workDir, {
+      id: created.meta.id,
+      name: 'Mara',
+      createdBy: 'user',
+      body: 'v2',
+      baseHash: freshToken,
+    })
+    expect(ok.ok).toBe(true)
+
+    const stale = await upsertWorldEntry(workDir, {
+      id: created.meta.id,
+      name: 'Mara',
+      createdBy: 'user',
+      body: 'a lost update',
+      baseHash: freshToken, // now stale: the body is v2
+    })
+    expect(stale).toEqual({
+      ok: false,
+      conflict: { currentHash: await xxh64OfString('v2'), currentText: 'v2' },
+    })
+    expect((await getWorldEntry(workDir, created.meta.id)).body).toBe('v2')
+  })
+
+  it('with baseHash, a vanished entry is a typed NotFound and a create is invalid', async () => {
+    await expect(
+      upsertWorldEntry(workDir, {
+        id: ulid(),
+        name: 'Ghost',
+        createdBy: 'user',
+        body: 'x',
+        baseHash: await xxh64OfString('x'),
+      }),
+    ).rejects.toBeInstanceOf(WorldEntryNotFoundError)
+    await expect(
+      upsertWorldEntry(workDir, {
+        name: 'No Id',
+        createdBy: 'user',
+        body: 'x',
+        baseHash: await xxh64OfString('x'),
+      }),
+    ).rejects.toThrow(/baseHash requires an entry id/)
+  })
 })
 
 describe('listWorldEntries', () => {
   it('sorts by name and skips files without valid frontmatter', async () => {
-    await upsertWorldEntry(workDir, { name: 'Zeph', createdBy: 'user', body: 'z' })
-    await upsertWorldEntry(workDir, { name: 'Anchor', createdBy: 'user', body: 'a' })
+    await upsertOk(workDir, { name: 'Zeph', createdBy: 'user', body: 'z' })
+    await upsertOk(workDir, { name: 'Anchor', createdBy: 'user', body: 'a' })
     await fsp.writeFile(path.join(worldEntriesDir(workDir), 'stray.md'), 'no frontmatter', 'utf8')
     const entries = await listWorldEntries(workDir)
     expect(entries.map((e) => e.meta.name)).toEqual(['Anchor', 'Zeph'])
@@ -87,7 +143,7 @@ describe('listWorldEntries', () => {
 
 describe('deleteWorldEntry', () => {
   it('removes the entry file and its image assets', async () => {
-    const entry = await upsertWorldEntry(workDir, { name: 'Doomed', createdBy: 'user', body: 'x' })
+    const entry = await upsertOk(workDir, { name: 'Doomed', createdBy: 'user', body: 'x' })
     await putWorldImage(workDir, entry.meta.id, Uint8Array.from([1, 2, 3]), illustrationFixture())
     await deleteWorldEntry(workDir, entry.meta.id)
     await expect(getWorldEntry(workDir, entry.meta.id)).rejects.toBeInstanceOf(
@@ -118,7 +174,7 @@ function illustrationFixture(): IllustrationMeta {
 
 describe('putWorldImage', () => {
   it('writes PNG + sidecar meta and points the entry image field at it (work-relative)', async () => {
-    const entry = await upsertWorldEntry(workDir, { name: 'Mara', createdBy: 'user', body: 'x' })
+    const entry = await upsertOk(workDir, { name: 'Mara', createdBy: 'user', body: 'x' })
     const meta = illustrationFixture()
     const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47])
     const { imagePath } = await putWorldImage(workDir, entry.meta.id, png, meta)
@@ -142,13 +198,13 @@ describe('putWorldImage', () => {
 
 describe('matchWorldEntries (pure key scan, §2.6)', () => {
   async function fixtures() {
-    const mara = await upsertWorldEntry(workDir, {
+    const mara = await upsertOk(workDir, {
       name: 'Mara Voss',
       keys: ['Mara', 'Voss', 'the keeper'],
       createdBy: 'user',
       body: '',
     })
-    const glass = await upsertWorldEntry(workDir, {
+    const glass = await upsertOk(workDir, {
       name: 'The Storm Glass',
       keys: [],
       createdBy: 'user',

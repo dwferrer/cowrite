@@ -217,6 +217,10 @@ export async function loadSectionFromDisk(
     illustrationHash,
     illustrationWidth,
     illustrationHeight,
+    // Inlined summary text (schema v2): the buffers were already read for the files
+    // rows, so GET /sections and the SSE hydrator can answer without touching disk.
+    shortSummary: buffers.get('summary-short.md')?.toString('utf8') ?? null,
+    longSummary: buffers.get('summary-long.md')?.toString('utf8') ?? null,
   }
   return { row, meta, files, fts: { title: meta.title, body: content ?? '' } }
 }

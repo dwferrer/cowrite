@@ -46,3 +46,40 @@ const budgetKnobsOverridesShape = Object.fromEntries(
 ) as { [K in keyof typeof BudgetKnobs.shape]: z.ZodOptional<z.ZodNumber> }
 export const BudgetKnobsOverrides = z.object(budgetKnobsOverridesShape)
 export type BudgetKnobsOverrides = z.infer<typeof BudgetKnobsOverrides>
+
+// ---------------------------------------------------------------------------
+// Context-route DTOs (docs/03-api.md §3.11).
+// OWNER: 06-context-engine.md (Stage 3). Defined here so the Stage 2 route registry can
+// reference the stubs; the engine's ledger schemas (`ContextState`, …) land with it.
+// ---------------------------------------------------------------------------
+
+/** GET /context/candidates — per-fidelity token counts for the picker + edit-task pane. */
+export const ContextCandidate = z.object({
+  id: Ulid,
+  kind: ItemKind,
+  name: z.string(),
+  path: z.string(), // display breadcrumb, e.g. "Book One / Ch. 3"
+  defaultFidelity: Fidelity,
+  currentFidelity: Fidelity,
+  tokens: z.partialRecord(Fidelity, z.number().int()),
+})
+export type ContextCandidate = z.infer<typeof ContextCandidate>
+
+/** POST /context/preview body — the live token meter's request. */
+export const ContextPreviewReq = z.object({
+  taskType: z.string(), // TaskKind; string here to avoid an import cycle knot at the stub stage
+  selections: z.array(z.object({ id: Ulid, kind: ItemKind, fidelity: Fidelity })).default([]),
+  targets: z.array(ItemRef).optional(),
+})
+export type ContextPreviewReq = z.infer<typeof ContextPreviewReq>
+
+/** POST /context/preview response — fully server-fed; the client renders no budget constants. */
+export const ContextPreviewRes = z.object({
+  totalTokens: z.number().int(),
+  perRegion: z.record(z.string(), z.number().int()),
+  overSoft: z.boolean(),
+  overHard: z.boolean(),
+  softBudget: z.number().int(),
+  hardCap: z.number().int(),
+})
+export type ContextPreviewRes = z.infer<typeof ContextPreviewRes>

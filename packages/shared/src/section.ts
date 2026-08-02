@@ -50,3 +50,68 @@ export const BoundaryProposal = z.object({
   ),
 })
 export type BoundaryProposal = z.infer<typeof BoundaryProposal>
+
+// ---------------------------------------------------------------------------
+// API DTOs (docs/03-api.md §3.2, docs/04-frontend.md §4.5). This export owns the name
+// `SectionRow`; the SQLite index's internal SectionRow (apps/server index/db.ts) is a
+// different, server-private shape.
+// ---------------------------------------------------------------------------
+
+export const SectionRow = z.object({
+  id: Ulid,
+  parentId: Ulid.nullable(), // flat array, document order; client builds the tree
+  kind: z.string(),
+  orderKey: OrderKey,
+  title: z.string().nullable(),
+  titleSource: z.enum(['user', 'agent']),
+  isLeaf: z.boolean(),
+  wordCount: z.number().int(),
+  contentHash: Hash.nullable(), // null for interior sections
+  shortSummary: z.string().nullable(), // inlined: small, needed for fold rendering
+  longSummary: z.string().nullable(), // inlined at/above chapter level; null below — GET …/summaries
+  illustration: z
+    .object({
+      version: z.string(), // PNG content hash — regenerations always bump it
+      width: z.number().int(),
+      height: z.number().int(), // reserved aspect-ratio boxes (04 §5.5, §10)
+    })
+    .nullable(), // null = none (incl. user-suppressed; no badge shown)
+  stale: z.object({
+    short: z.boolean(),
+    long: z.boolean(),
+    illustration: z.boolean(),
+  }),
+})
+export type SectionRow = z.infer<typeof SectionRow>
+
+/** GET /sections/:s/content response — leaf prose, lazy-fetched at fold `full`. */
+export const SectionContent = z.object({
+  markdown: z.string(),
+  contentHash: Hash,
+})
+export type SectionContent = z.infer<typeof SectionContent>
+
+/** PATCH /sections/:s/content body; 409 conflict when baseHash is stale. */
+export const SectionContentPatch = z.object({
+  markdown: z.string(),
+  baseHash: Hash,
+})
+export type SectionContentPatch = z.infer<typeof SectionContentPatch>
+
+/** PATCH /sections/:s body — sets titleSource: "user". */
+export const SectionTitlePatch = z.object({ title: z.string().min(1) })
+export type SectionTitlePatch = z.infer<typeof SectionTitlePatch>
+
+/** GET /sections/:s/summaries response — the lazy fetch for scene-level `long`. */
+export const SectionSummaries = z.object({
+  short: z.string().nullable(),
+  long: z.string().nullable(),
+})
+export type SectionSummaries = z.infer<typeof SectionSummaries>
+
+/** PUT /sections/:s/summaries body — user edit of enrichments (author: "user"). */
+export const SummariesUpdate = z.object({
+  short: z.string().optional(),
+  long: z.string().optional(),
+})
+export type SummariesUpdate = z.infer<typeof SummariesUpdate>

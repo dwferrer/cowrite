@@ -1,0 +1,412 @@
+/*
+ * Long-form document typography + app layout skeleton (docs/04-frontend.md §5.1, §9).
+ * The doc view itself (virtualizer, fold ladder) lands with the assembly pass; these are the
+ * shared classes it and the shell build on.
+ */
+
+/* ---- shell layout (WorkView three-pane grid, §9) ---- */
+
+.work-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.work-view__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.work-header {
+  align-items: center;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+}
+
+.work-header__title {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.banner {
+  font-size: 13px;
+  padding: var(--space-2) var(--space-4);
+  text-align: center;
+}
+
+.banner--readonly {
+  background: var(--warn-bg);
+  color: var(--fg);
+}
+
+.banner--offline {
+  background: var(--danger-bg);
+  color: var(--fg);
+}
+
+/* ---- panes ---- */
+
+.situation-pane {
+  background: var(--bg-sunken);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  max-width: 480px;
+  overflow-y: auto;
+  padding: var(--space-3);
+}
+
+.world-panel {
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  bottom: 0;
+  box-shadow: var(--shadow-2);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: min(560px, 90%);
+  z-index: 20;
+}
+
+/* instruction surfaces (§8.2) — always visually distinct from prose */
+.instruction-surface {
+  background: var(--instr-bg);
+  border: 1px solid var(--instr-border);
+  border-radius: var(--radius-1);
+  font-family: var(--font-ui);
+  text-align: left;
+}
+
+/* ---- document column (§5.1) ---- */
+
+.doc-view {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-anchor: none; /* we own anchoring (§5.5) */
+}
+
+.doc-column {
+  margin: 0 auto;
+  max-width: var(--prose-measure);
+  padding: var(--space-6) var(--space-4);
+}
+
+.prose {
+  font-family: var(--font-prose);
+  font-size: var(--prose-size);
+  line-height: var(--prose-leading);
+}
+
+.prose p {
+  margin: 0 0 1em;
+}
+
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  font-family: var(--font-ui);
+  line-height: 1.3;
+}
+
+.prose blockquote {
+  border-left: 2px solid var(--border-strong);
+  color: var(--fg-muted);
+  margin: 1em 0;
+  padding-left: var(--space-4);
+}
+
+.prose img {
+  max-width: 100%;
+}
+
+/* scene break ornament (§6.1) */
+.prose hr {
+  border: none;
+  margin: 1.5em 0;
+  text-align: center;
+}
+
+.prose hr::after {
+  color: var(--fg-faint);
+  content: "✳ ✳ ✳";
+  letter-spacing: 0.75em;
+}
+
+/* decoration spans (§6.2–6.3) */
+.prose .dlg {
+  color: var(--dlg);
+}
+
+.prose .wi {
+  text-decoration: underline dotted var(--wi-underline) 1px;
+  text-underline-offset: 3px;
+}
+
+/* snippet container (§5.1): hairline border, authorship tint on the left edge */
+.snippet-block {
+  border: 1px solid var(--border);
+  border-left-width: 2px;
+  border-radius: var(--radius-1);
+  margin: var(--space-3) 0;
+  padding: var(--space-3) var(--space-4);
+}
+
+.snippet-block--user {
+  border-left-color: var(--prov-user);
+}
+
+.snippet-block--agent {
+  border-left-color: var(--prov-agent);
+}
+
+.snippet-block--mixed {
+  border-image: linear-gradient(var(--prov-user), var(--prov-agent)) 1;
+  border-left-style: solid;
+}
+
+.snippet-block--selected {
+  background: color-mix(in oklch, var(--accent-bg) 15%, transparent);
+}
+
+.section-heading {
+  align-items: baseline;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  font-family: var(--font-ui);
+  gap: var(--space-2);
+  margin: var(--space-5) 0 var(--space-3);
+  padding-bottom: var(--space-1);
+}
+
+.section-heading__title {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.stale-badge {
+  color: var(--warn);
+  cursor: help;
+  font-size: 12px;
+}
+
+/* ---- doc view host (§5.4–5.5) ---- */
+
+.doc-view-wrap {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.doc-view-wrap .doc-view {
+  height: 100%;
+}
+
+.jump-to-frontier {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  bottom: var(--space-4);
+  box-shadow: var(--shadow-1);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font: inherit;
+  padding: var(--space-1) var(--space-3);
+  position: absolute;
+  right: var(--space-5);
+  z-index: 10;
+}
+
+/* lazy leaf prose placeholder, sized by the word-count estimate (§5.6) */
+.section-skeleton {
+  background: linear-gradient(180deg, var(--bg-sunken) 0 20px, transparent 20px 28px);
+  background-size: 100% 28px;
+  border-radius: var(--radius-1);
+  opacity: 0.6;
+}
+
+/* illustration reserved box (§10): floats right of prose at full fold */
+.section-illustration {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-1);
+  float: right;
+  margin: 0 0 var(--space-3) var(--space-4);
+  overflow: hidden;
+  width: min(320px, 40%);
+}
+
+.section-illustration img {
+  display: block;
+  height: auto;
+  width: 100%;
+}
+
+.section-block {
+  overflow-wrap: break-word;
+}
+
+.section-block::after {
+  clear: both;
+  content: "";
+  display: block;
+}
+
+/* ---- name card (§5.1, §10) ---- */
+
+.name-card {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2);
+  display: flex;
+  font-family: var(--font-ui);
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+  min-height: 96px;
+  padding: var(--space-2) var(--space-3);
+}
+
+.name-card__img {
+  border-radius: var(--radius-1);
+  flex-shrink: 0;
+  height: 72px;
+  object-fit: cover;
+  width: 72px;
+}
+
+.name-card__img--placeholder {
+  align-items: center;
+  color: oklch(0.35 0.02 250);
+  display: flex;
+  font-weight: 600;
+  justify-content: center;
+}
+
+.name-card__title {
+  font-weight: 600;
+}
+
+.name-card__hook {
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+/* ---- selection + editing (§7) ---- */
+
+.snippet-block {
+  position: relative;
+}
+
+.selection-toolbar {
+  align-items: center;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-1);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  position: absolute;
+  right: var(--space-2);
+  top: calc(-1 * var(--space-4));
+  z-index: 5;
+}
+
+.selection-toolbar__chip {
+  color: var(--fg-muted);
+  text-transform: capitalize;
+}
+
+.snippet-footer {
+  border-top: 1px solid var(--border);
+  color: var(--fg-muted);
+  display: flex;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+}
+
+.snippet-editor__textarea {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-1);
+  color: var(--fg);
+  field-sizing: content;
+  font-family: var(--font-prose);
+  font-size: var(--prose-size);
+  line-height: var(--prose-leading);
+  padding: var(--space-2);
+  resize: vertical;
+  width: 100%;
+}
+
+.editor-banner {
+  align-items: center;
+  background: var(--warn-bg);
+  border-radius: var(--radius-1);
+  display: flex;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+
+.editor-banner--conflict {
+  background: var(--danger-bg);
+}
+
+/* ---- frontier bar (§8.1) ---- */
+
+.frontier-bar {
+  padding: var(--space-3) 0 var(--space-6);
+}
+
+.frontier-bar__controls {
+  align-items: center;
+  display: flex;
+  gap: var(--space-3);
+}
+
+/* ---- world panel bits (§9.3) ---- */
+
+.key-chip {
+  align-items: center;
+  background: var(--accent-bg);
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 4px;
+  padding: 2px 10px;
+}
+
+.key-chip__remove {
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+}
+
+.situation-rest {
+  overflow-y: auto;
+}

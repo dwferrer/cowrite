@@ -5,6 +5,7 @@ import { ulid } from 'ulid'
 import { StorageError } from './errors.js'
 import { parseFrontmatter, serializeFrontmatter } from './lib/frontmatter.js'
 import { ensureDir, readIfExists, writeFileAtomic } from './lib/fsx.js'
+import { xxh64OfString } from './lib/hash.js'
 import {
   slugify,
   worldEntriesDir,
@@ -14,7 +15,7 @@ import {
   worldImageSidecarPath,
   worldImagesDir,
 } from './lib/paths.js'
-import type { WorldEntry } from './storageTypes.js'
+import type { WorldEntry, WorldEntryWriteResult } from './storageTypes.js'
 
 /**
  * World-info file store (spec 02 §2.6, §5.4): one frontmatter Markdown file per entry,
@@ -99,22 +100,43 @@ export interface WorldEntryUpsert {
   shortSummary?: string | null
   createdBy: 'user' | 'agent'
   body: string
+  /**
+   * Optimistic-concurrency token (03 §3.5 PATCH): xxh64 of the entry's current BODY.
+   * Requires `id`. A stale token returns the §6.6-style conflict result; omitting the
+   * token keeps the historical last-write-wins create/update semantics.
+   */
+  baseHash?: string
 }
 
 /**
  * Create or update an entry (§5.4 frontmatter + Markdown body). Updates keep the
  * existing file path even when the name changes — filename slugs are a human mirror,
  * and renames are the reconciler's territory (§8). `updatedAt` is stamped here.
+ * With `baseHash` set, a vanished target throws WorldEntryNotFoundError (typed 404,
+ * never a conflict — the conflict shape cannot represent a missing entry).
  */
 export async function upsertWorldEntry(
   workDirPath: string,
   input: WorldEntryUpsert,
-): Promise<WorldEntry> {
+): Promise<WorldEntryWriteResult> {
   await ensureDir(worldEntriesDir(workDirPath))
   const existing =
     input.id === undefined
       ? undefined
       : (await listWorldEntries(workDirPath)).find((e) => e.meta.id === input.id)
+
+  if (input.baseHash !== undefined) {
+    if (input.id === undefined) {
+      throw new StorageError('baseHash requires an entry id (create carries no token)', 'invalid', {
+        kind: 'world',
+      })
+    }
+    if (existing === undefined) throw new WorldEntryNotFoundError(input.id)
+    const currentHash = await xxh64OfString(existing.body)
+    if (currentHash !== input.baseHash) {
+      return { ok: false, conflict: { currentHash, currentText: existing.body } }
+    }
+  }
 
   const id = input.id ?? ulid()
   const meta = WorldEntryMeta.parse({
@@ -131,7 +153,7 @@ export async function upsertWorldEntry(
     existing?.filePath ??
     path.join(worldEntriesDir(workDirPath), worldEntryFileName(slugify(input.name), id))
   await writeFileAtomic(filePath, serializeEntry(meta, input.body))
-  return { meta, body: input.body, filePath }
+  return { ok: true, entry: { meta, body: input.body, filePath } }
 }
 
 /**
@@ -170,6 +192,26 @@ export async function putWorldImage(
   const updated = WorldEntryMeta.parse({ ...entry.meta, image: imagePath })
   await writeFileAtomic(entry.filePath, serializeEntry(updated, entry.body))
   return { imagePath }
+}
+
+/**
+ * Clear an entry's image: null the frontmatter pointer and remove the PNG + sidecar.
+ * Throws WorldEntryNotFoundError for an unknown entry; a no-image entry is an idempotent
+ * no-op (`removed: false`) — stray bytes are still swept either way.
+ */
+export async function deleteWorldImage(
+  workDirPath: string,
+  entryId: string,
+): Promise<{ removed: boolean }> {
+  const entry = await getWorldEntry(workDirPath, entryId)
+  const removed = entry.meta.image !== null
+  if (removed) {
+    const updated = WorldEntryMeta.parse({ ...entry.meta, image: null })
+    await writeFileAtomic(entry.filePath, serializeEntry(updated, entry.body))
+  }
+  await fsp.rm(worldImagePath(workDirPath, entryId), { force: true })
+  await fsp.rm(worldImageSidecarPath(workDirPath, entryId), { force: true })
+  return { removed }
 }
 
 const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g

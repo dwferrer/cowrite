@@ -70,6 +70,9 @@ describe('fullRebuild', () => {
     expect(sec1?.illustrationHash).toMatch(/^xxh64:[0-9a-f]{16}$/)
     expect(sec1?.illustrationWidth).toBe(640)
     expect(sec1?.illustrationHeight).toBe(480)
+    // summary text is inlined into the row (schema v2) so reads skip the files
+    expect(sec1?.shortSummary).toBe('Keeper watches the harbor.\n')
+    expect(sec1?.longSummary).toBe('A longer summary of chapter one.\n')
 
     const sec2 = rows[1]
     expect(sec2?.titleSource).toBe('user')
@@ -81,6 +84,8 @@ describe('fullRebuild', () => {
     expect(sec2?.illustrationStale).toBe(false)
     expect(sec2?.illustrationHash).toBeNull()
     expect(sec2?.illustrationWidth).toBeNull()
+    expect(sec2?.shortSummary).toBeNull() // no summary files on sec2
+    expect(sec2?.longSummary).toBeNull()
 
     expect(db.staleSections().map((r) => r.id)).toEqual([FIX.sec1, FIX.sec2])
   })
