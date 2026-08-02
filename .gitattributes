@@ -1,0 +1,8 @@
+# Normalize all text to LF in the repo and on checkout — the storage layer hashes file bytes
+# and writes LF JSONL, so working trees must not be CRLF-rewritten (Windows included).
+* text=auto eol=lf
+
+# True binaries
+*.png binary
+*.ico binary
+*.woff2 binary
