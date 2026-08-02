@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseArgs, titleFromPositionals } from './cli.js'
+import { parseArgs, stripBom, titleFromPositionals } from './cli.js'
 
 describe('parseArgs', () => {
   it('splits positionals from --flag forms', () => {
@@ -27,5 +27,16 @@ describe('titleFromPositionals (works create)', () => {
 
   it('is null for a missing title', () => {
     expect(titleFromPositionals(['works', 'create'])).toBeNull()
+  })
+})
+
+describe('stripBom', () => {
+  it('removes a leading UTF-8 BOM (PowerShell 5.1 stdin)', () => {
+    expect(stripBom('﻿Mara pressed her palm.')).toBe('Mara pressed her palm.')
+  })
+
+  it('leaves BOM-free text and interior U+FEFF untouched', () => {
+    expect(stripBom('plain text')).toBe('plain text')
+    expect(stripBom('a﻿b')).toBe('a﻿b')
   })
 })

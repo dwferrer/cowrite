@@ -78,10 +78,15 @@ export function titleFromPositionals(positionals: string[]): string | null {
   return title === '' ? null : title
 }
 
+// PowerShell 5.1 pipes stdin with a UTF-8 BOM; it must not become story text.
+export function stripBom(text: string): string {
+  return text.replace(/^﻿/, '')
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = []
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer)
-  return Buffer.concat(chunks).toString('utf8')
+  return stripBom(Buffer.concat(chunks).toString('utf8'))
 }
 
 function staleBadges(row: SectionRow): string {

@@ -15,6 +15,9 @@ data/
 .vscode/
 *.log
 
+# Claude Code machine-local settings
+.claude/settings.local.json
+
 # Playwright
 test-results/
 playwright-report/
