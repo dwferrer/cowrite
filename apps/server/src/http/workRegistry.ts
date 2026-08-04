@@ -39,6 +39,13 @@ export interface OpenWork {
   slug: string
   handle: WorkHandle
   bus: WorkEventBus
+  /**
+   * Register a per-open resource teardown (engine close, in-flight append settlement).
+   * Runs — and is awaited — during the §4.2 close path AFTER the close hooks but BEFORE
+   * `handle.close()` and any directory rename, so a DELETE cannot EPERM on Windows while
+   * a resource still has appends in flight (03 §4.3 ordering).
+   */
+  addCloseResource(teardown: () => void | Promise<void>): void
 }
 
 interface WorkState extends OpenWork {
@@ -47,6 +54,7 @@ interface WorkState extends OpenWork {
   reconcileTimer: NodeJS.Timeout | null
   idleCloseTimer: NodeJS.Timeout | null
   closing: boolean
+  closeResources: Array<() => void | Promise<void>>
   /** Set the moment `closing` flips true — awaited by delete/close racing the teardown. */
   closePromise: Promise<void> | null
 }
@@ -63,6 +71,8 @@ export class WorkRegistry {
 
   private readonly states = new Map<string, WorkState>() // keyed by slug
   private readonly opening = new Map<string, Promise<OpenWork>>()
+  private readonly closeHooks = new Set<(open: OpenWork) => void | Promise<void>>()
+  private readonly openHooks = new Set<(open: OpenWork) => void>()
   private idToSlug: Map<string, string> | null = null
 
   constructor(storage: StorageService, options: WorkRegistryOptions = {}) {
@@ -79,6 +89,33 @@ export class WorkRegistry {
 
   get openCount(): number {
     return this.states.size
+  }
+
+  /**
+   * Register a work-close hook, run at the START of the §4.2 close path — before the
+   * SSE stream ends and the handle closes, so the hook can still publish final events
+   * and write through storage. The harness uses this to cancel a closing work's lanes
+   * (05 §6.2 work close; skip-boundary-on-close is Stage 4's note). Hook errors are
+   * reported via `onError`, never abort the close.
+   */
+  onClose(hook: (open: OpenWork) => void | Promise<void>): () => void {
+    this.closeHooks.add(hook)
+    return () => {
+      this.closeHooks.delete(hook)
+    }
+  }
+
+  /**
+   * Register a work-open hook, run synchronously as each work finishes opening — the
+   * harness uses it to install the bus's attach-time task-state provider (03 §8.3), so
+   * a fresh SSE connection hydrates without a pre-fetch. Hook errors are reported via
+   * `onError`, never abort the open.
+   */
+  onOpen(hook: (open: OpenWork) => void): () => void {
+    this.openHooks.add(hook)
+    return () => {
+      this.openHooks.delete(hook)
+    }
   }
 
   /** Drop the id⇄slug cache; next resolve rescans. Called on create/delete. */
@@ -137,6 +174,7 @@ export class WorkRegistry {
     const adapter = attachStorageAdapter(handle, bus, {
       onError: (err) => this.onError(`event adapter for '${slug}'`, err),
     })
+    const closeResources: Array<() => void | Promise<void>> = []
     const state: WorkState = {
       id: handle.work.id,
       slug,
@@ -147,9 +185,20 @@ export class WorkRegistry {
       reconcileTimer: null,
       idleCloseTimer: null,
       closing: false,
+      closeResources,
       closePromise: null,
+      addCloseResource: (teardown) => {
+        closeResources.push(teardown)
+      },
     }
     this.states.set(slug, state)
+    for (const hook of [...this.openHooks]) {
+      try {
+        hook(state)
+      } catch (err) {
+        this.onError(`open hook for '${slug}'`, err)
+      }
+    }
     this.scheduleIdleClose(state)
     return state
   }
@@ -220,6 +269,25 @@ export class WorkRegistry {
       if (state.idleCloseTimer !== null) {
         clearTimeout(state.idleCloseTimer)
         state.idleCloseTimer = null
+      }
+      // Close hooks first (harness lane cancellation): the bus is still live, so final
+      // task events publish, and the handle is still open for run-file finalization.
+      for (const hook of [...this.closeHooks]) {
+        try {
+          await hook(state)
+        } catch (err) {
+          this.onError(`close hook for '${slug}'`, err)
+        }
+      }
+      // Per-open resources next (context engine, other appenders): their teardown must
+      // settle in-flight file appends BEFORE handle.close()/any rename — Windows EPERMs
+      // on directories with open handles (03 §4.3).
+      for (const teardown of state.closeResources) {
+        try {
+          await teardown()
+        } catch (err) {
+          this.onError(`close resource for '${slug}'`, err)
+        }
       }
       state.adapter.detach()
       await state.adapter.settled().catch(() => {})

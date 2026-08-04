@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  createWorkViaApi,
   destroyTestCtx,
   expectEnvelope,
   makeTestCtx,
@@ -8,10 +9,10 @@ import {
 } from './testUtil.js'
 
 /**
- * Registered-but-stubbed routes (docs/03-api.md §6.2): every Stage-3/4/5 route exists
- * now and answers 501 with the §7 envelope carrying the `not_implemented` code. Bodies
- * are still validated: a malformed TaskSpec 400s before the 501. `/tasks/estimate` is M2
- * and deliberately absent (404).
+ * Registered-but-stubbed routes (docs/03-api.md §6.2): the remaining Stage-4/5 routes
+ * exist now and answer 501 with the §7 envelope carrying the `not_implemented` code.
+ * Task/run/proposal routes went live with the Stage-3 harness (their behavior is tested
+ * in src/harness/); `/tasks/estimate` is M2 and deliberately absent (404).
  */
 
 let ctx: TestCtx
@@ -25,22 +26,10 @@ afterEach(async () => {
 })
 
 const w = `/api/works/${NO_SUCH_ID}`
-const t = NO_SUCH_ID
 
 const STUBS: Array<{ method: 'GET' | 'POST'; url: string; payload?: Record<string, unknown> }> = [
-  { method: 'POST', url: `${w}/tasks`, payload: { kind: 'continue' } },
-  { method: 'GET', url: `${w}/tasks` },
-  { method: 'GET', url: `${w}/tasks/${t}` },
-  { method: 'POST', url: `${w}/tasks/${t}/cancel` },
-  { method: 'POST', url: `${w}/tasks/${t}/proposal/apply` },
-  { method: 'POST', url: `${w}/tasks/${t}/proposal/discard` },
   { method: 'POST', url: `${w}/consolidate` },
   { method: 'POST', url: `${w}/consolidations/some-token/undo` },
-  { method: 'GET', url: `${w}/runs/${t}` },
-  { method: 'GET', url: `${w}/runs?artifact=snippet:${t}` },
-  { method: 'GET', url: `${w}/context/candidates` },
-  { method: 'POST', url: `${w}/context/preview`, payload: { taskType: 'continue' } },
-  { method: 'POST', url: `${w}/context/reset` },
   { method: 'GET', url: '/api/illustration/health' },
 ]
 
@@ -60,13 +49,23 @@ describe('stub routes', () => {
     }
   })
 
-  it('POST /tasks validates the TaskSpec body before stubbing (400)', async () => {
+  it('POST /tasks validates the TaskSpec body before any handler logic (400)', async () => {
     const res = await ctx.app.inject({
       method: 'POST',
       url: `${w}/tasks`,
       payload: { kind: 'no-such-kind' },
     })
     expectEnvelope(res, 400, 'validation')
+  })
+
+  it('POST /tasks answers 501 for kinds whose stage has not landed', async () => {
+    const work = await createWorkViaApi(ctx, 'Stubbed Kinds')
+    const res = await ctx.app.inject({
+      method: 'POST',
+      url: `/api/works/${work.id}/tasks`,
+      payload: { kind: 'enrich-section', sectionId: NO_SUCH_ID },
+    })
+    expectEnvelope(res, 501, 'not_implemented')
   })
 
   it('GET /runs requires the artifact query param (400)', async () => {

@@ -405,11 +405,18 @@ frontend's rule that every instruction-entry surface is visually distinct from p
 
 ## 6. Templates (v0 — subject to profiling)
 
-Templates live in `prompts/` as Markdown files with `{{slot}}` substitution, hot-reloaded in
-dev (05 §layout). Slots are filled by the engine (regions) or the handler (ids, directives).
-The concatenated template set is content-hashed and the hash recorded in every run's
-`meta.params.promptsHash` (§9). All wording below is **v0**: it ships, gets profiled, and gets
-rewritten — the grammar is the contract, the prose is not.
+Templates live in `apps/server/src/prompt/templates/` as Markdown files with `{{slot}}`
+substitution (05 §layout). Slots are filled by the engine (regions) or the handler (ids,
+directives). The concatenated template set is content-hashed and the hash recorded in every
+run's `meta.params.promptsHash` (§9). All wording below is **v0**: it ships, gets profiled, and
+gets rewritten — the grammar is the contract, the prose is not.
+
+**Shipped file naming** (the sections below are organized by kind; the files split the
+`<instructions>` body from the `<task>` region): `system.md`; `continue.md` + `quick-edit.md`
+(instructions bodies, §6.2/§6.3); `continue-task.md`, `instructed-continue-task.md`,
+`quick-edit-task.md` (per-kind `<task>` regions); `enrich.md` (§6.5); `boundaries.md` (§6.6);
+`refresh.md` (the §6.7 refresh turn); `repair.md` (§6.8). There is no `edit-task.md` yet —
+§6.4 lands with M2.
 
 ### 6.1 `system.md` — all interactive kinds, per-work stable
 

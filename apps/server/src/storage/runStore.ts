@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { RunEvent } from '@cowrite/shared'
+import { RunEvent, type RunEventInput } from '@cowrite/shared'
 import {
   appendJsonlLine,
   ensureDir,
@@ -30,7 +30,8 @@ export interface RunSink {
   readonly filePath: string
   /** true once a `result` event has been appended; further appends reject. */
   readonly closed: boolean
-  append(event: RunEvent): Promise<void>
+  /** Accepts the writer-side (input) shape; defaults are materialized by validation. */
+  append(event: RunEventInput): Promise<void>
 }
 
 /**
@@ -61,7 +62,9 @@ async function readLastRunEvent(filePath: string): Promise<RunEvent | null> {
  * schema and becomes exactly one JSONL line; appends are internally serialized so
  * un-awaited callers cannot interleave lines. After a `result` event the sink is
  * write-once: subsequent appends reject (§10.7) — including a sink re-opened on an
- * already-finished run file. A torn tail left by a crash is physically dropped at open
+ * already-finished run file. The single exception is the `proposal` resolution event,
+ * which docs/05 §5.1 defines as appended AFTER the result by proposal apply/discard (the
+ * durable idempotence marker). A torn tail left by a crash is physically dropped at open
  * so the first append never fuses with it into mid-file corruption (§9.1).
  */
 export async function recordRun(
@@ -72,16 +75,21 @@ export async function recordRun(
   const filePath = runFilePath(runsDir(workDirPath), runId, startedAtIso)
   await ensureDir(path.dirname(filePath))
   await truncateTornTail(filePath)
-  let closed = (await readLastRunEvent(filePath))?.type === 'result'
+  // A `proposal` line can only ever follow a result (05 §5.1), so both mean "finished".
+  const lastType = (await readLastRunEvent(filePath))?.type
+  let closed = lastType === 'result' || lastType === 'proposal'
   let chain: Promise<void> = Promise.resolve()
   return {
     filePath,
     get closed() {
       return closed
     },
-    async append(event: RunEvent): Promise<void> {
-      if (closed) throw new Error(`run ${runId} is closed (result already recorded)`)
+    async append(event: RunEventInput): Promise<void> {
       const valid = RunEvent.parse(event)
+      // Write-once after the result — except the post-result proposal resolution (05 §5.1).
+      if (closed && valid.type !== 'proposal') {
+        throw new Error(`run ${runId} is closed (result already recorded)`)
+      }
       // Close immediately, before the write flushes, so a racing append after a result
       // rejects even when neither call has been awaited yet.
       if (valid.type === 'result') closed = true
@@ -172,16 +180,19 @@ export async function finalizeCrashedRuns(workDirPath: string): Promise<CrashFin
       if (!match || match[1] === undefined) continue
       const filePath = path.join(shard, name)
       try {
-        // Cheap probe: only the last line decides whether the run already finished.
-        if ((await readLastRunEvent(filePath))?.type === 'result') continue
+        // Cheap probe: only the last line decides whether the run already finished
+        // (a `proposal` resolution is only ever appended after a result — 05 §5.1).
+        const lastType = (await readLastRunEvent(filePath))?.type
+        if (lastType === 'result' || lastType === 'proposal') continue
 
         const { lines } = await readJsonl(filePath) // throws on mid-file corruption
         const last = lines[lines.length - 1]
-        if (isRecord(last) && last.type === 'result') continue
+        if (isRecord(last) && (last.type === 'result' || last.type === 'proposal')) continue
 
         let promptTokens = 0
         let completionTokens = 0
-        const outputs: string[] = []
+        let estimated = false
+        const outputs: Array<{ text: string; attempt: number }> = []
         for (const line of lines) {
           if (!isRecord(line)) continue
           if (line.type === 'usage') {
@@ -189,16 +200,28 @@ export async function finalizeCrashedRuns(workDirPath: string): Promise<CrashFin
             if (typeof line.completionTokens === 'number') {
               completionTokens += line.completionTokens
             }
+            if (line.estimated === true) estimated = true
           } else if (line.type === 'output' && typeof line.text === 'string') {
-            outputs.push(line.text)
+            outputs.push({
+              text: line.text,
+              attempt: typeof line.attempt === 'number' ? line.attempt : 1,
+            })
           }
         }
+        // partialText joins ONLY the final attempt's output events (05 §6.5): a run that
+        // died after a mid-stream retry recorded the abandoned attempt's text under an
+        // earlier attempt index — fusing attempts would offer doubled prose.
+        const finalAttempt = outputs.reduce((max, o) => Math.max(max, o.attempt), 1)
+        const partialText = outputs
+          .filter((o) => o.attempt === finalAttempt)
+          .map((o) => o.text)
+          .join('')
         const result = RunEvent.parse({
           type: 'result',
           status: 'error',
           error: { code: 'crash', message: 'run ended without a result; finalized at work open' },
-          usageTotal: { promptTokens, completionTokens },
-          partialText: outputs.length ? outputs.join('') : null,
+          usageTotal: { promptTokens, completionTokens, estimated },
+          partialText: partialText === '' ? null : partialText,
           artifacts: [],
           endedAt: new Date().toISOString(),
         })

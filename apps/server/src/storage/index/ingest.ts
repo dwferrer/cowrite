@@ -526,6 +526,7 @@ export async function loadRunFromDisk(workDir: string, fileAbs: string): Promise
     status: result?.status ?? null,
     promptTokens: result?.usageTotal.promptTokens ?? null,
     completionTokens: result?.usageTotal.completionTokens ?? null,
+    usageEstimated: result === null ? null : result.usageTotal.estimated ? 1 : 0,
     filePath: toWorkRelative(workDir, fileAbs),
   }
   const artifacts: RunArtifactRow[] = []

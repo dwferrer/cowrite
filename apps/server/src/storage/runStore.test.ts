@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import type { RunEvent } from '@cowrite/shared'
+import type { RunEvent, RunEventInput } from '@cowrite/shared'
 import { ulid } from 'ulid'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runsDir } from './lib/paths.js'
@@ -19,21 +19,21 @@ afterEach(async () => {
 
 const STARTED_AT = '2026-07-06T14:01:58Z'
 
-function metaEvent(runId: string): RunEvent {
+function metaEvent(runId: string): RunEventInput {
   return {
     type: 'meta',
     runId,
     kind: 'continue',
     lane: 'high',
     model: 'glm-5',
-    spec: {},
+    spec: { kind: 'continue' },
     params: { maxTokens: 2048 },
     contextSnapshot: null,
     startedAt: STARTED_AT,
   }
 }
 
-function resultEvent(): RunEvent {
+function resultEvent(): RunEventInput {
   return {
     type: 'result',
     status: 'ok',
@@ -167,11 +167,30 @@ describe('finalizeCrashedRuns (§10.7)', () => {
       code: 'crash',
       message: expect.stringContaining('without a result'),
     })
-    expect(last.usageTotal).toEqual({ promptTokens: 100, completionTokens: 20 })
+    expect(last.usageTotal).toEqual({ promptTokens: 100, estimated: false, completionTokens: 20 })
     expect(last.partialText).toBe('Mara pressed her palm')
 
     // The healthy run was untouched.
     expect(await readRun(workDir, healthy)).toHaveLength(2)
+  })
+
+  it('crash after a mid-stream retry: partialText is the FINAL attempt only (05 §6.5)', async () => {
+    // Attempt 1 streamed and was abandoned; attempt 2 streamed, then the process died.
+    // Joining both attempts would offer doubled prose — only attempt 2's text counts.
+    const crashed = ulid()
+    const sink = await recordRun(workDir, crashed, STARTED_AT)
+    await sink.append(metaEvent(crashed))
+    await sink.append({ type: 'output', text: 'Abandoned first-attempt prose. ', attempt: 1 })
+    await sink.append({ type: 'attempt', n: 2, reason: 'endpoint_unreachable' })
+    await sink.append({ type: 'output', text: 'Final attempt ', attempt: 2 })
+    await sink.append({ type: 'output', text: 'prose only.', attempt: 2 })
+
+    await finalizeCrashedRuns(workDir)
+    const events = await readRun(workDir, crashed)
+    const last = events[events.length - 1]
+    if (last?.type !== 'result') throw new Error('expected a result line')
+    expect(last.partialText).toBe('Final attempt prose only.')
+    expect(last.partialText).not.toContain('Abandoned')
   })
 
   it('starts a fresh line under a torn tail', async () => {

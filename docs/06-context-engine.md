@@ -699,14 +699,16 @@ For a target inside a frozen section ("far" ≝ not among the un-consolidated sn
 ```ts
 // apps/server/src/context/engine.ts
 export class ContextEngine {
-  static async load(work: WorkHandle, deps: EngineDeps): Promise<ContextEngine>;
+  static async load(deps: EngineDeps): Promise<ContextEngine>;
   /** Interactive TaskSpecs only; throws SessionBusyError if a session is open
    *  (defensive — 05's interactive-lane capacity of 1 plus the background bypass
-   *  make it unreachable in practice). */
-  beginTask(spec: TaskSpec): TaskContextSession;
-  candidates(): ContextCandidate[];              // GET /context/candidates
-  preview(req: PreviewRequest): PreviewResponse; // POST /context/preview
-  reset(): Promise<void>;                        // POST /context/reset
+   *  make it unreachable in practice). Async: captures the WorkSnapshot (§10). */
+  beginTask(spec: TaskSpec): Promise<TaskContextSession>;
+  stateRes(): Promise<ContextStateRes>;                   // GET /context/state
+  candidates(): Promise<ContextCandidate[]>;              // GET /context/candidates
+  preview(req: PreviewRequest): Promise<PreviewResponse>; // POST /context/preview
+  reset(): Promise<void>;                                 // POST /context/reset
+  usage(limit: number): Promise<UsageEvent[]>;            // GET /context/usage (bounded tail)
 }
 
 export interface TaskContextSession {
@@ -721,15 +723,19 @@ export interface TaskContextSession {
 }
 
 export interface EngineDeps {                    // everything injected = everything mockable
+  workId: Ulid;
+  contextDir: string;             // .cowrite/context/ of the work (state.json + usage.jsonl)
   manuscript: ManuscriptReader;   // section tree, content, summaries, snippets (02 readers)
   worldInfo: WorldInfoReader;
   situation: SituationReader;     // getSituation() (02 §situation)
-  channels: {                     // in-process EventBus channels (03 §in-process channels)
+  channels?: {                    // in-process EventBus channels (03 §in-process channels)
     emitEnrichmentWanted(sectionId: Ulid): void;
     onEnrichmentCompleted(cb: (sectionId: Ulid) => void): Unsubscribe;
+    onWorkChanged(cb: () => void): Unsubscribe;  // storage onChange → snapshot-cache invalidation
   };
   onUsage?: (e: UsageEvent) => void;   // teed to usage.jsonl by the engine; exposed for tests
-  knobs?: Partial<BudgetKnobs>;
+  knobs?: Partial<BudgetKnobs> | (() => Partial<BudgetKnobs>); // §8.1 chain, re-read per task
+  renderer: PromptRenderer;            // template-backed in production — 07 §6 owns wording
   now?: () => Date;
 }
 ```

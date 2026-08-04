@@ -4,6 +4,8 @@ import {
   ConfigTestReq,
   ConfigUpdate,
   ConfigWriteRes,
+  HarnessKnobs,
+  HarnessKnobsOverrides,
   ModelEndpoint,
   ProbeResult,
   PublicConfig,
@@ -82,6 +84,49 @@ describe('AppConfig fields', () => {
     expect(AppConfig.safeParse({ server: { port: 0 } }).success).toBe(false)
     expect(AppConfig.safeParse({ server: { port: 70_000 } }).success).toBe(false)
     expect(AppConfig.safeParse({ schemaVersion: 2 }).success).toBe(false)
+  })
+})
+
+describe('HarnessKnobs (05 §6.4 — the config.harness fragment)', () => {
+  it('materializes every documented default from {}', () => {
+    expect(HarnessKnobs.parse({})).toEqual({
+      connectTimeoutMs: 15_000,
+      firstTokenTimeoutMs: 60_000,
+      idleTokenTimeoutMs: 30_000,
+      totalTimeoutMs: { high: 300_000, low: 120_000 },
+      illustrationBudgetMs: 600_000,
+      retry: { maxAttempts: 3, backoffMs: 1_000, backoffMaxMs: 4_000 },
+      spendWarnUsd: 5,
+      spendStopUsd: null,
+    })
+  })
+
+  it('carries no planning caps — those are BudgetKnobs fields (06 §8.1), never duplicated', () => {
+    expect(Object.keys(HarnessKnobs.shape)).toEqual([
+      'connectTimeoutMs',
+      'firstTokenTimeoutMs',
+      'idleTokenTimeoutMs',
+      'totalTimeoutMs',
+      'illustrationBudgetMs',
+      'retry',
+      'spendWarnUsd',
+      'spendStopUsd',
+    ])
+  })
+
+  it('spend-guard knobs: warn defaults on at $5, stop defaults off (null)', () => {
+    const knobs = HarnessKnobs.parse({ spendWarnUsd: null, spendStopUsd: 12.5 })
+    expect(knobs.spendWarnUsd).toBeNull() // null disables the threshold
+    expect(knobs.spendStopUsd).toBe(12.5)
+    expect(HarnessKnobs.safeParse({ spendStopUsd: -1 }).success).toBe(false)
+  })
+
+  it('overrides stay sparse — no re-materialized defaults (the zod 4 .partial() gotcha)', () => {
+    expect(HarnessKnobsOverrides.parse({})).toEqual({})
+    expect(HarnessKnobsOverrides.parse({ totalTimeoutMs: { high: 600_000 } })).toEqual({
+      totalTimeoutMs: { high: 600_000 },
+    })
+    expect(HarnessKnobsOverrides.safeParse({ retry: { maxAttempts: 0 } }).success).toBe(false)
   })
 })
 

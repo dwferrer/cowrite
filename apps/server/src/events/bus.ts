@@ -12,9 +12,11 @@ import { ulid } from 'ulid'
  *
  * The bus also carries the §8.5 in-process-only channels (events that never hit the wire:
  * storage's `work.changed`/`run.recorded`, the engine's `enrichment_wanted`, …) and the
- * per-target text accumulator STRUCTURE for Stage 3 task streaming (empty by construction
- * until the harness lands and fills it — `snapshotEvents()` renders it into synthetic
- * `task.snapshot` events during §8.3 negotiation).
+ * per-target text accumulator for Stage 3 task streaming: `publishTaskDelta` coalesces
+ * `task.delta` events to ≤ 30/s per (task, target) (03 §8.2) while accumulating the full
+ * streamed text, so `snapshotEvents()` can render one synthetic `task.snapshot` per active
+ * target during §8.3 negotiation (reconnect mid-stream replays one snapshot, then live
+ * deltas). The harness resets a task's stream on retry and ends it at terminal events.
  */
 
 export interface EventSink {
@@ -27,6 +29,17 @@ export type InProcessEvent = { type: string } & Record<string, unknown>
 export type InProcessListener = (event: InProcessEvent) => void
 export type Unsubscribe = () => void
 
+/**
+ * Attach-time task-state frames (03 §8.3 hydration fencing): the harness registers a
+ * provider that renders the current interactive task — or, with no live task, the latest
+ * terminal task still offering an unresolved proposal — as synthetic `task.state`
+ * event(s). `attach` emits them on EVERY attach, before the `task.snapshot` sequence, so
+ * a fresh EventSource hydrates purely from the stream (no fetch-to-subscribe gap). A
+ * promise-returning provider (lazy reconstruction from run files after a restart) has its
+ * frames written as soon as it settles, provided the sink is still attached.
+ */
+export type AttachStateProvider = () => WorkEvent[] | Promise<WorkEvent[]>
+
 export interface WorkEventBusOptions {
   /** `:hb` comment cadence; docs/03 §8.2 fixes 15 s. */
   heartbeatMs?: number
@@ -36,6 +49,8 @@ export interface WorkEventBusOptions {
   ringMs?: number
   /** Ring budget in frame bytes (default ~4 MB) — bounds memory under bulk bursts. */
   ringMaxBytes?: number
+  /** `task.delta` coalescing window (03 §8.2 fixes ≤ 30/s ⇒ ~34 ms). */
+  deltaFlushMs?: number
   /** Clock injection for tests. */
   now?: () => number
 }
@@ -51,6 +66,16 @@ const HEARTBEAT_MS = 15_000
 const RING_MAX = 4096
 const RING_MS = 600_000
 const RING_MAX_BYTES = 4 * 1024 * 1024
+/** ≤ 30 `task.delta` events per second per (task, target) — 03 §8.2. */
+const DELTA_FLUSH_MS = 34
+
+/** One open coalescing window for a streaming (task, target) pair. */
+interface DeltaWindow {
+  taskId: string
+  target: string
+  pending: string
+  timer: NodeJS.Timeout
+}
 
 /** One wire frame: `id:` cursor (when given), dot-case `event:`, one-line JSON `data:`. */
 function formatFrame(id: string | null, event: WorkEvent): string {
@@ -67,24 +92,25 @@ export class WorkEventBus {
   private ringBytes = 0
   private readonly sinks = new Set<EventSink>()
   private readonly localListeners = new Set<InProcessListener>()
-  /**
-   * taskId → target → accumulated stage-2 text. STRUCTURE STUB until Stage 3: nothing
-   * mutates it yet, so `snapshotEvents()` is empty by construction — but the §8.3
-   * negotiation skeleton (resync + snapshot ordering) is already wired through it.
-   */
+  /** taskId → target → accumulated stage-2 text (fed by `publishTaskDelta`). */
   private readonly accumulators = new Map<string, Map<string, string>>()
+  /** "taskId\ntarget" → open coalescing window (leading edge published, tail buffered). */
+  private readonly deltaWindows = new Map<string, DeltaWindow>()
   private readonly heartbeatMs: number
   private readonly ringMax: number
   private readonly ringMs: number
   private readonly ringMaxBytes: number
+  private readonly deltaFlushMs: number
   private readonly now: () => number
   private heartbeat: NodeJS.Timeout | null = null
+  private attachStateProvider: AttachStateProvider | null = null
 
   constructor(options: WorkEventBusOptions = {}) {
     this.heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
     this.ringMax = options.ringMax ?? RING_MAX
     this.ringMs = options.ringMs ?? RING_MS
     this.ringMaxBytes = options.ringMaxBytes ?? RING_MAX_BYTES
+    this.deltaFlushMs = options.deltaFlushMs ?? DELTA_FLUSH_MS
     this.now = options.now ?? Date.now
     this.heartbeat = setInterval(() => {
       this.broadcast(':hb\n\n')
@@ -128,10 +154,81 @@ export class WorkEventBus {
     }
   }
 
+  // -- Stage-3 task streaming (accumulator + ≤30/s coalescing, 03 §8.2/§8.3) ----------
+
+  /**
+   * Publish one composition delta for a task target. The full text accumulates for
+   * `snapshotEvents()`; the wire event rate is coalesced to one `task.delta` per
+   * `deltaFlushMs` window per (task, target): the leading delta publishes immediately,
+   * anything arriving inside the window buffers and flushes at the window edge.
+   */
+  publishTaskDelta(taskId: string, target: string, text: string): void {
+    if (this.ended || text === '') return
+    let targets = this.accumulators.get(taskId)
+    if (targets === undefined) {
+      targets = new Map()
+      this.accumulators.set(taskId, targets)
+    }
+    targets.set(target, (targets.get(target) ?? '') + text)
+
+    const key = `${taskId}\n${target}`
+    const window = this.deltaWindows.get(key)
+    if (window !== undefined) {
+      window.pending += text
+      return
+    }
+    this.publish({ type: 'task.delta', taskId, target, text })
+    this.openDeltaWindow(key, taskId, target)
+  }
+
+  private openDeltaWindow(key: string, taskId: string, target: string): void {
+    const timer = setTimeout(() => {
+      const window = this.deltaWindows.get(key)
+      this.deltaWindows.delete(key)
+      if (window === undefined || window.pending === '') return
+      this.publish({ type: 'task.delta', taskId, target, text: window.pending })
+      // Trailing-edge flushes re-open the window so a steady stream stays ≤ 1/window.
+      if (!this.ended) this.openDeltaWindow(key, taskId, target)
+    }, this.deltaFlushMs)
+    timer.unref?.()
+    this.deltaWindows.set(key, { taskId, target, pending: '', timer })
+  }
+
+  /** Flush any buffered deltas for a task now (before stage flips / terminal events). */
+  flushTaskDeltas(taskId: string): void {
+    for (const [key, window] of [...this.deltaWindows]) {
+      if (window.taskId !== taskId) continue
+      clearTimeout(window.timer)
+      this.deltaWindows.delete(key)
+      if (window.pending !== '') {
+        this.publish({ type: 'task.delta', taskId, target: window.target, text: window.pending })
+      }
+    }
+  }
+
+  /**
+   * Drop a task's buffered and accumulated text WITHOUT publishing — the mid-stream
+   * retry path (05 §6.5): the pending overlay resets, so a reconnect must not replay
+   * the abandoned attempt's text.
+   */
+  resetTaskStream(taskId: string): void {
+    for (const [key, window] of [...this.deltaWindows]) {
+      if (window.taskId !== taskId) continue
+      clearTimeout(window.timer)
+      this.deltaWindows.delete(key)
+    }
+    this.accumulators.delete(taskId)
+  }
+
+  /** Terminal path: flush buffered deltas, then clear the accumulator (03 §8.3). */
+  endTaskStream(taskId: string): void {
+    this.flushTaskDeltas(taskId)
+    this.accumulators.delete(taskId)
+  }
+
   /**
    * The synthetic snapshot sequence for a connection that cannot be replayed exactly
-   * (§8.3). Stage 3 populates the accumulators from task streaming; until then this is
-   * empty by construction.
+   * (§8.3): one `task.snapshot` per active streaming target, fed by `publishTaskDelta`.
    */
   snapshotEvents(): WorkEvent[] {
     const events: WorkEvent[] = []
@@ -143,10 +240,17 @@ export class WorkEventBus {
     return events
   }
 
+  /** Register the attach-time task-state provider (03 §8.3); null clears it. */
+  setAttachStateProvider(provider: AttachStateProvider | null): void {
+    this.attachStateProvider = provider
+  }
+
   /**
-   * Attach one SSE subscriber. Writes the `hello` frame, then the §8.3 negotiation
-   * (exact replay when `lastEventId` is in-ring and the streamId matches; otherwise
-   * `resync` + the synthetic snapshot sequence), then live events. Returns detach.
+   * Attach one SSE subscriber. Writes the `hello` frame, then the synthetic `task.state`
+   * frame(s) from the attach-state provider (EVERY attach — hydration needs no
+   * pre-fetch), then the §8.3 negotiation (exact replay when `lastEventId` is in-ring
+   * and the streamId matches; otherwise `resync` + the synthetic snapshot sequence),
+   * then live events. Returns detach.
    */
   attach(sink: EventSink, lastEventId?: string): Unsubscribe {
     if (this.ended) {
@@ -156,6 +260,11 @@ export class WorkEventBus {
     // Age/budget eviction also runs here so replay never serves frames a publish-time
     // eviction would already have dropped (an idle bus otherwise never evicts by time).
     this.evict()
+    // Flush open coalescing windows first: a synthetic snapshot below must not be
+    // followed by a trailing-edge delta whose text the snapshot already contains.
+    for (const window of [...this.deltaWindows.values()]) {
+      this.flushTaskDeltas(window.taskId)
+    }
     const write = (chunk: string): boolean => {
       try {
         sink.write(chunk)
@@ -166,6 +275,23 @@ export class WorkEventBus {
     }
 
     write(formatFrame(this.cursor(), { type: 'hello', streamId: this.streamId, seq: this.seq }))
+
+    // Attach-time task state (03 §8.3): sync providers (a live in-memory task) write
+    // BEFORE the snapshot sequence so the snapshot has a slot to land in; async ones
+    // (lazy post-restart reconstruction from the run files) write when they settle.
+    const stateEvents = this.attachStateProvider?.()
+    const writeStateFrames = (events: WorkEvent[]): void => {
+      for (const event of events) write(formatFrame(this.cursor(), event))
+    }
+    if (Array.isArray(stateEvents)) {
+      writeStateFrames(stateEvents)
+    } else if (stateEvents !== undefined) {
+      void stateEvents
+        .then((events) => {
+          if (!this.ended && this.sinks.has(sink)) writeStateFrames(events)
+        })
+        .catch(() => {}) // a broken provider must not break the stream
+    }
 
     const resume = lastEventId === undefined ? null : this.parseCursor(lastEventId)
     if (resume === null) {
@@ -216,6 +342,8 @@ export class WorkEventBus {
     this.sinks.clear()
     this.localListeners.clear()
     this.accumulators.clear()
+    for (const window of this.deltaWindows.values()) clearTimeout(window.timer)
+    this.deltaWindows.clear()
   }
 
   /** `"<streamId>:<seq>"` → seq when the streamId is ours; null otherwise. */

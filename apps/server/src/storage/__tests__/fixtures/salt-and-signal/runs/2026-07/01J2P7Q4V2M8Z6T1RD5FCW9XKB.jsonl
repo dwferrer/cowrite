@@ -1,4 +1,4 @@
-{"type":"meta","runId":"01J2P7Q4V2M8Z6T1RD5FCW9XKB","kind":"continue","lane":"high","model":"glm-5","spec":{},"params":{"maxTokens":2048},"contextSnapshot":null,"startedAt":"2026-07-06T14:01:58Z"}
+{"type":"meta","runId":"01J2P7Q4V2M8Z6T1RD5FCW9XKB","kind":"continue","lane":"high","model":"glm-5","spec":{"kind":"continue"},"params":{"maxTokens":2048},"contextSnapshot":null,"startedAt":"2026-07-06T14:01:58Z"}
 {"type":"message","role":"system","text":"<instructions>You are co-writing a novel...</instructions>"}
 {"type":"message","role":"user","text":"<world-info>...</world-info><local-context>...</local-context>"}
 {"type":"output","text":"The harrow-boat cast off at last, and the signal bell on the mole rang twice, salt wind\ncarrying the sound flat and hard across the water.\n"}

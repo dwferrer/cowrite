@@ -61,6 +61,9 @@ test('situation saves, then an external edit forces the theirs/mine conflict', a
   await expect(banner).toBeVisible({ timeout: 10_000 })
   await page.getByTestId(testids.situationConflictMine).click()
   await expect(banner).toHaveCount(0)
+  // The banner clears synchronously on click while the PUT is still in flight — wait on
+  // visible state (the saved tick) before asserting the disk write landed (09 §6.1).
+  await expect(page.getByTestId(testids.situationSavedTick)).toBeVisible({ timeout: 10_000 })
   await expect.poll(() => readFileSync(situationPath, 'utf8')).toBe(SECOND_NOTE)
   await expect(page.getByTestId(testids.situationRendered)).toContainText(SECOND_NOTE)
 })

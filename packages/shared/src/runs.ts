@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { Fidelity } from './context.js'
 import { IsoTime, Ulid } from './ids.js'
-import { Lane, TaskKind } from './tasks.js'
+import { Lane, TaskKind, TaskSpec } from './tasks.js'
 
 /**
  * Run persistence schemas (docs/05-agents.md §7.1). One task = one run = one JSONL file at
@@ -27,6 +27,8 @@ export type ContextSnapshot = z.infer<typeof ContextSnapshot>
 const UsageTotal = z.object({
   promptTokens: z.number().int(),
   completionTokens: z.number().int(),
+  /** true when ANY component was a chars/4 estimate (failed streams included). */
+  estimated: z.boolean().default(false),
 })
 
 export const RunArtifact = z.object({
@@ -56,10 +58,7 @@ export const RunEvent = z.discriminatedUnion('type', [
     kind: TaskKind,
     lane: Lane, // model lane — the cost-split index column
     model: z.string(),
-    // Deviation from 05 §7.1 (`spec: TaskSpec`): the full TaskSpec union ships with the agent
-    // harness; Stage 1's tasks.ts exports only TaskKind/Lane, so the spec stays an opaque
-    // object here until then. Tighten to TaskSpec when 05 lands.
-    spec: z.record(z.string(), z.unknown()),
+    spec: TaskSpec,
     params: z.record(z.string(), z.unknown()),
     contextSnapshot: ContextSnapshot.nullable(),
     startedAt: IsoTime,
@@ -81,7 +80,15 @@ export const RunEvent = z.discriminatedUnion('type', [
     output: z.string(),
     durationMs: z.number(),
   }),
-  z.object({ type: z.literal('output'), text: z.string() }), // flushed ≥ every 2 s / 2 KB
+  z.object({
+    type: z.literal('output'), // flushed ≥ every 2 s / 2 KB
+    text: z.string(),
+    // Which model-call attempt streamed this text (1-based, monotonic across the run).
+    // Crash finalization and proposal reconstruction use ONLY the final attempt's output,
+    // so abandoned/retried attempts never fuse into the committed or offered text.
+    // Defaulted for pre-existing run files, which were all single-attempt joins.
+    attempt: z.number().int().min(1).default(1),
+  }),
   z.object({ type: z.literal('attempt'), n: z.number().int(), reason: z.string() }),
   z.object({
     type: z.literal('usage'),
@@ -106,6 +113,14 @@ export const RunEvent = z.discriminatedUnion('type', [
   }),
 ])
 export type RunEvent = z.infer<typeof RunEvent>
+
+/**
+ * The writer-side shape: fields with schema defaults (`output.attempt`,
+ * `usage.estimated`, `result.partialText`, `usageTotal.estimated`) stay optional.
+ * `RunSink.append` validates with `RunEvent.parse`, so what lands on disk is always
+ * the full output shape.
+ */
+export type RunEventInput = z.input<typeof RunEvent>
 
 // List endpoints; no transcript.
 export const RunSummary = z.object({

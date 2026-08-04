@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineConfig, devices } from '@playwright/test'
-import { E2E_PORT, E2E_URL } from './e2e/util'
+import { E2E_MOCK_LLM_PORT, E2E_PORT, E2E_URL } from './e2e/util'
 
 /**
  * Playwright e2e config (docs/09-testing.md §6.1) — Windows-portable by construction:
@@ -39,6 +39,10 @@ export default defineConfig({
       COWRITE_HOME: homeDir,
       COWRITE_HOST: '127.0.0.1',
       COWRITE_PORT: String(E2E_PORT),
+      // Stage 3 (docs/09 §2.3): the server boots @cowrite/mock-llm in-process and points
+      // both lanes at it; the fixed port lets specs script POST /__mock/scenario.
+      COWRITE_MOCK_LLM: '1',
+      MOCK_LLM_PORT: String(E2E_MOCK_LLM_PORT),
     },
     url: `${E2E_URL}/api/health`, // readiness probe (docs/03-api.md §3.12)
     reuseExistingServer: false,

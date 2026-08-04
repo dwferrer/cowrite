@@ -1,4 +1,5 @@
 import type {
+  BudgetKnobsOverrides,
   IllustrationMeta,
   SectionRow,
   WorkDetail,
@@ -27,6 +28,13 @@ import type { OpenWork, WorkRegistry } from '../workRegistry.js'
 export interface ResourceDeps {
   works: WorkRegistry
   storage: StorageService
+  /** App-level context-budget overrides (`config.budgets` — 06 §8.1 override chain);
+   *  absent in tests ⇒ schema defaults + per-work overrides only. */
+  budgets?: () => BudgetKnobsOverrides
+  /** The agent harness backing the task/run routes (05). Absent ⇒ the route plugin
+   *  builds a default one over an all-defaults config, whose unconfigured lanes answer
+   *  `409 config_missing` at task creation. */
+  harness?: import('../../harness/service.js').AgentHarness
 }
 
 export function withZod(app: FastifyInstance) {

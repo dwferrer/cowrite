@@ -1,2 +1,2 @@
-{"type":"meta","runId":"01J2P5H8A3N1Y7S4QE2GBV6MKD","kind":"propose-boundaries","lane":"low","model":"glm-5","spec":{},"params":{},"contextSnapshot":null,"startedAt":"2026-07-06T14:10:00Z"}
+{"type":"meta","runId":"01J2P5H8A3N1Y7S4QE2GBV6MKD","kind":"propose-boundaries","lane":"low","model":"glm-5","spec":{"kind":"propose-boundaries","eligibleSnippetIds":["01J2P400000000000000P2M9X1"]},"params":{},"contextSnapshot":null,"startedAt":"2026-07-06T14:10:00Z"}
 {"type":"output","text":"{\"boundaries\":[{\"afterSnippetId\":\"01J2P6"}

@@ -34,6 +34,8 @@ const router = createBrowserRouter([
   { path: '/w/:workId', element: <WorkView />, loader: ensureConfigured },
   { path: '/w/:workId/world', element: <WorkView />, loader: ensureConfigured },
   { path: '/w/:workId/world/:entryId', element: <WorkView />, loader: ensureConfigured },
+  // provenance viewer — a route-driven modal over the work view (04 §7.4)
+  { path: '/w/:workId/runs/:runId', element: <WorkView />, loader: ensureConfigured },
 ])
 
 const root = document.getElementById('root')

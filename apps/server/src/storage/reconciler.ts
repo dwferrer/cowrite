@@ -458,14 +458,20 @@ async function reparseSnippetFile(
 
   // Foreign file: mint a ULID, orderKey from filename sort position, write frontmatter
   // back atomically (§8), and seed the revision log so history starts at adoption.
+  // Partial (e.g. id-less) frontmatter keeps its user-authored fields — only identity
+  // and ordering are minted.
   const ts = nowIso()
+  const salvage = SnippetMeta.omit({ id: true, orderKey: true, rev: true })
+    .partial()
+    .safeParse(fm.data)
   const meta = SnippetMeta.parse({
     id: ulid(),
     orderKey: await orderKeyFromFilenamePosition(ctx, fileName),
-    createdAt: ts,
+    createdAt: salvage.data?.createdAt ?? ts,
     updatedAt: ts,
-    authorship: 'user', // a foreign file is a user artifact by definition
-    originRunId: null,
+    // a foreign file is a user artifact by default, unless its frontmatter says otherwise
+    authorship: salvage.data?.authorship ?? 'user',
+    originRunId: salvage.data?.originRunId ?? null,
     rev: 1,
   })
   await writeFileAtomic(abs, serializeSnippet(meta, fm.body))
@@ -625,13 +631,19 @@ async function reparseWorldEntryFile(
     return
   }
 
+  // Salvage user-authored fields from partial (e.g. id-less) frontmatter — hand-written
+  // entries are a first-class path (§8): only the identity is minted, never their content.
+  const salvage = WorldEntryMeta.omit({ id: true, updatedAt: true }).partial().safeParse(fm.data)
   const meta = WorldEntryMeta.parse({
     id: ulid(),
-    name: parseWorldEntryFileName(fileName)?.slug ?? fileName.replace(/\.md$/, ''),
-    keys: [],
-    image: null,
-    shortSummary: null,
-    createdBy: 'user',
+    name:
+      salvage.data?.name ??
+      parseWorldEntryFileName(fileName)?.slug ??
+      fileName.replace(/\.md$/, ''),
+    keys: salvage.data?.keys ?? [],
+    image: salvage.data?.image ?? null,
+    shortSummary: salvage.data?.shortSummary ?? null,
+    createdBy: salvage.data?.createdBy ?? 'user',
     updatedAt: nowIso(),
   })
   await writeFileAtomic(abs, serializeEntry(meta, fm.body))

@@ -152,169 +152,179 @@ describe('reconciler fuzz: random external mutations (§8, §12)', () => {
     return await fsp.mkdtemp(path.join(os.tmpdir(), 'cowrite-fuzz-'))
   }
 
-  it.each([[11], [42]])('holds the §12 invariants across 30 rounds (seed %i)', async (seed) => {
-    const rand = mulberry32(seed)
-    // Library keys plus hand-authored ones a user might type: both must interleave.
-    const orderKeyPool = [...nKeysBetween(null, null, 40), 'a0', 'a2', 'z', '0z', 'zz']
-    const strayPaths: string[] = []
-    let revisionLogs = new Set(await listFiles(frontierRevisionsDir(workDir)))
-    let touchClock = Date.now()
+  // 30 rounds of real file IO + reconciles can legitimately exceed the default timeout
+  // on a loaded Windows CI box — give the fuzz run 30 s before calling it hung.
+  const FUZZ_TIMEOUT_MS = 30_000
+  it.each([[11], [42]])(
+    'holds the §12 invariants across 30 rounds (seed %i)',
+    async (seed) => {
+      const rand = mulberry32(seed)
+      // Library keys plus hand-authored ones a user might type: both must interleave.
+      const orderKeyPool = [...nKeysBetween(null, null, 40), 'a0', 'a2', 'z', '0z', 'zz']
+      const strayPaths: string[] = []
+      let revisionLogs = new Set(await listFiles(frontierRevisionsDir(workDir)))
+      let touchClock = Date.now()
 
-    const snippetsDir = frontierSnippetsDir(workDir)
-    const entriesDir = worldEntriesDir(workDir)
+      const snippetsDir = frontierSnippetsDir(workDir)
+      const entriesDir = worldEntriesDir(workDir)
 
-    const mutations = {
-      editSectionContent: async (round: number): Promise<void> => {
-        const dir = pick(rand, await sectionDirs(workDir))
-        const abs = path.join(sectionsDir(workDir), dir, 'content.md')
-        const current = await fsp.readFile(abs, 'utf8').catch(() => null)
-        if (current === null) return
-        await fsp.writeFile(abs, `${current}\nAn external editor appended paragraph ${round}.\n`)
-      },
-      editSnippetBody: async (round: number): Promise<void> => {
-        const names = await mdFiles(snippetsDir)
-        if (names.length === 0) return
-        const abs = path.join(snippetsDir, pick(rand, names))
-        const raw = await fsp.readFile(abs, 'utf8')
-        await fsp.writeFile(abs, `${raw}\nExternally appended sentence ${round}.\n`)
-      },
-      editSnippetFrontmatter: async (): Promise<void> => {
-        // rewrite the frontmatter orderKey (the user re-ordered in another tool);
-        // frontmatter is authoritative, the prefix mirror renumbers lazily (§4)
-        const names = await mdFiles(snippetsDir)
-        if (names.length === 0) return
-        const abs = path.join(snippetsDir, pick(rand, names))
-        const raw = await fsp.readFile(abs, 'utf8')
-        const key = pick(rand, orderKeyPool)
-        const next = raw.replace(/^orderKey: .*$/m, `orderKey: ${key}`)
-        if (next !== raw) await fsp.writeFile(abs, next)
-      },
-      stripSnippetFrontmatter: async (): Promise<void> => {
-        const names = await mdFiles(snippetsDir)
-        if (names.length === 0) return
-        const abs = path.join(snippetsDir, pick(rand, names))
-        const raw = await fsp.readFile(abs, 'utf8')
-        await fsp.writeFile(abs, parseFrontmatter(raw).body)
-      },
-      renameSnippetFile: async (): Promise<void> => {
-        // change the numeric prefix only (short id kept — identity must survive, §8)
-        const names = (await mdFiles(snippetsDir)).filter((n) => /^\d+\./.test(n))
-        if (names.length === 0) return
-        const name = pick(rand, names)
-        const target = name.replace(/^\d+\./, `${100 + randInt(rand, 899)}.`)
-        if (target === name) return
-        try {
-          await fsp.rename(path.join(snippetsDir, name), path.join(snippetsDir, target))
-        } catch {
-          // target name already exists: skip this round's rename
-        }
-      },
-      addForeignSnippet: async (round: number): Promise<void> => {
-        await fsp.writeFile(
-          path.join(snippetsDir, `pasted-note-${round}.md`),
-          `A foreign paragraph pasted in by hand, round ${round}.\n`,
-        )
-      },
-      addForeignWorldEntry: async (round: number): Promise<void> => {
-        await fsp.writeFile(
-          path.join(entriesDir, `new-place-${round}.md`),
-          `A foreign gazetteer entry written elsewhere, round ${round}.\n`,
-        )
-      },
-      stripWorldFrontmatter: async (): Promise<void> => {
-        // Every entry is fair game, including previously-adopted foreign files whose
-        // filename carries no short id: §8 re-association is impossible there, so the
-        // reconciler re-mints — and must drop the old identity's rows while doing it.
-        const names = await mdFiles(entriesDir)
-        if (names.length === 0) return
-        const abs = path.join(entriesDir, pick(rand, names))
-        const raw = await fsp.readFile(abs, 'utf8')
-        await fsp.writeFile(abs, parseFrontmatter(raw).body)
-      },
-      addStrayInSectionDir: async (round: number): Promise<void> => {
-        const dir = pick(rand, await sectionDirs(workDir))
-        const abs = path.join(sectionsDir(workDir), dir, `notes-${round}.md`)
-        await fsp.writeFile(abs, `Private notes ${round}; the reconciler must never touch these.\n`)
-        strayPaths.push(abs)
-      },
-      renameSectionDir: async (round: number): Promise<void> => {
-        // rename to a NON-conforming name: section.json is the truth (§5.2), so the
-        // section must survive both reconcile and fullRebuild under any dir name
-        const dirs = await sectionDirs(workDir)
-        if (dirs.length === 0) return
-        const name = pick(rand, dirs)
-        const oldAbs = path.join(sectionsDir(workDir), name)
-        const newAbs = path.join(sectionsDir(workDir), `renamed-${round}.${name}`)
-        try {
-          await fsp.rename(oldAbs, newAbs)
-        } catch {
-          return // target existed: skip this round's rename
-        }
-        // keep stray bookkeeping in step with the move
-        for (let i = 0; i < strayPaths.length; i++) {
-          const p = strayPaths[i]
-          if (p?.startsWith(oldAbs + path.sep)) {
-            strayPaths[i] = path.join(newAbs, path.relative(oldAbs, p))
+      const mutations = {
+        editSectionContent: async (round: number): Promise<void> => {
+          const dir = pick(rand, await sectionDirs(workDir))
+          const abs = path.join(sectionsDir(workDir), dir, 'content.md')
+          const current = await fsp.readFile(abs, 'utf8').catch(() => null)
+          if (current === null) return
+          await fsp.writeFile(abs, `${current}\nAn external editor appended paragraph ${round}.\n`)
+        },
+        editSnippetBody: async (round: number): Promise<void> => {
+          const names = await mdFiles(snippetsDir)
+          if (names.length === 0) return
+          const abs = path.join(snippetsDir, pick(rand, names))
+          const raw = await fsp.readFile(abs, 'utf8')
+          await fsp.writeFile(abs, `${raw}\nExternally appended sentence ${round}.\n`)
+        },
+        editSnippetFrontmatter: async (): Promise<void> => {
+          // rewrite the frontmatter orderKey (the user re-ordered in another tool);
+          // frontmatter is authoritative, the prefix mirror renumbers lazily (§4)
+          const names = await mdFiles(snippetsDir)
+          if (names.length === 0) return
+          const abs = path.join(snippetsDir, pick(rand, names))
+          const raw = await fsp.readFile(abs, 'utf8')
+          const key = pick(rand, orderKeyPool)
+          const next = raw.replace(/^orderKey: .*$/m, `orderKey: ${key}`)
+          if (next !== raw) await fsp.writeFile(abs, next)
+        },
+        stripSnippetFrontmatter: async (): Promise<void> => {
+          const names = await mdFiles(snippetsDir)
+          if (names.length === 0) return
+          const abs = path.join(snippetsDir, pick(rand, names))
+          const raw = await fsp.readFile(abs, 'utf8')
+          await fsp.writeFile(abs, parseFrontmatter(raw).body)
+        },
+        renameSnippetFile: async (): Promise<void> => {
+          // change the numeric prefix only (short id kept — identity must survive, §8)
+          const names = (await mdFiles(snippetsDir)).filter((n) => /^\d+\./.test(n))
+          if (names.length === 0) return
+          const name = pick(rand, names)
+          const target = name.replace(/^\d+\./, `${100 + randInt(rand, 899)}.`)
+          if (target === name) return
+          try {
+            await fsp.rename(path.join(snippetsDir, name), path.join(snippetsDir, target))
+          } catch {
+            // target name already exists: skip this round's rename
           }
+        },
+        addForeignSnippet: async (round: number): Promise<void> => {
+          await fsp.writeFile(
+            path.join(snippetsDir, `pasted-note-${round}.md`),
+            `A foreign paragraph pasted in by hand, round ${round}.\n`,
+          )
+        },
+        addForeignWorldEntry: async (round: number): Promise<void> => {
+          await fsp.writeFile(
+            path.join(entriesDir, `new-place-${round}.md`),
+            `A foreign gazetteer entry written elsewhere, round ${round}.\n`,
+          )
+        },
+        stripWorldFrontmatter: async (): Promise<void> => {
+          // Every entry is fair game, including previously-adopted foreign files whose
+          // filename carries no short id: §8 re-association is impossible there, so the
+          // reconciler re-mints — and must drop the old identity's rows while doing it.
+          const names = await mdFiles(entriesDir)
+          if (names.length === 0) return
+          const abs = path.join(entriesDir, pick(rand, names))
+          const raw = await fsp.readFile(abs, 'utf8')
+          await fsp.writeFile(abs, parseFrontmatter(raw).body)
+        },
+        addStrayInSectionDir: async (round: number): Promise<void> => {
+          const dir = pick(rand, await sectionDirs(workDir))
+          const abs = path.join(sectionsDir(workDir), dir, `notes-${round}.md`)
+          await fsp.writeFile(
+            abs,
+            `Private notes ${round}; the reconciler must never touch these.\n`,
+          )
+          strayPaths.push(abs)
+        },
+        renameSectionDir: async (round: number): Promise<void> => {
+          // rename to a NON-conforming name: section.json is the truth (§5.2), so the
+          // section must survive both reconcile and fullRebuild under any dir name
+          const dirs = await sectionDirs(workDir)
+          if (dirs.length === 0) return
+          const name = pick(rand, dirs)
+          const oldAbs = path.join(sectionsDir(workDir), name)
+          const newAbs = path.join(sectionsDir(workDir), `renamed-${round}.${name}`)
+          try {
+            await fsp.rename(oldAbs, newAbs)
+          } catch {
+            return // target existed: skip this round's rename
+          }
+          // keep stray bookkeeping in step with the move
+          for (let i = 0; i < strayPaths.length; i++) {
+            const p = strayPaths[i]
+            if (p?.startsWith(oldAbs + path.sep)) {
+              strayPaths[i] = path.join(newAbs, path.relative(oldAbs, p))
+            }
+          }
+        },
+        deleteSnippetFile: async (): Promise<void> => {
+          const names = await mdFiles(snippetsDir)
+          if (names.length < 2) return // keep the frontier non-empty
+          await fsp.unlink(path.join(snippetsDir, pick(rand, names)))
+        },
+        touchFile: async (): Promise<void> => {
+          const candidates: string[] = []
+          for (const n of await mdFiles(snippetsDir)) candidates.push(path.join(snippetsDir, n))
+          for (const n of await mdFiles(entriesDir)) candidates.push(path.join(entriesDir, n))
+          for (const d of await sectionDirs(workDir)) {
+            candidates.push(path.join(sectionsDir(workDir), d, 'content.md'))
+          }
+          if (candidates.length === 0) return
+          const abs = pick(rand, candidates)
+          touchClock += 1500
+          const when = new Date(touchClock)
+          await fsp.utimes(abs, when, when).catch(() => {}) // mtime-only change
+        },
+      } as const
+
+      const opNames = Object.keys(mutations) as Array<keyof typeof mutations>
+
+      for (let round = 0; round < 30; round++) {
+        const opsThisRound = 1 + randInt(rand, 2)
+        for (let i = 0; i < opsThisRound; i++) {
+          await mutations[pick(rand, opNames)](round * 10 + i)
         }
-      },
-      deleteSnippetFile: async (): Promise<void> => {
-        const names = await mdFiles(snippetsDir)
-        if (names.length < 2) return // keep the frontier non-empty
-        await fsp.unlink(path.join(snippetsDir, pick(rand, names)))
-      },
-      touchFile: async (): Promise<void> => {
-        const candidates: string[] = []
-        for (const n of await mdFiles(snippetsDir)) candidates.push(path.join(snippetsDir, n))
-        for (const n of await mdFiles(entriesDir)) candidates.push(path.join(entriesDir, n))
-        for (const d of await sectionDirs(workDir)) {
-          candidates.push(path.join(sectionsDir(workDir), d, 'content.md'))
+
+        // Invariant 1 setup: what the tree's prose looks like going INTO the reconcile.
+        const before = await snapshotProse(workDir, strayPaths)
+
+        await reconcile({ workDir, db })
+
+        // Invariant 1: reconcile never deletes a user file or rewrites a body.
+        const after = await snapshotProse(workDir, strayPaths)
+        expect(after.snippetBodies).toEqual(before.snippetBodies)
+        expect(after.worldBodies).toEqual(before.worldBodies)
+        expect(after.sectionContents).toEqual(before.sectionContents)
+        expect(after.strays).toEqual(before.strays)
+        expect(after.workJson).toBe(before.workJson)
+        expect(after.situation).toBe(before.situation)
+
+        // revision logs never disappear (adoption may add new ones)
+        const logsNow = new Set(await listFiles(frontierRevisionsDir(workDir)))
+        for (const log of revisionLogs) expect(logsNow.has(log)).toBe(true)
+        revisionLogs = logsNow
+
+        // Invariant 2: incremental index == from-scratch rebuild of the same tree.
+        const scratch = openIndex(':memory:')
+        try {
+          await fullRebuild(scratch, workDir)
+          expect(dump(db)).toEqual(dump(scratch))
+        } finally {
+          scratch.close()
         }
-        if (candidates.length === 0) return
-        const abs = pick(rand, candidates)
-        touchClock += 1500
-        const when = new Date(touchClock)
-        await fsp.utimes(abs, when, when).catch(() => {}) // mtime-only change
-      },
-    } as const
-
-    const opNames = Object.keys(mutations) as Array<keyof typeof mutations>
-
-    for (let round = 0; round < 30; round++) {
-      const opsThisRound = 1 + randInt(rand, 2)
-      for (let i = 0; i < opsThisRound; i++) {
-        await mutations[pick(rand, opNames)](round * 10 + i)
       }
-
-      // Invariant 1 setup: what the tree's prose looks like going INTO the reconcile.
-      const before = await snapshotProse(workDir, strayPaths)
-
-      await reconcile({ workDir, db })
-
-      // Invariant 1: reconcile never deletes a user file or rewrites a body.
-      const after = await snapshotProse(workDir, strayPaths)
-      expect(after.snippetBodies).toEqual(before.snippetBodies)
-      expect(after.worldBodies).toEqual(before.worldBodies)
-      expect(after.sectionContents).toEqual(before.sectionContents)
-      expect(after.strays).toEqual(before.strays)
-      expect(after.workJson).toBe(before.workJson)
-      expect(after.situation).toBe(before.situation)
-
-      // revision logs never disappear (adoption may add new ones)
-      const logsNow = new Set(await listFiles(frontierRevisionsDir(workDir)))
-      for (const log of revisionLogs) expect(logsNow.has(log)).toBe(true)
-      revisionLogs = logsNow
-
-      // Invariant 2: incremental index == from-scratch rebuild of the same tree.
-      const scratch = openIndex(':memory:')
-      try {
-        await fullRebuild(scratch, workDir)
-        expect(dump(db)).toEqual(dump(scratch))
-      } finally {
-        scratch.close()
-      }
-    }
-  })
+    },
+    FUZZ_TIMEOUT_MS,
+  )
 })
 
 describe('§8 re-mint: an adopted path sheds its previous identity completely', () => {

@@ -13,7 +13,9 @@ import { effectiveFold } from './foldPolicy.js'
  *
  * Stage 2 note: with no summaries yet, every leaf resolves to fold `full` (foldPolicy
  * degradation) — the ladder rendering proper is Stage 4; the model is already shaped for it.
- * The `streaming` block (Stage 3) is absent from the union until the task store exists.
+ * The streaming display (Stage 3) renders inside the frontierBar block (FrontierBar mounts
+ * StreamingBlock above its controls), so it needs no block kind of its own — the
+ * virtualizer's measureElement absorbs its growth.
  */
 
 export type Block =

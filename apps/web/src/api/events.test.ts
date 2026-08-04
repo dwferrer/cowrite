@@ -1,10 +1,18 @@
-import type { SectionRow, SnippetDto } from '@cowrite/shared'
+import type { SectionRow, SnippetDto, Task, TaskSpec } from '@cowrite/shared'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderHook, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useDocUiStore } from '../state/docUiStore.js'
-import { applyWorkEvent, useWorkEvents, useWorkStatusStore } from './events.js'
+import { useTaskStore } from '../state/taskStore.js'
+import { useToastStore } from '../ui/Toast.js'
+import {
+  applyWorkEvent,
+  dropPendingDeltas,
+  flushTaskDeltas,
+  useWorkEvents,
+  useWorkStatusStore,
+} from './events.js'
 import { qk } from './queries.js'
 
 vi.mock('./editingSignal.js', () => ({ signalEditing: vi.fn() }))
@@ -58,6 +66,9 @@ function makeClient(): QueryClient {
 beforeEach(() => {
   useWorkStatusStore.getState().reset()
   useDocUiStore.setState({ selection: null, editing: null, peekRevision: null, followBottom: true })
+  useTaskStore.getState().reset()
+  useToastStore.setState({ toasts: [] })
+  dropPendingDeltas()
   vi.mocked(signalEditing).mockClear()
 })
 
@@ -314,20 +325,330 @@ describe('applyWorkEvent — storage-originated rows (04 §4.3)', () => {
     await done
     await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1))
   })
+})
 
-  it('task.* events are Stage 3 no-ops that touch nothing', () => {
+// ---------------------------------------------------------------------------
+// task.* rows (04 §4.3, §4.4): started routes by lane; the rest by taskId; deltas
+// batch behind the 33 ms flush.
+// ---------------------------------------------------------------------------
+
+const T1 = '01ARZ3NDEKTSV4RRFFQ69G5FB1'
+const T2 = '01ARZ3NDEKTSV4RRFFQ69G5FB2'
+
+function mkTask(id: string, spec: TaskSpec, lane: Task['lane'] = 'interactive'): Task {
+  return {
+    id,
+    workId: W,
+    spec,
+    lane,
+    status: 'running',
+    queuedAt: NOW,
+    startedAt: NOW,
+    endedAt: null,
+    error: null,
+    partialText: null,
+    unresolvedProposal: null,
+  }
+}
+
+function startContinue(qc: QueryClient, taskId = T1): void {
+  applyWorkEvent(qc, W, {
+    type: 'task.started',
+    task: mkTask(taskId, { kind: 'continue' }),
+    lane: 'interactive',
+    target: { kind: 'frontier' },
+  })
+}
+
+describe('applyWorkEvent — attach-frame hydration + spend warning', () => {
+  it('task.state (running) seeds the interactive slot with no pre-fetch', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.state',
+      task: mkTask(T1, { kind: 'continue' }),
+      lane: 'interactive',
+      target: { kind: 'frontier' },
+    })
+    expect(useTaskStore.getState().interactive?.taskId).toBe(T1)
+    // the snapshot that follows the frame lands in the freshly seeded slot
+    applyWorkEvent(qc, W, { type: 'task.snapshot', taskId: T1, target: 'frontier', text: 'hi' })
+    expect(useTaskStore.getState().interactive?.buffers.get('frontier')).toBe('hi')
+  })
+
+  it('task.state (terminal, unresolved keep-partial) surfaces the proposal on hydrate', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.state',
+      task: {
+        ...mkTask(T1, { kind: 'continue' }),
+        status: 'error',
+        endedAt: NOW,
+        error: { code: 'timeout', message: 'gone' },
+        partialText: 'kept prose',
+        unresolvedProposal: { kind: 'keep-partial' },
+      },
+      lane: 'interactive',
+      target: { kind: 'frontier' },
+    })
+    expect(useTaskStore.getState().interactive).toBeNull()
+    expect(useTaskStore.getState().proposal).toMatchObject({ taskId: T1, text: 'kept prose' })
+  })
+
+  it('spend.warning parses and reduces without touching task state', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, { type: 'spend.warning', spentUsd: 6.2, thresholdUsd: 5 })
+    expect(useTaskStore.getState().interactive).toBeNull()
+  })
+})
+
+describe('applyWorkEvent — task rows (04 §4.3, §4.4)', () => {
+  it('task.started routes by lane: interactive fills the slot, background fills the map', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    expect(useTaskStore.getState().interactive?.taskId).toBe(T1)
+
+    applyWorkEvent(qc, W, {
+      type: 'task.started',
+      task: mkTask(T2, { kind: 'enrich-section', sectionId: S1 }, 'background'),
+      lane: 'background',
+      target: { kind: 'section', id: S1 },
+    })
+
+    // the flagship stream is isolated by construction — slot untouched
+    const s = useTaskStore.getState()
+    expect(s.interactive?.taskId).toBe(T1)
+    expect(s.background.get(T2)?.kind).toBe('enrich-section')
+  })
+
+  it('task.queued puts a background task in the map with its queue position', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.queued',
+      task: mkTask(T2, { kind: 'enrich-section', sectionId: S1 }, 'background'),
+      position: 2,
+    })
+    expect(useTaskStore.getState().background.get(T2)).toMatchObject({ queuedPosition: 2 })
+  })
+
+  it('task.stage flips planning ↔ writing; task.tool pushes a planning note', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, {
+      type: 'task.tool',
+      taskId: T1,
+      name: 'context_expand',
+      label: 'opened Chapter 7',
+    })
+    applyWorkEvent(qc, W, { type: 'task.stage', taskId: T1, stage: 'writing' })
+    const s = useTaskStore.getState()
+    expect(s.interactive?.stage).toBe('writing')
+    expect(s.interactive?.toolNotes).toEqual(['opened Chapter 7'])
+  })
+
+  it('task.delta batches invisibly until the ~30 fps flush commits one append', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: 'frontier', text: 'The ' })
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: 'frontier', text: 'ferry' })
+
+    // nothing visible yet — React stays off the token firehose
+    expect(useTaskStore.getState().interactive?.buffers.size).toBe(0)
+
+    flushTaskDeltas()
+    expect(useTaskStore.getState().interactive?.buffers.get('frontier')).toBe('The ferry')
+  })
+
+  it('targeted (quick-edit) deltas buffer invisibly under the target id', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.started',
+      task: mkTask(T1, {
+        kind: 'quick-edit',
+        instruction: 'tighten',
+        target: { type: 'snippet', snippetId: S1, baseRev: 1 },
+        selection: { text: 'x', start: 0, end: 1 },
+      }),
+      lane: 'interactive',
+      target: { kind: 'snippet', id: S1 },
+    })
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: S1, text: 'rewritten' })
+    flushTaskDeltas()
+    // buffered under the ULID target — the shimmer UI renders no live tokens (04 §8.3)
+    expect(useTaskStore.getState().interactive?.buffers.get(S1)).toBe('rewritten')
+  })
+
+  it('task.snapshot replaces the buffer and drops stale pending deltas (reconnect)', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, {
+      type: 'task.delta',
+      taskId: T1,
+      target: 'frontier',
+      text: 'stale tail',
+    })
+    applyWorkEvent(qc, W, {
+      type: 'task.snapshot',
+      taskId: T1,
+      target: 'frontier',
+      text: 'the whole accumulated text',
+    })
+    flushTaskDeltas() // stale pending must not re-append after the snapshot
+    expect(useTaskStore.getState().interactive?.buffers.get('frontier')).toBe(
+      'the whole accumulated text',
+    )
+  })
+
+  it('task.retrying resets the buffer and shows the attempt on the status line', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: 'frontier', text: 'half' })
+    flushTaskDeltas()
+    applyWorkEvent(qc, W, {
+      type: 'task.retrying',
+      taskId: T1,
+      attempt: 2,
+      reason: 'output_invalid',
+    })
+    const s = useTaskStore.getState()
+    expect(s.interactive?.buffers.size).toBe(0)
+    expect(s.interactive?.retrying).toEqual({ attempt: 2, reason: 'output_invalid' })
+  })
+
+  it('task.usage lands on the interactive status line', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, {
+      type: 'task.usage',
+      taskId: T1,
+      promptTokens: 6412,
+      completionTokens: 388,
+      estimated: false,
+      costUsd: null,
+    })
+    expect(useTaskStore.getState().interactive?.usage).toEqual({
+      promptTokens: 6412,
+      completionTokens: 388,
+      estimated: false,
+      costUsd: null,
+    })
+  })
+
+  it('task.progress patches the background illustration caption', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.started',
+      task: mkTask(T2, { kind: 'illustrate-section', sectionId: S1 }, 'illustration'),
+      lane: 'illustration',
+      target: { kind: 'section', id: S1 },
+    })
+    applyWorkEvent(qc, W, {
+      type: 'task.progress',
+      taskId: T2,
+      phase: 'generating',
+      attempt: 2,
+      maxAttempts: 3,
+      pct: 64,
+    })
+    expect(useTaskStore.getState().background.get(T2)).toMatchObject({
+      phase: 'generating',
+      attempt: 2,
+      pct: 64,
+    })
+  })
+
+  it('task.completed flushes pending deltas, then clears the slot (keyed swap)', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: 'frontier', text: 'tail' })
+    applyWorkEvent(qc, W, { type: 'task.completed', taskId: T1 })
+    const s = useTaskStore.getState()
+    expect(s.interactive).toBeNull()
+    expect(s.proposal).toBeNull() // committed cleanly — nothing to resolve
+  })
+
+  it('a conflict artifact + completed offers apply-anyway with the full buffered rewrite', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.started',
+      task: mkTask(T1, {
+        kind: 'quick-edit',
+        instruction: 'tighten',
+        target: { type: 'snippet', snippetId: S1, baseRev: 1 },
+        selection: { text: 'x', start: 0, end: 1 },
+      }),
+      lane: 'interactive',
+      target: { kind: 'snippet', id: S1 },
+    })
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: S1, text: 'new pass' })
+    applyWorkEvent(qc, W, {
+      type: 'task.artifact',
+      taskId: T1,
+      artifact: { kind: 'snippet-revision', snippetId: S1, rev: 2, state: 'conflict' },
+    })
+    // completion flushes the still-pending delta before building the proposal text
+    applyWorkEvent(qc, W, { type: 'task.completed', taskId: T1 })
+    const proposal = useTaskStore.getState().proposal
+    expect(proposal?.reason).toBe('conflict')
+    expect(proposal?.text).toBe('new pass')
+    expect(proposal?.target).toEqual({ kind: 'snippet', id: S1 })
+  })
+
+  it('task.failed on the interactive task toasts and offers keep-partial', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, {
+      type: 'task.failed',
+      taskId: T1,
+      code: 'timeout',
+      message: 'upstream timeout',
+      partialText: 'The storm arrived',
+      retryable: true,
+    })
+    const s = useTaskStore.getState()
+    expect(s.interactive).toBeNull()
+    expect(s.proposal?.reason).toBe('failed')
+    expect(s.proposal?.text).toBe('The storm arrived')
+    expect(useToastStore.getState().toasts.some((t) => t.tone === 'error')).toBe(true)
+  })
+
+  it('task.cancelled keeps the partial for review with an info toast', () => {
+    const qc = makeClient()
+    startContinue(qc)
+    applyWorkEvent(qc, W, { type: 'task.cancelled', taskId: T1, partialText: 'partial prose' })
+    expect(useTaskStore.getState().proposal?.reason).toBe('cancelled')
+    expect(useToastStore.getState().toasts).toHaveLength(1)
+  })
+
+  it('background task.failed stays quiet — no toast, no proposal', () => {
+    const qc = makeClient()
+    applyWorkEvent(qc, W, {
+      type: 'task.started',
+      task: mkTask(T2, { kind: 'enrich-section', sectionId: S1 }, 'background'),
+      lane: 'background',
+      target: { kind: 'section', id: S1 },
+    })
+    applyWorkEvent(qc, W, {
+      type: 'task.failed',
+      taskId: T2,
+      code: 'timeout',
+      message: 'slow',
+      partialText: 'x',
+      retryable: true,
+    })
+    const s = useTaskStore.getState()
+    expect(s.background.has(T2)).toBe(false)
+    expect(s.proposal).toBeNull()
+    expect(useToastStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('task rows never touch the query cache — domain events own cache patching', () => {
     const qc = makeClient()
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
     const setData = vi.spyOn(qc, 'setQueryData')
-
-    applyWorkEvent(qc, W, {
-      type: 'task.delta',
-      taskId: S1,
-      target: 'frontier',
-      text: 'The ferry…',
-    })
-    applyWorkEvent(qc, W, { type: 'task.completed', taskId: S1 })
-
+    startContinue(qc)
+    applyWorkEvent(qc, W, { type: 'task.delta', taskId: T1, target: 'frontier', text: 'x' })
+    flushTaskDeltas()
+    applyWorkEvent(qc, W, { type: 'task.completed', taskId: T1 })
     expect(invalidate).not.toHaveBeenCalled()
     expect(setData).not.toHaveBeenCalled()
   })
@@ -373,7 +694,7 @@ class FakeEventSource {
 }
 
 describe('useWorkEvents', () => {
-  it('opens one EventSource, applies parsed events, and cleans up on unmount', () => {
+  it('opens one EventSource, applies parsed events, and cleans up on unmount', async () => {
     vi.stubGlobal('EventSource', FakeEventSource)
     FakeEventSource.instances = []
     const qc = makeClient()
@@ -387,8 +708,9 @@ describe('useWorkEvents', () => {
       wrapper,
     })
 
-    // StrictMode-free render: exactly one connection to the events route
-    expect(FakeEventSource.instances).toHaveLength(1)
+    // StrictMode-free render: exactly one connection to the events route (connect is
+    // deferred one tick behind the best-effort task hydration fetch)
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
     const source = FakeEventSource.instances[0] as FakeEventSource
     expect(source.url).toBe(`/api/works/${W}/events`)
 
@@ -411,9 +733,8 @@ describe('useWorkEvents', () => {
     vi.unstubAllGlobals()
   })
 
-  it('schedules a backoff reconnect and resumes via the ?lastEventId query param', () => {
+  it('schedules a backoff reconnect and resumes via the ?lastEventId query param', async () => {
     vi.stubGlobal('EventSource', FakeEventSource)
-    vi.useFakeTimers()
     FakeEventSource.instances = []
     const qc = makeClient()
     const wrapper = ({ children }: { children: React.ReactNode }) =>
@@ -423,6 +744,9 @@ describe('useWorkEvents', () => {
     const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
       wrapper,
     })
+
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
+    vi.useFakeTimers()
 
     const first = FakeEventSource.instances[0] as FakeEventSource
     // deliver one event carrying an SSE id — that becomes the resume cursor
@@ -450,7 +774,7 @@ describe('useWorkEvents', () => {
     vi.unstubAllGlobals()
   })
 
-  it('re-asserts the editing signal on every open while a snippet editor is open', () => {
+  it('re-asserts the editing signal on every open while a snippet editor is open', async () => {
     vi.stubGlobal('EventSource', FakeEventSource)
     FakeEventSource.instances = []
     const qc = makeClient()
@@ -461,6 +785,7 @@ describe('useWorkEvents', () => {
     const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
       wrapper,
     })
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
     useDocUiStore.setState({
       editing: { kind: 'snippet', id: S1, workId: W, draft: 'mid-edit' },
     })
@@ -471,6 +796,52 @@ describe('useWorkEvents', () => {
     const source = FakeEventSource.instances[0] as FakeEventSource
     source.onopen?.()
     expect(signalEditing).toHaveBeenCalledWith(W, S1)
+
+    unmount()
+    vi.unstubAllGlobals()
+  })
+
+  it('hydrates a reload mid-generation purely from the stream (attach frame, no pre-fetch)', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    FakeEventSource.instances = []
+    const fetchMock = vi.fn(async () => {
+      throw new Error('the stream is the ONLY hydration source — no fetch allowed')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const qc = makeClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      createElement(QueryClientProvider, { client: qc }, children)
+    const factory = (url: string) => new FakeEventSource(url) as unknown as EventSource
+
+    const { unmount } = renderHook(() => useWorkEvents(W, { eventSourceFactory: factory }), {
+      wrapper,
+    })
+
+    // The connection opens immediately — there is no fetch-to-subscribe gap (03 §8.3).
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    // The bus's attach-time task.state frame seeds the slot…
+    const source = FakeEventSource.instances[0] as FakeEventSource
+    source.emit('task.state', {
+      type: 'task.state',
+      task: mkTask(T1, { kind: 'continue' }),
+      lane: 'interactive',
+      target: { kind: 'frontier' },
+    })
+    expect(useTaskStore.getState().interactive?.taskId).toBe(T1)
+
+    // …and the synthetic snapshot that follows lands in it.
+    source.emit('task.snapshot', {
+      type: 'task.snapshot',
+      taskId: T1,
+      target: 'frontier',
+      text: 'replayed prose',
+    })
+    const s = useTaskStore.getState()
+    expect(s.interactive?.buffers.get('frontier')).toBe('replayed prose')
+    // the snapshot's non-empty text implies the composition already started
+    expect(s.interactive?.stage).toBe('writing')
 
     unmount()
     vi.unstubAllGlobals()

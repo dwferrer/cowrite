@@ -58,6 +58,8 @@ describe('WorkEvent names (09 §shared: spellings locked — a rename is a contr
       'task.completed',
       'task.cancelled',
       'task.failed',
+      'task.state',
+      'spend.warning',
       'hello',
       'resync',
     ])

@@ -2,6 +2,7 @@ import {
   api,
   type SituationDto,
   type SnippetDto,
+  type TaskSpec,
   type WorkDetail,
   type WorldEntryDto,
   type WorldEntryPatch,
@@ -107,6 +108,46 @@ export function useWorld(workId: string) {
   return useQuery({
     queryKey: qk.world(workId),
     queryFn: ({ signal }) => apiCall('listWorldEntries', [workId], { signal }),
+  })
+}
+
+/** One parsed run JSONL (04 §7.4) — immutable once the run ended; staleTime Infinity. */
+export function useRun(workId: string, runId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.run(workId, runId),
+    queryFn: ({ signal }) => apiCall('getRun', [workId, runId], { signal }),
+    staleTime: Number.POSITIVE_INFINITY,
+    enabled,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Task mutations (03 §3.7). Submitting returns the queued Task envelope (202); all display
+// state then rides SSE `task.*` events into the task store — nothing to patch here.
+// ---------------------------------------------------------------------------
+
+export function useCreateTask(workId: string) {
+  return useMutation({
+    mutationFn: (spec: TaskSpec) => apiCall('createTask', [workId], { body: spec }),
+  })
+}
+
+export function useCancelTask(workId: string) {
+  return useMutation({
+    mutationFn: (taskId: string) => apiCall('cancelTask', [workId, taskId]),
+  })
+}
+
+/** Keep-partial / apply-anyway (04 §8.4) — the commit echoes back as a domain event. */
+export function useApplyProposal(workId: string) {
+  return useMutation({
+    mutationFn: (taskId: string) => apiCall('applyProposal', [workId, taskId]),
+  })
+}
+
+export function useDiscardProposal(workId: string) {
+  return useMutation({
+    mutationFn: (taskId: string) => apiCall('discardProposal', [workId, taskId]),
   })
 }
 

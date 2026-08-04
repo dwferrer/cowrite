@@ -189,15 +189,16 @@ await request.post("/__mock/llm/enqueue", { data: scenarioJson });
   The app is driven by `app.inject()`; SSE is read by injecting a request with
   `accept: text/event-stream` and parsing frames. Scenario control is in-process (same test
   file), so tests stay hermetic and parallelizable.
-- **E2E / manual dev:** `COWRITE_MOCK_LLM=1` (or `--mock`) makes the server boot both mocks
-  in-process, point both lanes and `comfyui` at them (03 §9.3), and mount the control routes:
+- **E2E / manual dev:** `COWRITE_MOCK_LLM=1` (or `--mock`) makes the server boot the mocks
+  in-process and point the lanes (and, Stage 5, `comfyui`) at them (03 §9.3). Each mock
+  serves its OWN control routes on its own port (`MOCK_LLM_PORT`, 2700 in e2e — never
+  mounted under the app):
 
-  | Route (only under the flag) | Purpose |
+  | Route (on the mock's port) | Purpose |
   |---|---|
-  | `POST /__mock/llm/enqueue` | append `MockStep[]` to the LLM scenario |
-  | `POST /__mock/comfy/enqueue` | append `MockComfyStep[]` |
-  | `POST /__mock/reset` | clear both scenarios back to the improviser default |
-  | `GET /__mock/state` | pending steps + consumed count (assert drained from e2e) |
+  | `POST /__mock/scenario` | append `LlmStep[]` / `ComfyStep[]` to the scenario queue |
+  | `POST /__mock/reset` | clear the scenario queue, consumption history, and captured requests |
+  | `GET /__mock/state` | pending steps + consumed count + errors (assert drained from e2e) |
 
   With no enqueued scenario the mocks run the **improviser**: deterministic seeded-RNG prose at
   20 ms/token and an always-succeed ComfyUI returning fixture PNGs — the whole app demos offline
@@ -382,15 +383,19 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const dataDir = mkdtempSync(join(tmpdir(), "cowrite-e2e-"));   // never `mktemp`
+// Fixed ports (constants in e2e/util.ts): 2698 = e2e server (never the 2697 default, so a
+// running dev server can't collide); 2700 = the in-process mock LLM's control routes
+// (COWRITE_MOCK_LLM=1 + MOCK_LLM_PORT); 2699 = the restart spec's own server.
+const dataDir = mkdtempSync(join(tmpdir(), "cowrite-e2e-data-"));   // never `mktemp`
 export default defineConfig({
   testDir: "e2e",
   workers: 1, fullyParallel: false,      // one server, global mock scenario state (§6.2)
   webServer: {
     command: "pnpm --filter @cowrite/server start",
     env: { COWRITE_DATA_DIR: dataDir, COWRITE_MOCK_LLM: "1",
-           COWRITE_PORT: "2697", COWRITE_HOME: mkdtempSync(join(tmpdir(), "cowrite-cfg-")) },
-    url: "http://127.0.0.1:2697/api/health",                   // readiness probe (03 §3.12)
+           COWRITE_PORT: "2698", MOCK_LLM_PORT: "2700",
+           COWRITE_HOME: mkdtempSync(join(tmpdir(), "cowrite-e2e-home-")) },
+    url: "http://127.0.0.1:2698/api/health",                   // readiness probe (03 §3.12)
   },
   projects: [{ name: "chromium", use: devices["Desktop Chrome"] }],  // one browser: localhost app
 });
@@ -415,10 +420,11 @@ Windows dev machine and so flipping on a `windows-latest` e2e job later is a one
   seed via the fixture builder in a `beforeAll` that calls `seedTiny`/`seedNovel` into the
   shared data dir under a unique slug, then hits `POST /api/config/reload`-free paths — works
   are discovered by directory scan, 03 §3.1).
-- **Mock scenarios are enqueued per test** via `POST /__mock/llm/enqueue` /
-  `POST /__mock/comfy/enqueue`, and `POST /__mock/reset` runs in `afterEach`. Because scenario
-  state is server-global, the suite runs with `workers: 1` — acceptable at M1's spec count; if
-  the suite outgrows it, scenario scoping by work id is the structured-for extension.
+- **Mock scenarios are enqueued per test** via `POST /__mock/scenario` on each mock's own
+  fixed port (LLM on 2700; the ComfyUI mock gets its own when Stage 5 lands), with
+  `POST /__mock/reset` at the top of every task-running test. Because scenario state is
+  server-global, the suite runs with `workers: 1` — acceptable at M1's spec count; if the
+  suite outgrows it, scenario scoping by work id is the structured-for extension.
 - **The resilience spec is the exception:** it launches and kills its own server process (a
   `launchServer(dataDir)` helper spawning the same command with `child_process`, no shell) so it
   can assert restart recovery without murdering the shared `webServer`.

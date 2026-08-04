@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { BudgetKnobsOverrides } from './context.js'
 import { ComfyConfig } from './illustration.js'
-import { HarnessKnobsOverrides, Lane, TaskKind } from './tasks.js'
+import { Lane, TaskKind } from './tasks.js'
 
 /**
  * App configuration — `~/.cowrite/config.jsonc` (docs/03-api.md §9).
@@ -10,11 +10,79 @@ import { HarnessKnobsOverrides, Lane, TaskKind } from './tasks.js'
  * - nested-object `.default({})` → `.prefault({})` (defaults must be complete output objects);
  * - `z.string().url()` → `z.url()`;
  * - `BudgetKnobs.partial()` / `HarnessKnobs.partial()` → the dedicated *Overrides schemas
- *   (see context.ts / tasks.ts for why `.partial()` re-materializes defaults);
+ *   (see context.ts / the HarnessKnobsOverrides note below for why `.partial()`
+ *   re-materializes defaults);
  * - `schemaVersion: z.literal(1)` carries `.default(1)` so the all-defaults empty object
  *   parses — the named regression of §12 ("AppConfig.parse({}) and the first-run template
  *   must both parse") guards this in config.test.ts.
  */
+
+// ---------------------------------------------------------------------------
+// Harness knobs (05 §6.4) — `config.harness`, the transport ladder the runner owns:
+// timeouts, retries, and the illustration run budget (the pipeline reads it via
+// `RunContext.remainingMs()`). `retry.backoffMs → backoffMaxMs` is the doc's
+// "1 000 → 4 000 (+ full jitter)" ladder; `Retry-After` on 429 is honored above it.
+//
+// Deliberately NOT here — referenced, never duplicated:
+// - planning caps (`maxPlanningRounds`, `maxPlanningRoundsQuickEdit`, `maxToolCalls`,
+//   `maxToolResultTokens`): the engine owns them in `BudgetKnobs` (06 §8.1,
+//   `config.budgets`); the harness keeps no round counter of its own (05 §4.2).
+// - lane capacities: fixed policy, not config — `QUEUE_LANE_CAPACITY` in tasks.ts (05 §6.1).
+// ---------------------------------------------------------------------------
+
+export const HarnessKnobs = z.object({
+  connectTimeoutMs: z.number().int().positive().default(15_000), // TCP/TLS + request write
+  firstTokenTimeoutMs: z.number().int().positive().default(60_000), // sent → first stream event
+  idleTokenTimeoutMs: z.number().int().positive().default(30_000), // gap between stream events
+  totalTimeoutMs: z
+    .object({
+      high: z.number().int().positive().default(300_000), // whole model call, high lane
+      low: z.number().int().positive().default(120_000), // whole model call, low lane
+    })
+    .prefault({}),
+  illustrationBudgetMs: z.number().int().positive().default(600_000), // whole illustration run
+  retry: z
+    .object({
+      maxAttempts: z.number().int().min(1).default(3), // per logical model call: total attempts
+      backoffMs: z.number().int().positive().default(1_000),
+      backoffMaxMs: z.number().int().positive().default(4_000),
+    })
+    .prefault({}),
+  // Per-process cumulative spend guard (derived cost summed across runs since boot).
+  // Crossing spendWarnUsd emits a one-time `spend.warning` event + console notice;
+  // crossing spendStopUsd makes NEW task submissions fail until restart or a knob change.
+  // null disables the threshold.
+  spendWarnUsd: z.number().nonnegative().nullable().default(5),
+  spendStopUsd: z.number().nonnegative().nullable().default(null),
+})
+export type HarnessKnobs = z.infer<typeof HarnessKnobs>
+
+// The doc spells the config field `HarnessKnobs.partial().default({})` (03 §9.2), but zod 4
+// fires ZodDefault even under the ZodOptional that `.partial()` adds — a sparse override
+// object would parse into a full knob set (see context.ts BudgetKnobsOverrides for the same
+// gotcha). Hand-written optional shape keeps true Partial<HarnessKnobs> semantics.
+export const HarnessKnobsOverrides = z.object({
+  connectTimeoutMs: z.number().int().positive().optional(),
+  firstTokenTimeoutMs: z.number().int().positive().optional(),
+  idleTokenTimeoutMs: z.number().int().positive().optional(),
+  totalTimeoutMs: z
+    .object({
+      high: z.number().int().positive().optional(),
+      low: z.number().int().positive().optional(),
+    })
+    .optional(),
+  illustrationBudgetMs: z.number().int().positive().optional(),
+  retry: z
+    .object({
+      maxAttempts: z.number().int().min(1).optional(),
+      backoffMs: z.number().int().positive().optional(),
+      backoffMaxMs: z.number().int().positive().optional(),
+    })
+    .optional(),
+  spendWarnUsd: z.number().nonnegative().nullable().optional(),
+  spendStopUsd: z.number().nonnegative().nullable().optional(),
+})
+export type HarnessKnobsOverrides = z.infer<typeof HarnessKnobsOverrides>
 
 export const ModelEndpoint = z.object({
   baseUrl: z.url(), // ".../v1" — OpenAI-compatible root

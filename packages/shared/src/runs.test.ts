@@ -52,12 +52,19 @@ describe('RunEvent', () => {
     } as const
     expect(RunEvent.parse(message)).toEqual(message)
     const output = { type: 'output', text: 'Mara pressed her palm...' } as const
-    expect(RunEvent.parse(output)).toEqual(output)
+    // pre-existing single-attempt run files default to attempt 1 (05 §6.5)
+    expect(RunEvent.parse(output)).toEqual({ ...output, attempt: 1 })
+    const tagged = { type: 'output', text: 'replayed', attempt: 3 } as const
+    expect(RunEvent.parse(tagged)).toEqual(tagged)
   })
 
-  it('parses the §5.4 result line, defaulting partialText to null', () => {
+  it('parses the §5.4 result line, defaulting partialText null + estimated false', () => {
     const parsed = RunEvent.parse(resultLine)
-    expect(parsed).toEqual({ ...resultLine, partialText: null })
+    expect(parsed).toEqual({
+      ...resultLine,
+      partialText: null,
+      usageTotal: { ...resultLine.usageTotal, estimated: false },
+    })
   })
 
   it('accepts a null contextSnapshot for background/illustration runs', () => {
@@ -83,6 +90,46 @@ describe('RunEvent', () => {
       partialText: 'Mara pressed',
     })
     expect(parsed.type === 'result' && parsed.error?.code).toBe('crash')
+  })
+
+  it('parses stage, toolCall, attempt, and proposal lines', () => {
+    const stage = { type: 'stage', stage: 'writing', round: 2 } as const
+    expect(RunEvent.parse(stage)).toEqual(stage)
+    const toolCall = {
+      type: 'toolCall',
+      name: 'context_expand',
+      input: { kind: 'section', id: snippetId, level: 'long' },
+      output: 'Chapter 7 — long summary…',
+      durationMs: 12,
+    } as const
+    expect(RunEvent.parse(toolCall)).toEqual(toolCall)
+    const attempt = { type: 'attempt', n: 2, reason: 'first-token timeout' } as const
+    expect(RunEvent.parse(attempt)).toEqual(attempt)
+    const proposal = {
+      type: 'proposal',
+      resolution: 'applied',
+      at: '2026-07-06T15:00:00Z',
+    } as const
+    expect(RunEvent.parse(proposal)).toEqual(proposal)
+    expect(RunEvent.safeParse({ ...proposal, resolution: 'kept' }).success).toBe(false)
+  })
+
+  it('meta.spec is the real TaskSpec union, not an opaque object', () => {
+    // missing required instruction for the kind ⇒ the meta line itself fails to parse
+    expect(RunEvent.safeParse({ ...metaLine, spec: { kind: 'instructed-continue' } }).success).toBe(
+      false,
+    )
+    const quickEditMeta = RunEvent.parse({
+      ...metaLine,
+      kind: 'quick-edit',
+      spec: {
+        kind: 'quick-edit',
+        instruction: 'tighten this',
+        target: { type: 'snippet', snippetId, baseRev: 2 },
+        selection: { text: 'the glass cracks', start: 10, end: 26 },
+      },
+    })
+    expect(quickEditMeta.type === 'meta' && quickEditMeta.spec.kind).toBe('quick-edit')
   })
 
   it('rejects unknown event types and unknown task kinds', () => {
@@ -132,6 +179,9 @@ describe('ContextSnapshot & RunSummary', () => {
       endedAt: '2026-07-06T14:02:11Z',
       usageTotal: { promptTokens: 6412, completionTokens: 388 },
     } as const
-    expect(RunSummary.parse(summary)).toEqual(summary)
+    expect(RunSummary.parse(summary)).toEqual({
+      ...summary,
+      usageTotal: { ...summary.usageTotal, estimated: false },
+    })
   })
 })

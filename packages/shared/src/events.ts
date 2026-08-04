@@ -101,6 +101,8 @@ export const WorkEvent = z.discriminatedUnion('type', [
     taskId: Ulid,
     promptTokens: z.number().int(),
     completionTokens: z.number().int(),
+    /** true when any component was a chars/4 estimate — the UI shows "~" (05 §9). */
+    estimated: z.boolean().default(false),
     costUsd: z.number().nullable(),
   }),
   z.object({ type: z.literal('task.completed'), taskId: Ulid }),
@@ -118,13 +120,40 @@ export const WorkEvent = z.discriminatedUnion('type', [
     retryable: z.boolean(),
   }),
 
+  // Synthetic frame written on EVERY SSE attach (03 §8.3 hydration fencing): the current
+  // interactive task (status/stage seed; accumulated text follows as `task.snapshot`), or —
+  // when no live task exists — the latest terminal task still offering an unresolved
+  // proposal, so a fresh EventSource hydrates purely from the stream (no pre-fetch gap).
+  z.object({
+    type: z.literal('task.state'),
+    task: Task,
+    lane: QueueLane,
+    target: z.object({
+      kind: z.enum(['frontier', 'snippet', 'section', 'entry']),
+      id: Ulid.optional(),
+    }),
+  }),
+
+  // One-time per-process spend warning (crossing config.harness.spendWarnUsd).
+  z.object({
+    type: z.literal('spend.warning'),
+    spentUsd: z.number(),
+    thresholdUsd: z.number(),
+  }),
+
   // ---- stream control ----
   z.object({ type: z.literal('hello'), streamId: z.string(), seq: z.number().int() }),
   z.object({ type: z.literal('resync') }), // client must invalidate all work queries
 ])
 export type WorkEvent = z.infer<typeof WorkEvent>
 
+/** One event name from the union — what the 04 §4.3 reducer switches on. */
+export type WorkEventType = WorkEvent['type']
+
+/** The payload of one event name, for typed reducer cases: `WorkEventOf<'task.delta'>`. */
+export type WorkEventOf<T extends WorkEventType> = Extract<WorkEvent, { type: T }>
+
 /** The dot-case event-name vocabulary, derivable for tests and reducers. */
 export const WORK_EVENT_TYPES = WorkEvent.options.map(
   (option) => option.shape.type.value,
-) as string[]
+) as WorkEventType[]

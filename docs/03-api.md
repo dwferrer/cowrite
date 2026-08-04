@@ -692,7 +692,7 @@ export const AppConfig = z.object({
   // must both parse — a named regression test guards this (§12).
   routing: z.partialRecord(TaskKind, z.enum(["high","low"])).default({}),
   budgets: BudgetKnobs.partial().default({}),        // 06 §knobs, app-level overrides
-  harness: HarnessKnobs.partial().default({}),       // timeouts/retries, 05 §timeouts
+  harness: HarnessKnobs.partial().default({}),       // timeouts/retries + spendWarnUsd/spendStopUsd, 05 §timeouts
   retention: z.object({
     pruneRunsAfterMonths: z.number().int().positive().nullable().default(null),
   }).default({}),
@@ -889,7 +889,7 @@ snapshot/resync (§8.3) makes this a non-event in practice.
 | Line endings | `.gitattributes` forces `*.ts *.json *.md text eol=lf`; Biome enforces LF. |
 | Sockets | Default host `127.0.0.1` explicitly (not `localhost`) to dodge Windows IPv6 (`::1`) resolution surprises between fetch and listen. |
 | Signals | SIGINT works on both; Windows gets no SIGTERM — the console `close` event runs the same shutdown function. |
-| Playwright | `webServer.command` in `playwright.config.ts` is a plain `pnpm` invocation with `env: {...}` in the config object (not inline shell env) and targets port 2697, so it runs unmodified on Windows runners (09). |
+| Playwright | `webServer.command` in `playwright.config.ts` is a plain `pnpm` invocation with `env: {...}` in the config object (not inline shell env) and targets the dedicated e2e port 2698 (mock LLM control on 2700, restart-spec server on 2699 — 09 §6.1), so it runs unmodified on Windows runners and never collides with a dev server on the 2697 default. |
 
 CI runs the unit/integration suite on `ubuntu-latest` **and** `windows-latest`; e2e on Linux only
 (MVP), Windows e2e deferred.

@@ -84,6 +84,7 @@ function makeRun(id: string, lane: 'high' | 'low', promptTokens: number | null):
     status: promptTokens === null ? null : 'ok',
     promptTokens,
     completionTokens: promptTokens === null ? null : 100,
+    usageEstimated: promptTokens === null ? null : 0,
     filePath: `runs/2026-07/${id}.jsonl`,
   }
 }

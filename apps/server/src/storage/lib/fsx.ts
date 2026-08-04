@@ -141,6 +141,46 @@ function trimCr(line: string): string {
 }
 
 /**
+ * Read the last ≤ `maxLines` non-empty lines of a file (in file order) without loading
+ * the whole file, scanning backward from EOF in chunks. A missing file reads as empty.
+ * The generalized tail read behind `readJsonlBoundaryLines` — also used directly where
+ * only a bounded recent window matters (context usage log, run listings).
+ */
+export async function readJsonlTailLines(fileAbs: string, maxLines: number): Promise<string[]> {
+  if (maxLines <= 0) return []
+  let handle: fsp.FileHandle
+  try {
+    handle = await fsp.open(fileAbs, 'r')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw err
+  }
+  try {
+    const { size } = await handle.stat()
+    if (size === 0) return []
+    let buf = Buffer.alloc(0)
+    let bufStart = size
+    const tail = (): string[] => {
+      let lines = buf.toString('utf8').split('\n')
+      // Mid-file start: the first segment may be a partial line — never trust it.
+      if (bufStart > 0) lines = lines.slice(1)
+      return lines.map(trimCr).filter((line) => line.trim() !== '')
+    }
+    while (bufStart > 0) {
+      const len = Math.min(READ_CHUNK, bufStart)
+      const chunk = Buffer.alloc(len)
+      await handle.read(chunk, 0, len, bufStart - len)
+      buf = Buffer.concat([chunk, buf])
+      bufStart -= len
+      if (tail().length >= maxLines) break
+    }
+    return tail().slice(-maxLines)
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
  * Read a JSONL file's first line and last non-empty line without loading the whole
  * file: the first line is read forward chunk-by-chunk to the first '\n'; the last is
  * found by seeking backward from EOF. Used wherever only the boundary events matter —
@@ -171,42 +211,31 @@ export async function readJsonlBoundaryLines(
     }
     const firstText = trimCr(Buffer.concat(firstParts).toString('utf8'))
     const first = firstText === '' ? null : firstText
-
-    // Last non-empty line: backward scan. `buf` covers file offsets [bufStart, size).
-    let buf = Buffer.alloc(0)
-    let bufStart = size
-    const extendDown = async (): Promise<boolean> => {
-      if (bufStart === 0) return false
-      const len = Math.min(READ_CHUNK, bufStart)
-      const chunk = Buffer.alloc(len)
-      await handle.read(chunk, 0, len, bufStart - len)
-      buf = Buffer.concat([chunk, buf])
-      bufStart -= len
-      return true
-    }
-    let end = size
-    while (end > 0) {
-      while (end - 1 < bufStart && (await extendDown())) {
-        // extend until buf covers offset end-1
-      }
-      const byte = buf[end - 1 - bufStart] ?? -1
-      if (byte === 0x0a || byte === 0x0d) end--
-      else break
-    }
-    if (end === 0) return { first, last: null }
-    let start = end
-    while (start > 0) {
-      while (start - 1 < bufStart && (await extendDown())) {
-        // extend until buf covers offset start-1
-      }
-      if (buf[start - 1 - bufStart] === 0x0a) break
-      start--
-    }
-    const lastText = trimCr(buf.subarray(start - bufStart, end - bufStart).toString('utf8'))
-    return { first, last: lastText === '' ? null : lastText }
+    const last = (await readJsonlTailLines(fileAbs, 1))[0] ?? null
+    return { first, last }
   } finally {
     await handle.close()
   }
+}
+
+/**
+ * Size-based single-generation rotation: when `filePath` exceeds `maxBytes`, rename it
+ * to `<filePath>.1` (replacing any previous generation) so the next append starts a
+ * fresh file. Returns true when a rotation happened. Missing file ⇒ no-op.
+ */
+export async function rotateFileIfOver(filePath: string, maxBytes: number): Promise<boolean> {
+  let size: number
+  try {
+    size = (await fsp.stat(filePath)).size
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw err
+  }
+  if (size <= maxBytes) return false
+  const rotated = `${filePath}.1`
+  await fsp.unlink(rotated).catch(() => {}) // Windows: rename cannot replace an existing file
+  await fsp.rename(filePath, rotated)
+  return true
 }
 
 /**

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
 import { ApiErrorBody, api, ErrorCode, HealthRes, type RouteDef } from './api.js'
+import { PreviewRequest, PreviewResponse } from './context.js'
+import { Task, TaskEstimate, TaskSpec } from './tasks.js'
 
 const entries = Object.entries(api) as [string, RouteDef][]
 
@@ -22,6 +24,7 @@ describe('ErrorCode (09 §shared: closed enum, spellings locked)', () => {
       'output_invalid',
       'pipeline',
       'crash',
+      'spend_stop',
       'not_implemented',
       'internal',
     ])
@@ -88,6 +91,28 @@ describe('api route registry (03 §6.2)', () => {
     expect(api.undoConsolidation.path('w1', 'tok')).toBe('/api/works/w1/consolidations/tok/undo')
     expect(api.events.path('w1')).toBe('/api/works/w1/events')
     expect(api.health.path()).toBe('/api/health')
+  })
+
+  it('task/context entries bind the real shared schemas by identity (03 §3.7, §3.11)', () => {
+    expect(api.createTask.body).toBe(TaskSpec)
+    expect(api.createTask.res).toBe(Task)
+    expect(api.createTask.status).toBe(202)
+    expect(api.getTask.res).toBe(Task)
+    expect(api.cancelTask.res).toBe(Task) // idempotent cancel echoes the Task envelope
+    expect(api.cancelTask.status).toBe(202)
+    expect(api.consolidateNow.res).toBe(Task)
+    expect(api.estimateTask.body).toBe(TaskSpec)
+    expect(api.estimateTask.res).toBe(TaskEstimate)
+    expect(api.previewContext.body).toBe(PreviewRequest)
+    expect(api.previewContext.res).toBe(PreviewResponse)
+  })
+
+  it('proposal routes: apply returns the committed artifact envelope; discard is 204', () => {
+    expect(api.applyProposal.method).toBe('POST')
+    expect(api.applyProposal.path('w1', 't2')).toBe('/api/works/w1/tasks/t2/proposal/apply')
+    expect(api.discardProposal.path('w1', 't2')).toBe('/api/works/w1/tasks/t2/proposal/discard')
+    expect(api.discardProposal.status).toBe(204)
+    expect((api.discardProposal as RouteDef).res).toBeUndefined()
   })
 
   it('marks the non-JSON surfaces: PNG bytes and the SSE stream', () => {

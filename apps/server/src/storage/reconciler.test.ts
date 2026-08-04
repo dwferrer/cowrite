@@ -83,3 +83,79 @@ describe('reconciler no-change tick performs zero full-file reads', () => {
     expect(after?.mtimeMs).not.toBe(before?.mtimeMs)
   })
 })
+
+/**
+ * §8 adoption must salvage user-authored fields from partial (e.g. id-less) frontmatter —
+ * hand-writing world entries and snippets is a first-class files-are-truth workflow, and
+ * re-minting identity must never discard the content fields the user wrote.
+ */
+describe('adoption salvages partial frontmatter', () => {
+  let root: string
+  let workDir: string
+  let db: IndexDb
+
+  beforeEach(async () => {
+    root = await fsp.mkdtemp(path.join(os.tmpdir(), 'cowrite-recon-salvage-'))
+    workDir = (await buildFixtureWork(root)).workDir
+    db = openIndex(indexPath(workDir))
+    await fullRebuild(db, workDir)
+  })
+
+  afterEach(async () => {
+    db.close()
+    await fsp.rm(root, { recursive: true, force: true })
+  })
+
+  it('keeps name, keys, and shortSummary from an id-less world entry', async () => {
+    const abs = path.join(workDir, 'world', 'entries', 'harbormaster-edlen.md')
+    await fsp.writeFile(
+      abs,
+      [
+        '---',
+        'name: Harbormaster Edlen',
+        'keys: [Edlen, harbormaster]',
+        'shortSummary: Keeps the port ledgers and at least one secret about the Elsinore.',
+        '---',
+        'Edlen has run the harbor office for twenty years.',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+
+    const report = await reconcile({ workDir, db })
+    const adopted = report.adopted.find((e) => e.kind === 'world')
+    expect(adopted).toBeDefined()
+    const row = db.getWorldEntry(adopted?.id ?? '')
+    expect(row?.name).toBe('Harbormaster Edlen')
+    expect(row?.shortSummary).toContain('port ledgers')
+    expect(db.worldKeys(adopted?.id ?? '')).toEqual(
+      expect.arrayContaining(['Edlen', 'harbormaster']),
+    )
+    // the write-back preserved the fields on disk too
+    const rewritten = await fsp.readFile(abs, 'utf8')
+    expect(rewritten).toContain('name: Harbormaster Edlen')
+    expect(rewritten).toContain('Edlen has run the harbor office')
+  })
+
+  it('keeps authorship and createdAt from an id-less snippet', async () => {
+    const abs = path.join(workDir, 'frontier', 'snippets', '900-hand-made.md')
+    await fsp.writeFile(
+      abs,
+      [
+        '---',
+        'authorship: agent',
+        'createdAt: 2026-01-01T00:00:00.000Z',
+        '---',
+        'A hand-restored agent passage with its history stripped.',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+
+    const report = await reconcile({ workDir, db })
+    const adopted = report.adopted.find((e) => e.kind === 'snippet')
+    expect(adopted).toBeDefined()
+    const row = db.getSnippet(adopted?.id ?? '')
+    expect(row?.authorship).toBe('agent')
+  })
+})

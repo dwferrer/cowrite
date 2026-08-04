@@ -125,15 +125,41 @@ export class WorkLock {
    * first, then `wx`-creates — losing that create retries the whole acquire once. A
    * post-create read-back verifies our nonce before returning `acquired: true`, which
    * also covers rename-based writers (a live holder's atomic refresh) racing the create.
+   *
+   * Same-PROCESS acquires on one path additionally serialize on an in-process queue: a
+   * process must never race itself for a work lock — a stale-takeover `unlink` has no
+   * "only if still stale" guard, so a slow sibling acquirer could delete the winner's
+   * freshly created lock and both would return `acquired: true` (the concurrent-stale-
+   * takeover regression in lock.test.ts). Cross-process, that window is closed by the
+   * §9.3 nonce re-validation before every write batch.
    */
   static async acquire(workDirPath: string, opts: LockOptions = {}): Promise<AcquireLockResult> {
-    const first = await WorkLock.tryAcquire(workDirPath, opts)
-    if (first !== null) return first
-    const second = await WorkLock.tryAcquire(workDirPath, opts)
-    if (second !== null) return second
-    throw new Error(
-      `could not acquire or identify the holder of ${lockPath(workDirPath)} (lock churn)`,
+    return WorkLock.serializeByPath(lockPath(workDirPath), async () => {
+      const first = await WorkLock.tryAcquire(workDirPath, opts)
+      if (first !== null) return first
+      const second = await WorkLock.tryAcquire(workDirPath, opts)
+      if (second !== null) return second
+      throw new Error(
+        `could not acquire or identify the holder of ${lockPath(workDirPath)} (lock churn)`,
+      )
+    })
+  }
+
+  /** In-process acquire queue per lock path (see `acquire`); entries clean up at idle. */
+  private static readonly acquireQueues = new Map<string, Promise<void>>()
+
+  private static serializeByPath<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = WorkLock.acquireQueues.get(key) ?? Promise.resolve()
+    const run = previous.then(fn)
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
     )
+    WorkLock.acquireQueues.set(key, tail)
+    void tail.then(() => {
+      if (WorkLock.acquireQueues.get(key) === tail) WorkLock.acquireQueues.delete(key)
+    })
+    return run
   }
 
   /** One acquire attempt; null = lost a create race in a way worth retrying once. */
@@ -152,7 +178,14 @@ export class WorkLock {
       try {
         await fsp.unlink(filePath)
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+          // Windows: a concurrent acquirer momentarily holds the file open (its own
+          // read or wx-create in flight) — a lost takeover race, not a failure.
+          // acquire() retries once and re-runs the staleness check.
+          return null
+        }
+        if (code !== 'ENOENT') throw err
       }
     }
     const lock = new WorkLock(filePath, opts)

@@ -9,6 +9,9 @@ import {
   readBufferIfExists,
   readIfExists,
   readJsonl,
+  readJsonlBoundaryLines,
+  readJsonlTailLines,
+  rotateFileIfOver,
   sweepTmpFiles,
   truncateTornTail,
   writeFileAtomic,
@@ -110,6 +113,60 @@ describe('appendJsonlLine / readJsonl', () => {
     const { lines, torn } = await readJsonl(file)
     expect(torn).toBe(false)
     expect(lines).toEqual([{ rev: 1 }, { rev: 2 }])
+  })
+})
+
+describe('readJsonlTailLines', () => {
+  it('returns the last N non-empty lines in file order', async () => {
+    const target = path.join(dir, 'tail.jsonl')
+    for (let i = 0; i < 10; i++) await appendJsonlLine(target, { i })
+    expect(await readJsonlTailLines(target, 3)).toEqual(['{"i":7}', '{"i":8}', '{"i":9}'])
+    expect(await readJsonlTailLines(target, 100)).toHaveLength(10)
+    expect(await readJsonlTailLines(target, 0)).toEqual([])
+  })
+
+  it('missing and empty files read as empty', async () => {
+    expect(await readJsonlTailLines(path.join(dir, 'nope.jsonl'), 5)).toEqual([])
+    const empty = path.join(dir, 'empty.jsonl')
+    await fsp.writeFile(empty, '')
+    expect(await readJsonlTailLines(empty, 5)).toEqual([])
+  })
+
+  it('skips blank lines and tolerates \\r and a missing final newline', async () => {
+    const target = path.join(dir, 'messy.jsonl')
+    await fsp.writeFile(target, '{"a":1}\r\n\n{"b":2}\n{"torn":', 'utf8')
+    expect(await readJsonlTailLines(target, 10)).toEqual(['{"a":1}', '{"b":2}', '{"torn":'])
+  })
+
+  it('reads only a bounded tail of a file far larger than one chunk', async () => {
+    const target = path.join(dir, 'big.jsonl')
+    const pad = 'x'.repeat(400)
+    const parts: string[] = []
+    for (let i = 0; i < 500; i++) parts.push(`${JSON.stringify({ i, pad })}\n`)
+    await fsp.writeFile(target, parts.join(''), 'utf8') // ~200 KB — several 64 KB chunks
+    const lines = await readJsonlTailLines(target, 2)
+    expect(lines.map((l) => (JSON.parse(l) as { i: number }).i)).toEqual([498, 499])
+    // consistency with the boundary helper on the same file
+    const { first, last } = await readJsonlBoundaryLines(target)
+    expect((JSON.parse(first ?? '') as { i: number }).i).toBe(0)
+    expect(last).toBe(lines[1])
+  })
+})
+
+describe('rotateFileIfOver', () => {
+  it('rotates to a single .1 generation once the size threshold is crossed', async () => {
+    const target = path.join(dir, 'usage.jsonl')
+    expect(await rotateFileIfOver(target, 10)).toBe(false) // missing: no-op
+    await fsp.writeFile(target, 'first generation\n')
+    expect(await rotateFileIfOver(target, 1024)).toBe(false) // under: no-op
+    expect(await rotateFileIfOver(target, 4)).toBe(true)
+    expect(await readIfExists(target)).toBeNull()
+    expect(await readIfExists(`${target}.1`)).toBe('first generation\n')
+
+    // A second rotation REPLACES the previous generation (exactly one kept).
+    await fsp.writeFile(target, 'second generation\n')
+    expect(await rotateFileIfOver(target, 4)).toBe(true)
+    expect(await readIfExists(`${target}.1`)).toBe('second generation\n')
   })
 })
 

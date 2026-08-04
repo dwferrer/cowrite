@@ -144,7 +144,8 @@ The auditable record of one task execution: kind (= `TaskKind`, kebab-case: `con
 `instructed-continue`, `quick-edit`, `edit-task`, `enrich-section`, `propose-boundaries`,
 `illustrate-section`, `world-image`), lane (`high` | `low`), model, spec, context snapshot,
 messages, tool calls, streamed output, usage, and artifacts. One JSONL file per run, write-once
-after the `result` line. The event schema (`RunEvent`, `RunArtifact`, `ContextSnapshot`) is owned
+after the `result` line — with exactly one carve-out: the durable `proposal` resolution line
+that apply/discard appends *after* `result` (mirroring 05 §5.1's proposals-from-run-JSONL). The event schema (`RunEvent`, `RunArtifact`, `ContextSnapshot`) is owned
 by 05; **this document owns the file location, sink semantics, retention, and index tables**
 (§7, §10.6).
 
@@ -899,7 +900,9 @@ export const WorldEntryMeta = z.object({
 obligations toward them:
 
 - `recordRun(runId)` returns an **append sink**: each `RunEvent` becomes one JSONL line at
-  `runs/<YYYY-MM>/<runId>.jsonl`; the file is write-once after `result`.
+  `runs/<YYYY-MM>/<runId>.jsonl`; the file is write-once after `result`, except for the one
+  post-`result` `proposal` resolution line that proposal apply/discard appends through the
+  same sink (05 §5.1 — the durable, idempotent resolution marker).
 - Run files whose `result` never arrived (crash) are finalized at the next work open as
   `status:"error", code:"crash"` by appending a synthesized `result` line.
 - The `agent_runs` / `run_artifacts` tables (§7.1) ingest exactly the `meta` and `result` lines:

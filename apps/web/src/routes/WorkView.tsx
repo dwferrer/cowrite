@@ -2,7 +2,9 @@ import { useEffect } from 'react'
 import { Link, useMatch, useNavigate, useParams } from 'react-router'
 import { useWorkEvents, useWorkStatusStore } from '../api/events.js'
 import { useWork } from '../api/queries.js'
+import { dispatchContinue } from '../doc/blocks/FrontierBar.js'
 import { DocView } from '../doc/DocView.js'
+import { dispatchQuickEdit } from '../edit/QuickEditBox.js'
 import { dispatchRevisionCycle } from '../edit/RevisionCycler.js'
 import { installKeyboard } from '../keyboard.js'
 import { SituationPane } from '../panes/SituationPane.js'
@@ -11,6 +13,7 @@ import { useDocUiStore } from '../state/docUiStore.js'
 import { usePanelStore } from '../state/panelStore.js'
 import { testids } from '../testids.js'
 import { Button } from '../ui/Button.js'
+import { RunViewer } from './RunViewer.js'
 import { ModelsNotConfiguredBanner } from './Settings.js'
 
 /**
@@ -30,6 +33,8 @@ export function WorkView() {
   const worldEntryMatch = useMatch('/w/:workId/world/*')
   const worldListMatch = useMatch('/w/:workId/world')
   const worldOpen = worldEntryMatch !== null || worldListMatch !== null
+  const runMatch = useMatch('/w/:workId/runs/:runId')
+  const runId = runMatch?.params.runId ?? null
   const readonlyBanner = useWorkStatusStore((s) => s.readonlyBanner)
   const connected = useWorkStatusStore((s) => s.connected)
 
@@ -64,7 +69,12 @@ export function WorkView() {
           // Esc ladder (§12): modal (owns its own Esc) → panel → nothing
           if (worldOpen) navigate(worldEntryMatch ? `/w/${workId}/world` : `/w/${workId}`)
         },
-        // 'global.continue' stays unregistered — Continue is disabled until Stage 3
+        // Ctrl-Enter with nothing selected/no editor → Continue (04 §8.1, §12); the
+        // frontier bar owns the launch (and the disabled/busy/config_missing surface)
+        'global.continue': () => dispatchContinue(),
+        // Ctrl-Enter with a selection → quick edit iff its box has text; never falls
+        // through to Continue (04 §12) — the box itself checks for text
+        'selection.quickEdit': () => dispatchQuickEdit(),
       },
     )
   }, [workId, worldOpen, worldEntryMatch, navigate])
@@ -112,6 +122,10 @@ export function WorkView() {
           <WorldPanel workId={workId} entryId={params.entryId} readonly={readonly} />
         ) : null}
       </div>
+
+      {runId !== null ? (
+        <RunViewer workId={workId} runId={runId} onClose={() => navigate(`/w/${workId}`)} />
+      ) : null}
     </div>
   )
 }

@@ -1,6 +1,13 @@
 import { z } from 'zod'
 import { ConfigTestReq, ConfigUpdate, ConfigWriteRes, ProbeResult, PublicConfig } from './config.js'
-import { ContextCandidate, ContextPreviewReq, ContextPreviewRes } from './context.js'
+import {
+  ContextCandidate,
+  ContextStateRes,
+  ContextUsageQuery,
+  PreviewRequest,
+  PreviewResponse,
+  UsageEvent,
+} from './context.js'
 import { Hash } from './ids.js'
 import { IllustrationHealthRes } from './illustration.js'
 import { RunEvent, RunSummary } from './runs.js'
@@ -55,6 +62,7 @@ export const ErrorCode = z.enum([
   'output_invalid',
   'pipeline',
   'crash',
+  'spend_stop', // 409 — the per-process spend guard tripped (05 §cost); restart or raise the knob
   // registered-but-stubbed routes (§6.2) and storage entry points that land in a later stage
   'not_implemented', // 501
   // catch-all
@@ -284,7 +292,9 @@ export const api = {
     res: SituationPutRes,
   },
 
-  // ---- tasks (§3.7; Stage 3 stubs — the harness owns handler semantics) ----
+  // ---- tasks (§3.7; schemas are the real 05 §2.1 contracts — the harness owns handler
+  // semantics: 409 busy/config_missing, the quick-edit selection rule, cancel idempotence,
+  // and proposal reconstruction from the run JSONL) ----
   createTask: {
     method: 'POST',
     path: (w: string) => `/api/works/${w}/tasks`,
@@ -334,7 +344,8 @@ export const api = {
     status: 204,
   },
 
-  // ---- runs (§3.9; Stage 3 stubs). GET /usage is deferred — not registered. ----
+  // ---- runs (§3.9; provenance — parsed run JSONL + artifact queries).
+  // GET /usage is deferred — not registered. ----
   getRun: {
     method: 'GET',
     path: (w: string, r: string) => `/api/works/${w}/runs/${r}`,
@@ -370,8 +381,12 @@ export const api = {
     raw: 'image/png', // immutable behind ?v=<imageVersion>
   },
 
-  // ---- context engine (§3.11; Stage 3 stubs — 06 owns handlers). /context/state and
-  // /context/usage are registered when 06 defines their DTOs. ----
+  // ---- context engine (§3.11; 06 §11 DTOs — 06 owns handlers) ----
+  getContextState: {
+    method: 'GET',
+    path: (w: string) => `/api/works/${w}/context/state`,
+    res: ContextStateRes,
+  },
   getContextCandidates: {
     method: 'GET',
     path: (w: string) => `/api/works/${w}/context/candidates`,
@@ -380,13 +395,19 @@ export const api = {
   previewContext: {
     method: 'POST',
     path: (w: string) => `/api/works/${w}/context/preview`,
-    body: ContextPreviewReq,
-    res: ContextPreviewRes,
+    body: PreviewRequest,
+    res: PreviewResponse,
   },
   resetContext: {
     method: 'POST',
     path: (w: string) => `/api/works/${w}/context/reset`,
     status: 204,
+  },
+  getContextUsage: {
+    method: 'GET',
+    path: (w: string) => `/api/works/${w}/context/usage`,
+    query: ContextUsageQuery,
+    res: z.array(UsageEvent),
   },
 
   // ---- config & meta (§3.12) ----

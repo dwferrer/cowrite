@@ -4,11 +4,16 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import { createMockLlm, type MockLlm } from '@cowrite/mock-llm'
+import type { AppConfig } from '@cowrite/shared'
 import { parseArgs } from './cli.js'
+import { formatConfigIssues, resolveEffectiveConfig } from './config/effective.js'
 import { ensureFirstRun } from './config/firstRun.js'
-import { type CliFlags, type ConfigIssue, loadConfig } from './config/load.js'
+import type { CliFlags } from './config/load.js'
 import { configRoutes } from './config/routes.js'
 import { ConfigService } from './config/service.js'
+import { withMockModels } from './harness/mockLlm.js'
+import { AgentHarness } from './harness/service.js'
 import { buildApp } from './http/app.js'
 import { resourceRoutes } from './http/routes/index.js'
 import { WorkRegistry } from './http/workRegistry.js'
@@ -46,15 +51,6 @@ function readFlags(argv: string[]): CliFlags {
     ...(flags['no-open'] === undefined ? {} : { noOpen: true }),
     ...(flags.mock === undefined ? {} : { mock: true }),
   }
-}
-
-function formatIssues(issues: ConfigIssue[]): string {
-  return issues
-    .map((issue) => {
-      const where = issue.line === null ? '' : ` (line ${issue.line}, col ${issue.column})`
-      return `  - ${issue.path === '' ? '(file)' : issue.path}: ${issue.message}${where}`
-    })
-    .join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -126,15 +122,29 @@ async function main(): Promise<void> {
   const version = pkg.version ?? '0.0.0'
 
   const flags = readFlags(process.argv.slice(2))
-  const loaded = await loadConfig({ flags })
-  if (!loaded.ok) {
-    console.error(`invalid config at ${loaded.configPath}:\n${formatIssues(loaded.issues)}`)
+  // ONE effective-config resolution shared with the dev CLI (config/effective.ts):
+  // invalid config is fatal — except under mock mode, where it warns and runs defaults.
+  const resolved = await resolveEffectiveConfig({ flags })
+  if (!resolved.ok) {
+    console.error(
+      `invalid config at ${resolved.configPath}:\n${formatConfigIssues(resolved.issues)}`,
+    )
     process.exit(1)
   }
+  for (const warning of resolved.warnings) console.warn(warning)
 
-  const { config, configPath, firstRun, mock } = loaded
+  const { config, mock, loaded } = resolved
+  const { configPath, firstRun } = loaded
+
+  // COWRITE_MOCK_LLM=1 / --mock (docs/09 §2.3): boot the scriptable mock in-process and
+  // point both model lanes at it, so e2e and manual dev run without real endpoints.
+  // MOCK_LLM_PORT pins the listen port (0/unset = ephemeral) so cross-process suites
+  // (Playwright) can script `POST /__mock/scenario` at a known address.
+  let mockLlm: MockLlm | null = null
   if (mock) {
-    console.log('(--mock requested: the in-process mock LLM arrives with the agent harness)')
+    const rawPort = Number(process.env.MOCK_LLM_PORT ?? '0')
+    const port = Number.isInteger(rawPort) && rawPort > 0 && rawPort <= 65535 ? rawPort : 0
+    mockLlm = await createMockLlm({ port })
   }
 
   // Boot-pinned values (§9.7 restartRequired): host, port, dataDir.
@@ -152,12 +162,23 @@ async function main(): Promise<void> {
   const service = new ConfigService(loaded, { flags })
   const storage = createStorage(dataDir)
   const works = new WorkRegistry(storage)
+  // The harness reads config live per task submit; in mock mode both lanes point at the
+  // in-process mock (config-pointing only — everything else is the saved config).
+  const effectiveConfig = (): AppConfig =>
+    mockLlm === null ? service.get() : withMockModels(service.get(), mockLlm.url)
+  const harness = new AgentHarness({
+    config: effectiveConfig,
+    budgets: () => service.get().budgets,
+  })
+  // Work close cancels that work's lanes before the stream/handle tear down (05 §6.2).
+  works.onClose((open) => harness.closeWork(open))
   const app = buildApp({
     config: { current: () => service.get() },
     works,
     version,
     plugins: [
-      resourceRoutes({ works, storage }),
+      // budgets: the app-level layer of 06 §8.1's override chain (config.budgets).
+      resourceRoutes({ works, storage, budgets: () => service.get().budgets, harness }),
       async (instance) => configRoutes(instance, { service }),
     ],
   })
@@ -195,6 +216,9 @@ async function main(): Promise<void> {
   console.log(
     `  data     ${dataDir}  (${workCount} work${workCount === 1 ? '' : 's'} · trash ${humanBytes(trashBytes)})`,
   )
+  if (mockLlm !== null) {
+    console.log(`  mock     in-process mock LLM at ${mockLlm.url} (both lanes; /__mock/* control)`)
+  }
   console.log(`  ➜ ${url}`)
 
   if (config.server.openBrowser && flags.noOpen !== true && process.stdout.isTTY) {
@@ -209,6 +233,7 @@ async function main(): Promise<void> {
       // §4.2: run the close path for every open work, then close the listener.
       await works.closeAll().catch(() => {})
       await app.close().catch(() => {})
+      await mockLlm?.close().catch(() => {})
       process.exit(0)
     })()
   }

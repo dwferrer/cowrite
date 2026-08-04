@@ -3,17 +3,67 @@ import { type QueryClient, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { create } from 'zustand'
 import { useDocUiStore } from '../state/docUiStore.js'
+import { useTaskStore } from '../state/taskStore.js'
+import { pushToast } from '../ui/Toast.js'
 import { signalEditing } from './editingSignal.js'
 import { byOrderKey, qk } from './queries.js'
 
 /**
  * SSE subscription + the WorkEvent → cache reducer (docs/04-frontend.md §4.3).
  *
- * Every storage-originated event row is implemented; the `task.*` family is routed to
- * explicit no-ops until Stage 3 fills the task store (the union is the contract, not the
- * emitter). `applyWorkEvent` is a pure-ish function over (QueryClient, stores) so each row is
+ * Every storage-originated event row patches the query cache; the `task.*` family routes
+ * into the task store (04 §4.4) — `task.started` by lane, everything later by taskId.
+ * `applyWorkEvent` is a pure-ish function over (QueryClient, stores) so each row is
  * unit-testable without a connection.
  */
+
+// ---------------------------------------------------------------------------
+// Delta batching (04 §8.3): `task.delta` events accumulate here; a 33 ms rAF-aligned
+// flush writes them to the store in one commit (~30 fps), keeping React off the token
+// firehose. Terminal events flush synchronously so no tail text is lost.
+// ---------------------------------------------------------------------------
+
+const DELTA_FLUSH_MS = 33
+
+let pendingDeltas = new Map<string /*taskId*/, Array<{ target: string; text: string }>>()
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+/** Flush all pending task deltas to the store immediately. Exported for tests. */
+export function flushTaskDeltas(): void {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
+  if (pendingDeltas.size === 0) return
+  const batch = pendingDeltas
+  pendingDeltas = new Map()
+  for (const [taskId, entries] of batch) {
+    useTaskStore.getState().appendDeltas(taskId, entries)
+  }
+}
+
+function scheduleDeltaFlush(): void {
+  if (flushTimer !== null) return
+  flushTimer = setTimeout(() => {
+    flushTimer = null
+    // align the store commit with a paint frame when the environment has one
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => flushTaskDeltas())
+    else flushTaskDeltas()
+  }, DELTA_FLUSH_MS)
+}
+
+/** Drop buffered deltas for one task (retry/snapshot reset) or all (work switch). */
+export function dropPendingDeltas(taskId?: string): void {
+  if (taskId === undefined) {
+    pendingDeltas = new Map()
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+    return
+  }
+  pendingDeltas.delete(taskId)
+}
 
 // ---------------------------------------------------------------------------
 // Connection/banner state the shell renders (readonly banner, offline banner,
@@ -248,21 +298,133 @@ export function applyWorkEvent(qc: QueryClient, workId: string, event: WorkEvent
       break
     }
 
-    // ---- task.* family: Stage 3 (agents) fills the task store; explicit no-ops now ----
-    case 'task.queued':
-    case 'task.started':
-    case 'task.stage':
-    case 'task.tool':
-    case 'task.delta':
-    case 'task.snapshot':
-    case 'task.retrying':
-    case 'task.progress':
-    case 'task.artifact':
-    case 'task.usage':
-    case 'task.completed':
-    case 'task.cancelled':
-    case 'task.failed':
+    // ---- task.* family (04 §4.3, §4.4): started routes by lane, the rest by taskId ----
+    case 'task.queued': {
+      useTaskStore.getState().queued(event.task, event.position)
       break
+    }
+
+    case 'task.started': {
+      useTaskStore.getState().started(event.task, event.lane, event.target)
+      break
+    }
+
+    case 'task.stage': {
+      useTaskStore.getState().setStage(event.taskId, event.stage)
+      break
+    }
+
+    case 'task.tool': {
+      useTaskStore.getState().addToolNote(event.taskId, event.label)
+      break
+    }
+
+    case 'task.delta': {
+      // accumulate; the 33 ms flush commits to the store (~30 fps, 04 §8.3). Targeted
+      // (quick-edit) deltas buffer invisibly — only the frontier target renders live.
+      const entries = pendingDeltas.get(event.taskId) ?? []
+      entries.push({ target: event.target, text: event.text })
+      pendingDeltas.set(event.taskId, entries)
+      scheduleDeltaFlush()
+      break
+    }
+
+    case 'task.snapshot': {
+      // reconnect catch-up: the snapshot replaces the buffer wholesale, so anything
+      // still pending for this task predates it and must not re-append
+      dropPendingDeltas(event.taskId)
+      useTaskStore.getState().snapshotBuffer(event.taskId, event.target, event.text)
+      break
+    }
+
+    case 'task.retrying': {
+      dropPendingDeltas(event.taskId)
+      useTaskStore.getState().retrying(event.taskId, event.attempt, event.reason)
+      break
+    }
+
+    case 'task.progress': {
+      useTaskStore.getState().progress(event.taskId, {
+        phase: event.phase,
+        attempt: event.attempt,
+        maxAttempts: event.maxAttempts,
+        pct: event.pct,
+      })
+      break
+    }
+
+    case 'task.artifact': {
+      // conflict-state artifacts arm the apply/discard offer surfaced at completion
+      // (04 §8.4); committed artifacts ride their own domain events — nothing to patch
+      useTaskStore.getState().artifact(event.taskId, event.artifact)
+      break
+    }
+
+    case 'task.usage': {
+      useTaskStore.getState().setUsage(event.taskId, {
+        promptTokens: event.promptTokens,
+        completionTokens: event.completionTokens,
+        estimated: event.estimated,
+        costUsd: event.costUsd,
+      })
+      break
+    }
+
+    case 'task.state': {
+      // Attach-frame hydration (03 §8.3): the synthetic state of the current interactive
+      // task — or a terminal one still offering an unresolved proposal — on EVERY
+      // attach. The web hydrates purely from the stream: no fetch-then-subscribe gap.
+      if (event.task.status === 'running' || event.task.status === 'queued') {
+        useTaskStore.getState().stateFrame(event.task, event.lane, event.target)
+      } else {
+        dropPendingDeltas(event.task.id)
+        useTaskStore.getState().stateFrame(event.task, event.lane, event.target)
+      }
+      break
+    }
+
+    case 'spend.warning': {
+      pushToast(
+        `Model spend this session crossed $${event.thresholdUsd.toFixed(2)} ` +
+          `(now $${event.spentUsd.toFixed(2)})`,
+        { tone: 'error' },
+      )
+      break
+    }
+
+    case 'task.completed': {
+      flushTaskDeltas() // a conflict proposal reads the buffered rewrite — no tail loss
+      useTaskStore.getState().completed(event.taskId)
+      break
+    }
+
+    case 'task.cancelled': {
+      flushTaskDeltas()
+      const wasInteractive = useTaskStore.getState().interactive?.taskId === event.taskId
+      useTaskStore.getState().cancelled(event.taskId, event.partialText)
+      if (wasInteractive && event.partialText !== null) {
+        pushToast('Generation cancelled — partial text kept for review')
+      }
+      break
+    }
+
+    case 'task.failed': {
+      flushTaskDeltas()
+      const wasInteractive = useTaskStore.getState().interactive?.taskId === event.taskId
+      useTaskStore.getState().failed(event.taskId, {
+        code: event.code,
+        message: event.message,
+        partialText: event.partialText,
+        retryable: event.retryable,
+      })
+      // interactive failures toast loudly; background ones stay quiet (04 §14)
+      if (wasInteractive) {
+        pushToast(`Generation failed — ${event.message}${event.retryable ? ' (retryable)' : ''}`, {
+          tone: 'error',
+        })
+      }
+      break
+    }
 
     default: {
       // exhaustiveness guard — a new union member fails compile here
@@ -375,6 +537,9 @@ export function useWorkEvents(workId: string, options: UseWorkEventsOptions = {}
       }
     }
 
+    // No pre-fetch: the bus's attach-time `task.state` frame seeds the interactive slot
+    // (or a pending keep-partial offer) before any snapshot/delta arrives (03 §8.3), so
+    // the stream alone hydrates and the fetch-to-subscribe gap does not exist.
     connect(false)
 
     return () => {
@@ -382,6 +547,9 @@ export function useWorkEvents(workId: string, options: UseWorkEventsOptions = {}
       if (retryTimer !== undefined) clearTimeout(retryTimer)
       source?.close()
       useWorkStatusStore.getState().reset()
+      // task display state is per work — never leak a stream across a work switch (04 §4.4)
+      dropPendingDeltas()
+      useTaskStore.getState().reset()
     }
   }, [workId, qc, factory])
 }

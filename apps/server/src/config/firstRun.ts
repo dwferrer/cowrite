@@ -61,7 +61,11 @@ export const CONFIG_TEMPLATE = `// Cowrite configuration — JSONC (comments and
   // The override chain: these app-level values < per-work "contextOverrides" in work.json.
   "budgets": {},
 
-  // Agent-harness timeouts/retries (docs/05 §6.4) — sparse overrides.
+  // Agent-harness timeouts/retries (docs/05 §6.4) — sparse overrides. Also the
+  // per-process spend guard: "spendWarnUsd" (default 5) emits a one-time warning once
+  // this session's derived model cost crosses it; "spendStopUsd" (default null = off)
+  // makes NEW task submissions fail with 409 spend_stop until a restart or a higher
+  // value. E.g. "harness": { "spendWarnUsd": 2, "spendStopUsd": 10 },
   "harness": {},
 
   "retention": {

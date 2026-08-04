@@ -46,6 +46,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   output_invalid: 502,
   pipeline: 502,
   crash: 500,
+  spend_stop: 409,
   not_implemented: 501,
   internal: 500,
 }

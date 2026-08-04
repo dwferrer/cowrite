@@ -1,0 +1,21 @@
+{
+  "name": "@cowrite/mock-llm",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Scriptable OpenAI-compatible and ComfyUI mock servers: the test double every tier uses.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "standalone": "tsx src/standalone.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}

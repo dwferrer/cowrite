@@ -20,8 +20,30 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks()
-  await fsp.rm(workDir, { recursive: true, force: true })
+  // Windows under load: a just-released handle can hold the dir briefly — same retry
+  // tolerance production cleanup paths use.
+  await fsp.rm(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 })
+
+/**
+ * Acquire with the SAME churn tolerance production gets from its second `tryAcquire`
+ * pass: on Windows under load, BOTH racers of a stale takeover can lose their unlink to
+ * a transient EPERM twice in a row (acquire throws "lock churn") — a lost race, not a
+ * failure, so retry briefly instead of flaking.
+ */
+async function acquireTolerant(
+  dir: string,
+  opts: Parameters<typeof WorkLock.acquire>[1] = {},
+): Promise<Awaited<ReturnType<typeof WorkLock.acquire>>> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await WorkLock.acquire(dir, opts)
+    } catch (err) {
+      if (attempt >= 5 || !/lock churn/.test(String(err))) throw err
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+  }
+}
 
 function staleLockData(): LockData {
   return {
@@ -74,11 +96,43 @@ describe('WorkLock.acquire (§9.3)', () => {
   it('two concurrent stale takeovers: exactly one wins', async () => {
     await fsp.mkdir(path.dirname(lockPath(workDir)), { recursive: true })
     await fsp.writeFile(lockPath(workDir), JSON.stringify(staleLockData()))
-    const results = await Promise.all([WorkLock.acquire(workDir), WorkLock.acquire(workDir)])
+    const results = await Promise.all([acquireTolerant(workDir), acquireTolerant(workDir)])
     expect(results.filter((r) => r.acquired)).toHaveLength(1)
     for (const r of results) {
       if (r.acquired) await r.lock.release()
     }
+  })
+
+  it('a SLOW second stale takeover cannot delete the winner’s fresh lock (unlink race)', async () => {
+    // The load-induced interleaving, made deterministic: both racers read the stale
+    // lock, racer 1 takes over (unlink + create) at full speed, racer 2's unlink is
+    // delayed until AFTER the winner's lock exists. Without the in-process acquire
+    // queue, that late unlink deletes the WINNER's fresh lock and both racers return
+    // acquired:true — a single-writer violation.
+    await fsp.mkdir(path.dirname(lockPath(workDir)), { recursive: true })
+    await fsp.writeFile(lockPath(workDir), JSON.stringify(staleLockData()))
+
+    const realUnlink = fsp.unlink.bind(fsp)
+    let lockUnlinks = 0
+    vi.spyOn(fsp, 'unlink').mockImplementation(async (target) => {
+      if (String(target) === lockPath(workDir)) {
+        lockUnlinks += 1
+        if (lockUnlinks > 1) {
+          // the slow racer: its takeover lands well after the winner acquired
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+      }
+      return realUnlink(target)
+    })
+
+    const results = await Promise.all([acquireTolerant(workDir), acquireTolerant(workDir)])
+    expect(results.filter((r) => r.acquired)).toHaveLength(1)
+    // the winner's lock is still on disk and still carries the winner's nonce
+    const winner = results.find((r) => r.acquired)
+    if (winner === undefined || !winner.acquired) throw new Error('unreachable')
+    const onDisk = parseLockData(await readIfExists(lockPath(workDir)))
+    expect(onDisk?.nonce).toBe(winner.lock.nonce)
+    await winner.lock.release()
   })
 })
 

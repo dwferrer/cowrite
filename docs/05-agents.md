@@ -488,6 +488,10 @@ queue** that per-work schedulers submit into (ComfyUI is one box).
 | `background` | **2** per work | enrich-section, propose-boundaries | FIFO; `propose-boundaries` jumps the queue (consolidation is waiting on it). Deduped by `(kind, targetId)` — enqueueing an enrich for an already-queued section is a no-op. |
 | `illustration` | **1** app-wide | illustrate-section, world-image | FIFO across works; user-initiated jumps ahead of scheduler-initiated. |
 
+Lane capacities are **policy, not configuration**: they live in the shared
+`QUEUE_LANE_CAPACITY` constant (consumed by `harness/queue.ts` and `service.ts`), never under
+`config.harness` — §6.4 stays timeouts/retries/spend only.
+
 Interactive and background lanes run concurrently — they hit different endpoints (high vs low),
 background work never touches the engine session (§4.4), and storage writes serialize on the
 per-work mutex (02 §atomicity). One carve-out: while a consolidation apply is in flight,
@@ -535,6 +539,8 @@ be able to reattach (03 §resume). Queued tasks cancel by removal.
 | `illustrationBudgetMs` | 600 000 | whole illustration run (pipeline reads it via `remainingMs()`) |
 | `retry.maxAttempts` | 3 | per model call (1 initial + 2 retries) |
 | `retry.backoffMs` | 1 000 → 4 000 (+ full jitter) | between attempts; honor `Retry-After` on 429 |
+| `spendWarnUsd` | 5 (null disables) | per-process cumulative derived spend (§9); crossing it emits a one-time `spend.warning` event + console notice |
+| `spendStopUsd` | null (disabled) | crossing it makes NEW task submissions fail `409 spend_stop` until restart or a knob change |
 
 Retryable: network errors, 408/429/5xx, first-token timeout, and mid-stream death during
 planning (no user-visible text lost — replay the call; the engine's `handleToolCall` is
@@ -716,34 +722,37 @@ Planning-stage tool expansion isn't estimable pre-run; the initial assembly domi
 ## 10. Module layout
 
 ```
-apps/server/src/agents/
-  index.ts                # AgentService: submit/cancel/list, cancelByTarget, wires lanes ↔ runner ↔ bus
-  scheduler.ts            # per-work lanes (interactive/background) + app-level illustration queue,
-                          #   dedupe & jump rules, sweep timers (presence-gated), AbortControllers
+apps/server/src/harness/
+  service.ts              # AgentHarness: submit/cancel/list, spend guard, wires lanes ↔ runner ↔ bus
+  queue.ts                # per-work lanes (interactive/background) + app-level illustration queue,
+                          #   dedupe & jump rules, AbortControllers (capacities: QUEUE_LANE_CAPACITY)
   runner.ts               # §4.2 loop; session lifecycle; retry/timeout policy; repair turn
-  llm/
-    client.ts             # LlmClient interface + OpenAI-compatible fetch/SSE impl
-  output/
-    tagBlocks.ts          # streaming TagBlockParser (§5.2)
-  tasks/                  # one handler per TaskKind: assembly (background kinds only),
-    continue.ts           #   expectedBlocks, commit
-    quickEdit.ts
-    editTask.ts           # M2
-    enrichSection.ts      # handler-owned assembly (§4.4)
-    proposeBoundaries.ts  # handler-owned assembly; returns BoundaryProposal to caller
-    illustrateSection.ts  # thin: delegates to illustration pipeline with RunContext (§13)
-    worldImage.ts
-  runsink.ts              # tees RunEvents → storage.recordRun + EventBus (delta throttling)
-  proposals.ts            # reconstruct-from-run-JSONL apply/discard (§5.1)
-  estimate.ts             # M2: wraps engine preview + cost math (§9)
+  tasks.ts                # per-kind task plans: expectedBlocks, targets, commit paths
+  proposals.ts            # reconstruct-from-run-JSONL apply/discard (§5.1); run-file listing
   routes.ts               # Fastify plugin for §8 (registered by 03)
-prompts/                  # .md templates with {{slots}}; wording owned by 07; hot-reloaded in dev
-  system.md  continue.md  quick-edit.md  edit-task.md  enrich.md  boundaries.md  repair.md
+  mockLlm.ts              # COWRITE_MOCK_LLM overlay: point both lanes at @cowrite/mock-llm (09 §2.3)
+apps/server/src/models/
+  client.ts               # LlmClient interface + OpenAI-compatible fetch/SSE impl
+  lanes.ts                # buildClients (high/low from config), resolveHarnessKnobs
+  usage.ts                # normalizeUsage, chars/4 estimate, derived cost (§9)
+apps/server/src/prompt/
+  tags.ts  regions.ts     # tag grammar + region/item renderers (07 owns wording)
+  renderer.ts             # template-backed PromptRenderer (the engine's `renderer` dep)
+  outputParser.ts         # streaming tag-block parser (§5.2)
+  imagePrompt.ts          # Stage-5 constants + compose-only regions (08)
+  templates/              # .md templates with {{slots}}; wording owned by 07; loader.ts hashes
+    loader.ts  system.md  #   the set into meta.params.promptsHash
+    continue.md  quick-edit.md            # <instructions> bodies (interactive kinds)
+    continue-task.md  quick-edit-task.md  # <task> regions, split per kind
+    instructed-continue-task.md
+    enrich.md  boundaries.md  refresh.md  repair.md   # edit-task templates land with M2
 packages/shared/src/
-  tasks.ts                # TaskKind, TaskSpec, EditTarget, SectionSpan, Task, TaskEstimate
+  task-kind.ts            # the TaskKind enum leaf (breaks the tasks ⇄ context import cycle)
+  tasks.ts                # TaskSpec, EditTarget, SectionSpan, Task, TaskEstimate; re-exports TaskKind
   runs.ts                 # RunEvent, RunArtifact, RunSummary, ContextSnapshot
 packages/mock-llm/        # §12; shared with 09
-  src/server.ts  src/scenario.ts  src/comfy.ts  scenarios/*.json
+  src/server.ts  src/scenario.ts  src/comfy.ts  src/base.ts  src/png.ts
+  src/standalone.ts  src/index.ts  src/testUtil.ts
 ```
 
 Model endpoint config, `${env:}` interpolation, and hot-reload live in the API layer's
@@ -908,7 +917,7 @@ Shared schemas this subsystem **owns** (in `packages/shared/src/`):
 | `TaskKind`, `TaskSpec`, `EditTarget`, `SectionSpan`, `ContextSelection`, `Task`, `TaskEstimate` | `tasks.ts` | 03 §tasks (routes), 04 §task store, 06 §session specs |
 | `RunEvent`, `RunArtifact`, `RunSummary` | `runs.ts` | 02 §runs (sink + index ingestion of `meta`/`result`), 03 §runs, 04 §provenance |
 | `ContextSnapshot` | `runs.ts` (values produced by 06 §assembly) | 04 §provenance region view, run `meta` events |
-| `HarnessKnobs` (timeouts/retries, §6.4) | `config.ts` fragment | 03 §config (`config.harness`) |
+| `HarnessKnobs` (timeouts/retries + `spendWarnUsd`/`spendStopUsd`, §6.4) | `config.ts` fragment | 03 §config (`config.harness`) |
 | `LlmClient`, `RunContext` (interfaces, `apps/server`) | — | 08 §pipeline, 09 §mocks |
 
 Shared schemas and services this subsystem **consumes**:

@@ -10,7 +10,9 @@ import Database from 'better-sqlite3'
  * rebuild-needed check (§7.3), and a thin typed query API for §7.2's consumers.
  */
 
-export const INDEX_SCHEMA_VERSION = 2
+// v3: agent_runs.usage_estimated (05 §9 usage honesty) — bumping forces the rebuild
+// that backfills it from run files (the index is a cache; a rebuild is always safe).
+export const INDEX_SCHEMA_VERSION = 3
 
 // DDL exactly per spec 02 §7.1 (user_version is set by openIndex in the same transaction).
 const DDL = `
@@ -77,6 +79,7 @@ CREATE TABLE agent_runs (
   model TEXT,
   started_at TEXT NOT NULL, ended_at TEXT, status TEXT,
   prompt_tokens INTEGER, completion_tokens INTEGER,
+  usage_estimated INTEGER,              -- 1 when any usage component was a chars/4 estimate
   file_path TEXT NOT NULL
 );
 CREATE TABLE run_artifacts (            -- run <-> artifact join: "what produced this version?"
@@ -165,6 +168,8 @@ export interface AgentRunRow {
   status: 'ok' | 'error' | 'cancelled' | null
   promptTokens: number | null
   completionTokens: number | null
+  /** 1 when any usage component was a chars/4 estimate (05 §9); null pre-result. */
+  usageEstimated: number | null
   filePath: string
 }
 
@@ -246,7 +251,7 @@ FROM world_entries`
 
 const RUN_SELECT = `SELECT id, kind, lane, model, started_at AS startedAt, ended_at AS endedAt,
   status, prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
-  file_path AS filePath
+  usage_estimated AS usageEstimated, file_path AS filePath
 FROM agent_runs`
 
 /** The ONE encoding of the works-list/WorkDetail aggregates (03 §3.1): counts, total
@@ -512,7 +517,8 @@ export class IndexDb {
     this.transaction(() => {
       this.prepare(
         `INSERT OR REPLACE INTO agent_runs (id, kind, lane, model, started_at, ended_at, status,
-          prompt_tokens, completion_tokens, file_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          prompt_tokens, completion_tokens, usage_estimated, file_path)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         run.id,
         run.kind,
@@ -523,6 +529,7 @@ export class IndexDb {
         run.status,
         run.promptTokens,
         run.completionTokens,
+        run.usageEstimated,
         run.filePath,
       )
       this.prepare('DELETE FROM run_artifacts WHERE run_id = ?').run(run.id)
@@ -552,6 +559,7 @@ export class IndexDb {
       `SELECT r.id AS runId, r.kind, r.lane, r.model, r.status,
          r.started_at AS startedAt, r.ended_at AS endedAt,
          r.prompt_tokens AS promptTokens, r.completion_tokens AS completionTokens,
+         r.usage_estimated AS usageEstimated,
          a.rev, a.state AS artifactState
        FROM run_artifacts a JOIN agent_runs r ON r.id = a.run_id
        WHERE a.artifact_kind = ? AND a.artifact_id = ?
@@ -560,13 +568,15 @@ export class IndexDb {
       Omit<RunByArtifact, 'usageTotal'> & {
         promptTokens: number | null
         completionTokens: number | null
+        usageEstimated: number | null
       }
     >
-    return raw.map(({ promptTokens, completionTokens, ...rest }) => ({
+    return raw.map(({ promptTokens, completionTokens, usageEstimated, ...rest }) => ({
       ...rest,
       usageTotal: {
         promptTokens: promptTokens ?? 0,
         completionTokens: completionTokens ?? 0,
+        estimated: usageEstimated === 1,
       },
     }))
   }

@@ -2,19 +2,34 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import {
+  type CliRuntime,
+  type CliTaskRequest,
+  contextPreviewCommand,
+  contextStateCommand,
+  createCliRuntime,
+  promptRenderCommand,
+  runsListCommand,
+  runsShowCommand,
+  runTaskCommand,
+} from './cliAgents.js'
 import type { SectionRow, SnippetRow } from './storage/index/db.js'
 import { wordCount } from './storage/lib/hash.js'
 import { shortId } from './storage/lib/paths.js'
 import { createStorage, type WorkHandle } from './storage/service.js'
 
 /**
- * Stage-1 demo CLI over the storage layer (spec 02 §11). Plain console output, no
- * argument-parsing dependency — a ~40-line positional/flag splitter below is all a demo
- * tool needs. Data dir comes from COWRITE_DATA_DIR (default ~/.cowrite/data, §5.2).
+ * The dev CLI (docs/10 §Stage 1 dev-CLI note): Stage-1 storage commands (spec 02 §11)
+ * plus the Stage-3 agent commands (cliAgents.ts — same harness/engine code paths as the
+ * HTTP layer). Plain console output, no argument-parsing dependency — a ~40-line
+ * positional/flag splitter below is all a demo tool needs. Data dir comes from
+ * COWRITE_DATA_DIR (default ~/.cowrite/data, §5.2); model lanes come from
+ * ~/.cowrite/config.jsonc, or run modelless with COWRITE_MOCK_LLM=1 (docs/09 §2.3).
  */
 
-const USAGE = `cowrite storage CLI (data dir: COWRITE_DATA_DIR, default ~/.cowrite/data)
+const USAGE = `cowrite dev CLI (data dir: COWRITE_DATA_DIR, default ~/.cowrite/data)
 
+storage:
   works list                              list all works
   works create <title>                    create a work
   work info <slug>                        sections tree + frontier + staleness badges
@@ -26,7 +41,21 @@ const USAGE = `cowrite storage CLI (data dir: COWRITE_DATA_DIR, default ~/.cowri
   world list <slug>                       list world entries
   search <slug> <query>                   full-text search (FTS5)
   reconcile <slug>                        adopt/refresh external edits
-  rebuild <slug>                          full index rebuild from files`
+  rebuild <slug>                          full index rebuild from files
+
+agents (model lanes from ~/.cowrite/config.jsonc; COWRITE_MOCK_LLM=1 runs modelless):
+  continue <slug> [--cancel-after <ms>]   run a continue task; deltas stream to stdout
+  instruct <slug> <instruction...>        instructed continue (same flags as continue)
+  quick-edit <slug> <snippetId> <instruction...>
+                                          rewrite one snippet; prints before/after words
+  prompt render <slug> [--kind continue|instructed-continue|quick-edit]
+                [--target <snippetId>] [--instruction <text>] [--json]
+                                          print the exact assembled prompt — NO model call
+                                          (--json prints the ContextSnapshot instead)
+  context preview <slug>                  region/item table: fidelity, tokens, budgets
+  context state <slug>                    the elevation ledger + anchors
+  runs list <slug>                        run summaries from the run files
+  runs show <slug> <runId> [--full]       one run's transcript (--full prints messages)`
 
 interface Args {
   positionals: string[]
@@ -292,6 +321,104 @@ async function cmdRebuild(dataDir: string, slug: string): Promise<void> {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Stage-3 agent commands (cliAgents.ts does the work; these adapt argv + stdout).
+// ---------------------------------------------------------------------------
+
+const stdoutWrite = (text: string): void => {
+  process.stdout.write(text)
+}
+
+async function withRuntime<T>(dataDir: string, fn: (rt: CliRuntime) => Promise<T>): Promise<T> {
+  const rt = await createCliRuntime({ dataDir })
+  try {
+    return await fn(rt)
+  } finally {
+    await rt.close()
+  }
+}
+
+/** `continue <slug>` / `instruct <slug> <instruction…>` / `quick-edit <slug> <id> <instruction…>`. */
+async function cmdAgentTask(dataDir: string, args: Args): Promise<void> {
+  const [cmd, slug] = args.positionals
+  if (slug === undefined) fail(USAGE)
+  let request: CliTaskRequest
+  if (cmd === 'continue') {
+    request = { kind: 'continue' }
+  } else if (cmd === 'instruct') {
+    const instruction = args.positionals.slice(2).join(' ').trim()
+    if (instruction === '') fail('usage: instruct <slug> <instruction...>')
+    request = { kind: 'instructed-continue', instruction }
+  } else {
+    const snippetId = args.positionals[2]
+    const instruction = args.positionals.slice(3).join(' ').trim()
+    if (snippetId === undefined || instruction === '') {
+      fail('usage: quick-edit <slug> <snippetId> <instruction...>')
+    }
+    request = { kind: 'quick-edit', snippetId, instruction }
+  }
+
+  const cancelRaw = args.flags['cancel-after']
+  const cancelAfterMs = typeof cancelRaw === 'string' ? Number(cancelRaw) : undefined
+  if (cancelAfterMs !== undefined && !(Number.isFinite(cancelAfterMs) && cancelAfterMs >= 0)) {
+    fail('--cancel-after takes a millisecond count')
+  }
+
+  const result = await withRuntime(dataDir, (rt) =>
+    runTaskCommand(rt, slug, request, {
+      out: stdoutWrite,
+      ...(cancelAfterMs === undefined ? {} : { cancelAfterMs }),
+    }),
+  )
+  // The failure is already printed with its code/message; just exit non-zero.
+  if (result.status === 'error') process.exitCode = 1
+}
+
+async function cmdPrompt(dataDir: string, args: Args): Promise<void> {
+  const [, sub, slug] = args.positionals
+  if (sub !== 'render' || slug === undefined) fail(USAGE)
+  const RENDER_KINDS = ['continue', 'instructed-continue', 'quick-edit'] as const
+  const kindRaw = args.flags.kind ?? 'continue'
+  const kind = RENDER_KINDS.find((k) => k === kindRaw)
+  if (kind === undefined) fail('--kind must be continue, instructed-continue, or quick-edit')
+  const targetId = args.flags.target
+  const instruction = args.flags.instruction
+  await withRuntime(dataDir, (rt) =>
+    promptRenderCommand(rt, slug, {
+      kind,
+      json: args.flags.json === true,
+      out: stdoutWrite,
+      ...(typeof targetId === 'string' ? { targetId } : {}),
+      ...(typeof instruction === 'string' ? { instruction } : {}),
+    }),
+  )
+}
+
+async function cmdContext(dataDir: string, args: Args): Promise<void> {
+  const [, sub, slug] = args.positionals
+  if ((sub !== 'preview' && sub !== 'state') || slug === undefined) fail(USAGE)
+  await withRuntime(dataDir, (rt) =>
+    sub === 'preview'
+      ? contextPreviewCommand(rt, slug, stdoutWrite)
+      : contextStateCommand(rt, slug, stdoutWrite),
+  )
+}
+
+async function cmdRuns(dataDir: string, args: Args): Promise<void> {
+  const [, sub, slug, runId] = args.positionals
+  if (sub === 'list' && slug !== undefined) {
+    await withRuntime(dataDir, (rt) => runsListCommand(rt, slug, stdoutWrite))
+    return
+  }
+  if (sub === 'show' && slug !== undefined && runId !== undefined) {
+    await withRuntime(dataDir, (rt) =>
+      runsShowCommand(rt, slug, runId, { full: args.flags.full === true, out: stdoutWrite }),
+    )
+    return
+  }
+  fail('usage: runs list <slug> | runs show <slug> <runId> [--full]')
+}
+
 async function main(): Promise<void> {
   const dataDir = process.env.COWRITE_DATA_DIR ?? path.join(os.homedir(), '.cowrite', 'data')
   const args = parseArgs(process.argv.slice(2))
@@ -319,6 +446,16 @@ async function main(): Promise<void> {
     case 'rebuild':
       if (a === undefined) fail('usage: rebuild <slug>')
       return cmdRebuild(dataDir, a)
+    case 'continue':
+    case 'instruct':
+    case 'quick-edit':
+      return cmdAgentTask(dataDir, args)
+    case 'prompt':
+      return cmdPrompt(dataDir, args)
+    case 'context':
+      return cmdContext(dataDir, args)
+    case 'runs':
+      return cmdRuns(dataDir, args)
     default:
       fail(USAGE)
   }

@@ -1,3 +1,4 @@
+import type { LlmStep } from '@cowrite/mock-llm'
 import type { APIRequestContext } from '@playwright/test'
 import { expect } from '@playwright/test'
 
@@ -10,6 +11,10 @@ import { expect } from '@playwright/test'
 /** Fixed test port — distinct from the 2697 default so a running dev server never collides. */
 export const E2E_PORT = 2698
 export const E2E_URL = `http://127.0.0.1:${E2E_PORT}`
+/** Fixed port for the server's in-process mock LLM (COWRITE_MOCK_LLM=1 + MOCK_LLM_PORT).
+ *  2699 is taken: the restart spec (60) boots its own server there. */
+export const E2E_MOCK_LLM_PORT = 2700
+export const MOCK_LLM_URL = `http://127.0.0.1:${E2E_MOCK_LLM_PORT}`
 
 export function e2eDataDir(): string {
   const dir = process.env.COWRITE_E2E_DATA_DIR
@@ -67,4 +72,38 @@ export async function createSnippet(
   const res = await request.post(`/api/works/${workId}/snippets`, { data: { text } })
   expect(res.status()).toBe(201)
   return (await res.json()) as { id: string; rev: number }
+}
+
+// ---------------------------------------------------------------------------
+// Mock-LLM scripting over the cross-process control routes (docs/09 §2.2/§2.3).
+// The step types come straight from @cowrite/mock-llm — plain JSON by design,
+// so the same shapes travel over POST /__mock/scenario. One source, no drift.
+// ---------------------------------------------------------------------------
+
+export type { LlmMatch, LlmStep } from '@cowrite/mock-llm'
+
+/** Wrap prose in the tag block the Stage-3 output parser expects (07 §tag grammar). */
+export function snippetBlock(id: string, body: string): string {
+  return `<snippet id="${id}">\n${body}\n</snippet>\n`
+}
+
+/** Reset the strict scenario queue (call at the top of every task-running test). */
+export async function resetLlm(request: APIRequestContext): Promise<void> {
+  const res = await request.post(`${MOCK_LLM_URL}/__mock/reset`)
+  expect(res.ok()).toBe(true)
+}
+
+/** Enqueue scripted steps; an unscripted or mismatched request fails loudly server-side. */
+export async function scriptLlm(request: APIRequestContext, steps: LlmStep[]): Promise<void> {
+  const res = await request.post(`${MOCK_LLM_URL}/__mock/scenario`, { data: steps })
+  expect(res.ok()).toBe(true)
+}
+
+/** End-of-test gate: every scripted step fired and no request ever mismatched. */
+export async function assertLlmDrained(request: APIRequestContext): Promise<void> {
+  const res = await request.get(`${MOCK_LLM_URL}/__mock/state`)
+  expect(res.ok()).toBe(true)
+  const state = (await res.json()) as { pending: number; consumed: number; errors: string[] }
+  expect(state.errors).toEqual([])
+  expect(state.pending).toBe(0)
 }

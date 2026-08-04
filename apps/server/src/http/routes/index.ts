@@ -1,4 +1,8 @@
+import { AppConfig } from '@cowrite/shared'
 import type { FastifyPluginAsync } from 'fastify'
+import { registerContextRoutes } from '../../context/routes.js'
+import { registerTaskRoutes } from '../../harness/routes.js'
+import { AgentHarness } from '../../harness/service.js'
 import { registerEditingRoutes } from './editing.js'
 import { registerImageRoutes } from './images.js'
 import { registerSectionRoutes } from './sections.js'
@@ -21,6 +25,12 @@ export type { ResourceDeps } from './shared.js'
 export function resourceRoutes(deps: ResourceDeps): FastifyPluginAsync {
   return async (app) => {
     const zodApp = withZod(app)
+    // Default harness: all-defaults config ⇒ unconfigured lanes ⇒ 409 config_missing at
+    // task creation; runs/proposal routes work regardless (they read storage).
+    const harness = deps.harness ?? new AgentHarness({ config: () => AppConfig.parse({}) })
+    // Every open work's bus gets the harness's attach-time task-state provider, so a
+    // fresh SSE connection hydrates without a pre-fetch (03 §8.3 hydration fencing).
+    deps.works.onOpen((open) => harness.attachWork(open))
     registerWorkRoutes(zodApp, deps)
     registerSectionRoutes(zodApp, deps)
     registerSnippetRoutes(zodApp, deps)
@@ -28,6 +38,8 @@ export function resourceRoutes(deps: ResourceDeps): FastifyPluginAsync {
     registerSituationRoutes(zodApp, deps)
     registerEditingRoutes(zodApp, deps)
     registerImageRoutes(zodApp, deps)
+    registerContextRoutes(zodApp, deps)
+    registerTaskRoutes(zodApp, deps, harness)
     registerStubRoutes(zodApp)
   }
 }

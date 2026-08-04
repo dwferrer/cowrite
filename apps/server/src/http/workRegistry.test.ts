@@ -176,6 +176,44 @@ describe('WorkRegistry', () => {
     expect(err).toBeInstanceOf(AppError)
   })
 
+  it('per-open close resources (a slow usage-append sink) settle BEFORE handle.close and the rename', async () => {
+    // Windows EPERM regression (03 §4.3): DELETE during an in-flight engine usage append
+    // must await the resource's teardown before the handle closes and the directory is
+    // renamed into .trash — otherwise the rename hits a directory with open handles.
+    const open = await registry.open(WORK_ID)
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    open.addCloseResource(async () => {
+      fake.calls.push('resource:begin') // the "engine.close(): await usageTail" moment
+      await gate
+      fake.calls.push('resource:end')
+    })
+
+    const deletion = registry.deleteWork(WORK_ID)
+    for (let i = 0; i < 10; i++) await Promise.resolve() // let close reach the resource
+    expect(fake.calls).toContain('resource:begin')
+    expect(fake.calls).not.toContain('handle.close') // blocked behind the slow sink
+
+    release()
+    await deletion
+    const order = fake.calls.filter((c) =>
+      ['resource:end', 'handle.close', `trashWork:${SLUG}`].includes(c),
+    )
+    expect(order).toEqual(['resource:end', 'handle.close', `trashWork:${SLUG}`])
+  })
+
+  it('onOpen hooks run as each work opens (attach-state provider wiring)', async () => {
+    const seen: string[] = []
+    registry.onOpen((openWork) => {
+      seen.push(openWork.id)
+    })
+    await registry.open(WORK_ID)
+    await registry.open(WORK_ID) // cached open: the hook does not re-fire
+    expect(seen).toEqual([WORK_ID])
+  })
+
   it('trashes a never-opened work without opening it first', async () => {
     await registry.deleteWork(WORK_ID)
     expect(fake.openCalls).toBe(0)

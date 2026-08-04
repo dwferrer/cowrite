@@ -1,0 +1,84 @@
+<instructions>
+## This task: continue
+
+Continue the manuscript past the end of <local-context> with roughly one page of new prose
+(300–700 words). Move the scene forward; end at a natural beat, not mid-sentence. Do not
+summarize, do not skip ahead in time unless the prose demands it, and do not repeat or rephrase
+text that is already written.
+
+When you are ready, output exactly one block and nothing else:
+
+<snippet id="new">
+…your new prose…
+</snippet>
+</instructions>
+
+<world-info>
+<entry id="01J2N8Q3F7VWXK2MR9T5BCAD01" name="Mara Voss" fidelity="short">
+Keeper of the Saltmarsh light; late forties, cropped grey hair, a ruined left hand she hides in
+a fingerless glove. Widowed by the same storm the town pretends was weather.
+</entry>
+<entry id="01J2N9AAE2QRSTK4MP7Y3XCD02" name="The storm glass" fidelity="full">
+A sealed spirit-glass from the old lighthouse inventory. Its crystals bloom hours before
+weather arrives — and, Mara now suspects, before other things arrive too.
+
+**Appearance:** a hand-blown teardrop of cloudy glass on a brass gimbal, whale-oil sheen.
+</entry>
+</world-info>
+
+<global-context>
+<section id="01HZQA55M2C8DWPN6R3VTEXA10" level="chapter" name="The Lighthouse Keeper" fidelity="short">
+Mara Voss takes over the decommissioned Saltmarsh light after her predecessor drowns. She finds
+the lamp room sealed from the inside and an inventory listing one item too many.
+</section>
+<section id="01J2KF8T4YB1HZQX7WN2SDEA11" level="chapter" name="The Storm Glass" fidelity="long">
+Mara retrieves the storm glass from the sealed lamp room. Over three nights its crystals bloom
+in dead calm; each bloom precedes a boat failing to return. She logs the pattern, tells no one.
+⋮ The chapter closes with Edlen, the harbormaster, demanding the inventory book "for the
+insurers" and Mara handing him a copy with the glass's line inked out.
+</section>
+</global-context>
+
+<voice-anchors>
+<excerpt from="The Lighthouse Keeper" tokens="1010">
+The light had been dark for eleven years, and the town had learned to say so the way you say a
+grace — quickly, and without looking up. Mara carried her cases up the spiral stair one at a
+time, resting on the landings, counting the gulls through the salt-fogged panes.
+⋮
+</excerpt>
+<excerpt from="The Storm Glass" tokens="980">
+Third night. No wind, the marsh flat as poured lead, and the crystals climbing anyway —
+feathering up the glass like frost in a hurry.
+⋮
+</excerpt>
+</voice-anchors>
+
+<expanded-context>
+<section id="01J2KF8T4YB1HZQX7WN2SDEA11" path="The Storm Glass" fidelity="full">
+The lamp room key turned as if it had been oiled that morning.
+⋮ (full chapter text — opened by the model two tasks ago; still within TTL)
+</section>
+</expanded-context>
+
+<situation>
+Scene: Mara confronts Edlen in the harbor office, dusk, storm building. She wants the original
+inventory back. He knows more than he says. Don't resolve it yet — end with her outside in the
+first rain.
+</situation>
+
+<task kind="continue">
+Continue the story directly from the end of <local-context>.
+</task>
+
+<local-context>
+<snippet id="01J2P7R9GT5W0ZNXK3M8QAB4CD">
+The harbor office kept its lamps lit all day in October, which told you what the windows were
+worth. Mara came in with the copy of the inventory under her arm and the original's absence
+like a stone in her boot.
+</snippet>
+<snippet id="01J2P7SVWX2Y1ANBK9M4QCD5EF">
+Edlen did not stand. "Keeper," he said, and made the word sound like a job he'd once turned
+down.
+⋮
+</snippet>
+</local-context>
