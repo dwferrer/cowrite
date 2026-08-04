@@ -87,6 +87,31 @@ export const HarnessKnobsOverrides = z.object({
 })
 export type HarnessKnobsOverrides = z.infer<typeof HarnessKnobsOverrides>
 
+/**
+ * Reasoning controls for reasoning models (OpenAI `reasoning_effort` + OpenRouter's
+ * `reasoning` object). Reasoning models spend hidden thinking tokens before answering, and
+ * some — Qwen's QwQ line especially, more so at low quantization — get stuck in reasoning
+ * loops that exhaust the budget. `effort` dials the depth down; `maxTokens` hard-caps the
+ * thinking so it can never loop past a ceiling (a separate budget from `maxOutputTokens`).
+ */
+export const ReasoningControls = z.object({
+  effort: z.enum(['minimal', 'low', 'medium', 'high']).nullable().default(null),
+  maxTokens: z.number().int().positive().nullable().default(null), // OpenRouter reasoning.max_tokens
+  exclude: z.boolean().default(false), // think internally but omit reasoning from the response
+})
+export type ReasoningControls = z.infer<typeof ReasoningControls>
+
+/**
+ * OpenRouter provider-routing preferences, passed through to the request `provider` field
+ * verbatim (docs: openrouter.ai/docs/features/provider-routing). Common keys: `order`,
+ * `only`, `ignore` (provider slugs), `quantizations` (e.g. ["fp16","fp8"] — pin a higher
+ * quant to dodge low-quant reasoning loops), `sort` ("price"|"throughput"|"latency"),
+ * `allow_fallbacks`, `require_parameters`. Typed loose + passthrough for forward-compat;
+ * ignored by non-OpenRouter servers. Only emitted when set.
+ */
+export const ProviderRouting = z.looseObject({})
+export type ProviderRouting = z.infer<typeof ProviderRouting>
+
 export const ModelEndpoint = z.object({
   baseUrl: z.url(), // ".../v1" — OpenAI-compatible root
   apiKey: z.string().default(''), // "" for keyless local servers
@@ -98,6 +123,8 @@ export const ModelEndpoint = z.object({
   temperature: z.number().min(0).max(2).default(0.8),
   promptCostPerMTok: z.number().nonnegative().nullable().default(null),
   completionCostPerMTok: z.number().nonnegative().nullable().default(null),
+  reasoning: ReasoningControls.nullable().default(null),
+  provider: ProviderRouting.nullable().default(null),
 })
 export type ModelEndpoint = z.infer<typeof ModelEndpoint>
 

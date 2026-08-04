@@ -40,8 +40,13 @@ export const CONFIG_TEMPLATE = `// Cowrite configuration — JSONC (comments and
     //   "baseUrl": "https://api.example.com/v1",
     //   "apiKey": "\${env:COWRITE_HIGH_KEY}",
     //   "model": "your-model-name",
-    //   "maxOutputTokens": 2048,
+    //   "maxOutputTokens": 8192,
     //   "temperature": 0.8,
+    //   // Reasoning models: dial the thinking down or cap it so it can't loop.
+    //   // "reasoning": { "effort": "low", "maxTokens": 2048 },
+    //   // OpenRouter routing — pin a higher quant to dodge low-quant reasoning loops,
+    //   // or steer providers (docs: openrouter.ai/docs/features/provider-routing):
+    //   // "provider": { "quantizations": ["fp16"], "sort": "throughput" },
     // },
     "low": null,
   },

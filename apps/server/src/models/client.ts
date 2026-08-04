@@ -321,7 +321,31 @@ export class OpenAiCompatClient {
     if (stream) body.stream_options = { include_usage: true }
     if (request.tools !== undefined) body.tools = request.tools
     if (request.toolChoice !== undefined) body.tool_choice = request.toolChoice
+    this.applyReasoning(body)
+    if (this.endpoint.provider !== null) body.provider = this.endpoint.provider
     return body
+  }
+
+  /**
+   * Emit reasoning controls in the shape the target understands. `effort` alone rides the
+   * OpenAI-standard `reasoning_effort` (which OpenRouter also accepts). A `maxTokens` cap or
+   * `exclude` — OpenRouter-only features — moves everything into the `reasoning` object.
+   * OpenRouter rejects `reasoning.effort` and `reasoning.max_tokens` together, so the
+   * explicit cap wins when both are configured (it's the harder loop guarantee). Nothing is
+   * emitted when unconfigured, so plain OpenAI servers are untouched.
+   */
+  private applyReasoning(body: Record<string, unknown>): void {
+    const r = this.endpoint.reasoning
+    if (r === null) return
+    if (r.maxTokens !== null || r.exclude) {
+      const reasoning: Record<string, unknown> = {}
+      if (r.maxTokens !== null) reasoning.max_tokens = r.maxTokens
+      else if (r.effort !== null) reasoning.effort = r.effort // only when there's no cap
+      if (r.exclude) reasoning.exclude = true
+      body.reasoning = reasoning
+    } else if (r.effort !== null) {
+      body.reasoning_effort = r.effort
+    }
   }
 
   private backoffMs(attempt: number): number {

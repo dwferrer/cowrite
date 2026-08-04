@@ -123,6 +123,85 @@ describe('streaming happy path', () => {
     })
     expect(req?.tools).toHaveLength(1)
   })
+
+  it('omits reasoning and provider fields entirely when unconfigured', async () => {
+    llm.scenario.respond('ok')
+    await makeClient().chat({ messages: [userMessage] })
+    const body = llm.requests[0]?.body ?? {}
+    expect('reasoning' in body).toBe(false)
+    expect('reasoning_effort' in body).toBe(false)
+    expect('provider' in body).toBe(false)
+  })
+
+  it('effort alone rides the OpenAI-standard reasoning_effort field', async () => {
+    llm.scenario.respond('ok')
+    const client = new OpenAiCompatClient({
+      lane: 'low',
+      endpoint: ModelEndpoint.parse({
+        baseUrl: `${llm.url}/v1`,
+        model: 'mock-low',
+        reasoning: { effort: 'low' },
+      }),
+      knobs: fastKnobs(),
+      allowImageParts: true,
+    })
+    await client.chat({ messages: [userMessage] })
+    const body = llm.requests[0]?.body ?? {}
+    expect(body.reasoning_effort).toBe('low')
+    expect('reasoning' in body).toBe(false) // no object form when only effort is set
+  })
+
+  it('a maxTokens cap wins over effort (OpenRouter forbids both) and uses the reasoning object', async () => {
+    llm.scenario.respond('ok')
+    const client = new OpenAiCompatClient({
+      lane: 'low',
+      endpoint: ModelEndpoint.parse({
+        baseUrl: `${llm.url}/v1`,
+        model: 'mock-low',
+        reasoning: { effort: 'medium', maxTokens: 256, exclude: true },
+      }),
+      knobs: fastKnobs(),
+      allowImageParts: true,
+    })
+    await client.chat({ messages: [userMessage] })
+    const body = llm.requests[0]?.body ?? {}
+    // effort is dropped — never sent alongside max_tokens
+    expect(body.reasoning).toEqual({ max_tokens: 256, exclude: true })
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('exclude with effort (no cap) rides the reasoning object, not the top-level alias', async () => {
+    llm.scenario.respond('ok')
+    const client = new OpenAiCompatClient({
+      lane: 'low',
+      endpoint: ModelEndpoint.parse({
+        baseUrl: `${llm.url}/v1`,
+        model: 'mock-low',
+        reasoning: { effort: 'high', exclude: true },
+      }),
+      knobs: fastKnobs(),
+      allowImageParts: true,
+    })
+    await client.chat({ messages: [userMessage] })
+    expect(llm.requests[0]?.body.reasoning).toEqual({ effort: 'high', exclude: true })
+  })
+
+  it('passes OpenRouter provider routing through verbatim', async () => {
+    llm.scenario.respond('ok')
+    const provider = { quantizations: ['fp16'], sort: 'throughput', allow_fallbacks: false }
+    const client = new OpenAiCompatClient({
+      lane: 'low',
+      endpoint: ModelEndpoint.parse({
+        baseUrl: `${llm.url}/v1`,
+        model: 'mock-low',
+        provider,
+      }),
+      knobs: fastKnobs(),
+      allowImageParts: true,
+    })
+    await client.chat({ messages: [userMessage] })
+    expect(llm.requests[0]?.body.provider).toEqual(provider)
+  })
 })
 
 describe('tool-call accumulation', () => {

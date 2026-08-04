@@ -672,10 +672,20 @@ export const ModelEndpoint = z.object({
   baseUrl: z.string().url(),                    // ".../v1" — OpenAI-compatible root
   apiKey: z.string().default(""),               // "" for keyless local servers
   model: z.string().min(1),
-  maxOutputTokens: z.number().int().positive().default(2048),
-  temperature: z.number().min(0).max(2).default(0.8),
-  promptCostPerMTok: z.number().nonnegative().nullable().default(null),
-  completionCostPerMTok: z.number().nonnegative().nullable().default(null),
+  maxOutputTokens: z.number().int().positive().default(8192),  // generous: reasoning models
+  temperature: z.number().min(0).max(2).default(0.8),          //   spend hidden tokens here too
+  promptCostPerMTok: z.number().nonnegative().nullable().default(null),      // else auto-discovered
+  completionCostPerMTok: z.number().nonnegative().nullable().default(null),  //   from /models (OpenRouter)
+  // Reasoning-model controls. `effort` alone → OpenAI `reasoning_effort`; a `maxTokens` cap or
+  // `exclude` → OpenRouter's `reasoning` object (cap wins over effort — they're exclusive there).
+  reasoning: z.object({
+    effort: z.enum(["minimal","low","medium","high"]).nullable().default(null),
+    maxTokens: z.number().int().positive().nullable().default(null),  // hard-cap the thinking loop
+    exclude: z.boolean().default(false),
+  }).nullable().default(null),
+  // OpenRouter provider routing, passed through verbatim (quantizations/order/only/sort/…):
+  // pin a higher quant to dodge low-quant reasoning loops. Ignored by non-OpenRouter servers.
+  provider: z.looseObject({}).nullable().default(null),
 });
 
 export const AppConfig = z.object({

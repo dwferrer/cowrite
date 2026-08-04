@@ -131,13 +131,29 @@ describe('HarnessKnobs (05 §6.4 — the config.harness fragment)', () => {
 })
 
 describe('ModelEndpoint', () => {
-  it('defaults apiKey "", 8192 max output tokens, temperature 0.8, null prices', () => {
+  it('defaults apiKey "", 8192 max output tokens, temperature 0.8, null prices, null reasoning/provider', () => {
     const parsed = ModelEndpoint.parse({ baseUrl: highEndpoint.baseUrl, model: 'm' })
     expect(parsed.apiKey).toBe('')
     expect(parsed.maxOutputTokens).toBe(8192)
     expect(parsed.temperature).toBe(0.8)
     expect(parsed.promptCostPerMTok).toBeNull()
     expect(parsed.completionCostPerMTok).toBeNull()
+    expect(parsed.reasoning).toBeNull()
+    expect(parsed.provider).toBeNull()
+  })
+
+  it('parses reasoning controls (effort defaults null, exclude defaults false) and passes provider through', () => {
+    const parsed = ModelEndpoint.parse({
+      baseUrl: highEndpoint.baseUrl,
+      model: 'm',
+      reasoning: { maxTokens: 2048 },
+      provider: { quantizations: ['fp16'], sort: 'throughput' },
+    })
+    expect(parsed.reasoning).toEqual({ effort: null, maxTokens: 2048, exclude: false })
+    expect(parsed.provider).toEqual({ quantizations: ['fp16'], sort: 'throughput' })
+    expect(
+      ModelEndpoint.safeParse({ ...highEndpoint, reasoning: { effort: 'sideways' } }).success,
+    ).toBe(false)
   })
 
   it('rejects a non-URL baseUrl, empty model, out-of-range temperature', () => {
