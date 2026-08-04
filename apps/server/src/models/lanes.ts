@@ -1,6 +1,7 @@
-import type { AppConfig, HarnessKnobs, HarnessKnobsOverrides } from '@cowrite/shared'
+import type { AppConfig, HarnessKnobs, HarnessKnobsOverrides, ModelEndpoint } from '@cowrite/shared'
 import { HarnessKnobs as HarnessKnobsSchema } from '@cowrite/shared'
 import { OpenAiCompatClient } from './client.js'
+import { type DiscoveredPrices, discoverPrices, fillPrices } from './pricing.js'
 
 /**
  * Model lanes (docs/05-agents.md §3.1): two clients built from `AppConfig.models`.
@@ -32,6 +33,45 @@ export function resolveHarnessKnobs(overrides: HarnessKnobsOverrides): HarnessKn
   return HarnessKnobsSchema.parse(overrides)
 }
 
+/**
+ * Per-process price-discovery cache keyed by `baseUrl|model`: clients are built per task
+ * (harness submit), so discovery must fire once per endpoint, not once per client. Filled
+ * prices land on each client's endpoint COPY — the AppConfig object is never mutated, and
+ * config-set prices always win (fillPrices only fills nulls).
+ */
+const priceDiscovery = new Map<string, Promise<DiscoveredPrices | null>>()
+const priceLogged = new Set<string>()
+
+export function resetPriceDiscoveryCache(): void {
+  priceDiscovery.clear()
+  priceLogged.clear()
+}
+
+function withDiscoveredPrices(
+  endpoint: ModelEndpoint,
+  fetchImpl: typeof fetch | undefined,
+): ModelEndpoint {
+  const copy = { ...endpoint }
+  if (copy.promptCostPerMTok !== null && copy.completionCostPerMTok !== null) return copy
+  const key = `${copy.baseUrl}|${copy.model}`
+  let pending = priceDiscovery.get(key)
+  if (pending === undefined) {
+    pending = discoverPrices(copy, fetchImpl)
+    priceDiscovery.set(key, pending)
+  }
+  void pending.then((found) => {
+    if (found === null) return
+    if (fillPrices(copy, found) && !priceLogged.has(key)) {
+      priceLogged.add(key)
+      console.log(
+        `[models] prices for ${copy.model} from the API: ` +
+          `$${found.promptCostPerMTok.toFixed(3)}/$${found.completionCostPerMTok.toFixed(3)} per MTok`,
+      )
+    }
+  })
+  return copy
+}
+
 export function buildClients(config: AppConfig, deps: LaneDeps = {}): LaneClients {
   const knobs = resolveHarnessKnobs(config.harness)
   const high =
@@ -39,7 +79,7 @@ export function buildClients(config: AppConfig, deps: LaneDeps = {}): LaneClient
       ? null
       : new OpenAiCompatClient({
           lane: 'high',
-          endpoint: config.models.high,
+          endpoint: withDiscoveredPrices(config.models.high, deps.fetchImpl),
           knobs,
           allowImageParts: false, // the high model never sees images (05 §3.1)
           ...deps,
@@ -49,7 +89,7 @@ export function buildClients(config: AppConfig, deps: LaneDeps = {}): LaneClient
       ? null
       : new OpenAiCompatClient({
           lane: 'low',
-          endpoint: config.models.low,
+          endpoint: withDiscoveredPrices(config.models.low, deps.fetchImpl),
           knobs,
           allowImageParts: true, // illustration VLM critique attaches image_url parts (08)
           ...deps,
