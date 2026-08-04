@@ -51,6 +51,14 @@ export function SectionBlock({ workId, section, fold, matcher }: SectionBlockPro
       <div className="section-block prose" data-testid={testids.sectionBlock} data-fold={fold}>
         <IllustrationBox workId={workId} section={section} />
         <Markdown markdown={summary ?? ''} matcher={matcher} />
+        {/* subtle fidelity affordance (04 §5.1): this is a summary, not the prose */}
+        <span
+          className="section-block__fold-hint"
+          data-testid={testids.sectionFoldHint}
+          title={`Collapsed to the ${fold} summary — expand with the fold dots in the heading`}
+        >
+          {fold} summary
+        </span>
       </div>
     )
   }

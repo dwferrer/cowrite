@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import { ApiErrorBody, api, ErrorCode, HealthRes, type RouteDef } from './api.js'
+import { ApiErrorBody, api, ConsolidateNowRes, ErrorCode, HealthRes, type RouteDef } from './api.js'
 import { PreviewRequest, PreviewResponse } from './context.js'
 import { Task, TaskEstimate, TaskSpec } from './tasks.js'
 
@@ -100,7 +100,10 @@ describe('api route registry (03 §6.2)', () => {
     expect(api.getTask.res).toBe(Task)
     expect(api.cancelTask.res).toBe(Task) // idempotent cancel echoes the Task envelope
     expect(api.cancelTask.status).toBe(202)
-    expect(api.consolidateNow.res).toBe(Task)
+    // Stage 4: /consolidate answers the boundary Task OR the applied-immediately shape
+    // (heuristic scene-break split, 02 §6.3 rule 1).
+    expect(api.consolidateNow.res).toBe(ConsolidateNowRes)
+    expect(ConsolidateNowRes.options[0]).toBe(Task)
     expect(api.estimateTask.body).toBe(TaskSpec)
     expect(api.estimateTask.res).toBe(TaskEstimate)
     expect(api.previewContext.body).toBe(PreviewRequest)

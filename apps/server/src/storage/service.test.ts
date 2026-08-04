@@ -10,13 +10,7 @@ import { buildFixtureWork, FIX } from './index/fixture.js'
 import { xxh64OfString } from './lib/hash.js'
 import { indexPath, lockPath, revisionLogPath, runsDir, shortId } from './lib/paths.js'
 import { SectionNotFoundError } from './sectionStore.js'
-import {
-  createStorage,
-  NotImplementedError,
-  ReadOnlyError,
-  type StorageService,
-  type WorkHandle,
-} from './service.js'
+import { createStorage, ReadOnlyError, type StorageService, type WorkHandle } from './service.js'
 import { SnippetNotFoundError } from './snippetStore.js'
 import { WorldEntryNotFoundError } from './worldStore.js'
 
@@ -303,12 +297,18 @@ describe('storage service end-to-end', () => {
     expect(handle.getEditingSnippet()).toBeNull()
   })
 
-  it('exposes consolidation entry points that throw NotImplementedError until Stage 4', () => {
-    expect(() => handle.maybeConsolidate({ taskTargetIds: [] })).toThrow(NotImplementedError)
-    expect(() => handle.applyBoundaries({ boundaries: [] }, { boundaryRunId: null })).toThrow(
-      NotImplementedError,
-    )
-    expect(() => handle.undoConsolidation('some-op')).toThrow(NotImplementedError)
+  it('answers consolidation entry points (engine detail in consolidation.service.test.ts)', async () => {
+    // The shared work sits far below the default thresholds — the evaluation is idle.
+    await expect(handle.maybeConsolidate({ taskTargetIds: [] })).resolves.toEqual({
+      status: 'idle',
+    })
+    // An empty proposal is the §6.3 all-dropped/none case: a typed deferral.
+    await expect(
+      handle.applyBoundaries({ boundaries: [] }, { boundaryRunId: null }),
+    ).resolves.toEqual({ ok: false, deferred: true, droppedBoundaries: 0 })
+    // No op is inside its grace window, so the undo token is expired/unknown → 409.
+    await expect(handle.undoConsolidation(ulid())).rejects.toMatchObject({ code: 'conflict' })
+    await expect(handle.pendingConsolidation()).resolves.toBeNull()
   })
 
   it('rebuilds from files alone after .cowrite/ is deleted — reads answer identically (§1)', async () => {

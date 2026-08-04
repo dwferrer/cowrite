@@ -12,6 +12,7 @@ import { WorldPanel } from '../panes/world/WorldPanel.js'
 import { useDocUiStore } from '../state/docUiStore.js'
 import { usePanelStore } from '../state/panelStore.js'
 import { testids } from '../testids.js'
+import { BackgroundActivity } from '../ui/BackgroundActivity.js'
 import { Button } from '../ui/Button.js'
 import { RunViewer } from './RunViewer.js'
 import { ModelsNotConfiguredBanner } from './Settings.js'
@@ -86,6 +87,7 @@ export function WorkView() {
           ←
         </Link>
         <h1 className="work-header__title">{work.data?.title ?? '…'}</h1>
+        <BackgroundActivity workId={workId} />
         <Button
           variant="ghost"
           data-testid={testids.situationToggle}

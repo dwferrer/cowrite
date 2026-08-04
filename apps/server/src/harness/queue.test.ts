@@ -28,9 +28,9 @@ describe('QueueLane', () => {
       order.push(`start-${id}`)
       await (jobs[id] as Job).promise
     }
-    expect(lane.enqueue({ id: 'a', start: start(0) })).toBe('started')
-    expect(lane.enqueue({ id: 'b', start: start(1) })).toBe('started')
-    expect(lane.enqueue({ id: 'c', start: start(2) })).toBe('queued')
+    expect(lane.enqueue({ id: 'a', start: start(0) })).toEqual({ status: 'started' })
+    expect(lane.enqueue({ id: 'b', start: start(1) })).toEqual({ status: 'started' })
+    expect(lane.enqueue({ id: 'c', start: start(2) })).toEqual({ status: 'queued' })
     expect(lane.runningCount).toBe(2)
     expect(lane.queuedIds()).toEqual(['c'])
 
@@ -46,16 +46,26 @@ describe('QueueLane', () => {
   it('dedupes by (kind, targetId) key across queued AND running jobs (05 §6.1)', async () => {
     const lane = new QueueLane(1)
     const first = job()
-    expect(lane.enqueue({ id: 'a', dedupeKey: 'enrich:s1', start: () => first.promise })).toBe(
-      'started',
-    )
-    expect(lane.enqueue({ id: 'b', dedupeKey: 'enrich:s1', start: async () => {} })).toBe('deduped')
-    expect(lane.enqueue({ id: 'c', dedupeKey: 'enrich:s2', start: async () => {} })).toBe('queued')
-    expect(lane.enqueue({ id: 'd', dedupeKey: 'enrich:s2', start: async () => {} })).toBe('deduped')
+    expect(lane.enqueue({ id: 'a', dedupeKey: 'enrich:s1', start: () => first.promise })).toEqual({
+      status: 'started',
+    })
+    expect(lane.enqueue({ id: 'b', dedupeKey: 'enrich:s1', start: async () => {} })).toEqual({
+      status: 'deduped',
+      existingId: 'a',
+    })
+    expect(lane.enqueue({ id: 'c', dedupeKey: 'enrich:s2', start: async () => {} })).toEqual({
+      status: 'queued',
+    })
+    expect(lane.enqueue({ id: 'd', dedupeKey: 'enrich:s2', start: async () => {} })).toEqual({
+      status: 'deduped',
+      existingId: 'c',
+    })
     first.resolve()
     await lane.idle()
     // The key is released once the job settles: a fresh enqueue is accepted again.
-    expect(lane.enqueue({ id: 'e', dedupeKey: 'enrich:s1', start: async () => {} })).toBe('started')
+    expect(lane.enqueue({ id: 'e', dedupeKey: 'enrich:s1', start: async () => {} })).toEqual({
+      status: 'started',
+    })
     await lane.idle()
   })
 
@@ -88,11 +98,15 @@ describe('QueueLane', () => {
     const boom = (): Promise<void> => {
       throw new Error('sync explosion before any promise exists')
     }
-    expect(lane.enqueue({ id: 'a', dedupeKey: 'enrich:s1', start: boom })).toBe('started')
+    expect(lane.enqueue({ id: 'a', dedupeKey: 'enrich:s1', start: boom })).toEqual({
+      status: 'started',
+    })
     await lane.idle()
     // Without the launch wrapper the key stayed registered forever: this re-enqueue
     // would answer 'deduped' and the target could never be enriched again.
-    expect(lane.enqueue({ id: 'b', dedupeKey: 'enrich:s1', start: async () => {} })).toBe('started')
+    expect(lane.enqueue({ id: 'b', dedupeKey: 'enrich:s1', start: async () => {} })).toEqual({
+      status: 'started',
+    })
     await lane.idle()
   })
 
@@ -103,7 +117,9 @@ describe('QueueLane', () => {
     lane.enqueue({ id: 'q', dedupeKey: 'k', start: async () => {} })
     expect(lane.removeQueued('q')).toBe(true)
     expect(lane.removeQueued('q')).toBe(false)
-    expect(lane.enqueue({ id: 'q2', dedupeKey: 'k', start: async () => {} })).toBe('queued')
+    expect(lane.enqueue({ id: 'q2', dedupeKey: 'k', start: async () => {} })).toEqual({
+      status: 'queued',
+    })
     gate.resolve()
   })
 })

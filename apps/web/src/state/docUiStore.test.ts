@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { clearCrashCopy, readCrashCopy, useDocUiStore } from './docUiStore.js'
+import { clearCrashCopy, gcCrashCopies, readCrashCopy, useDocUiStore } from './docUiStore.js'
 
 vi.mock('../api/editingSignal.js', () => ({ signalEditing: vi.fn() }))
 
@@ -113,5 +113,37 @@ describe('docUiStore', () => {
     expect(useDocUiStore.getState().editing).toBeNull()
     expect(readCrashCopy(W, A)).toBeNull()
     expect(signalEditing).toHaveBeenCalledWith(W, null)
+  })
+
+  describe('gcCrashCopies (§4.1 stale-key GC)', () => {
+    it('drops drafts whose block no longer resolves and returns their texts', () => {
+      localStorage.setItem(`cowrite:draft:${W}:${A}`, 'live draft')
+      localStorage.setItem(`cowrite:draft:${W}:${B}`, 'orphan draft')
+
+      const dropped = gcCrashCopies(W, new Set([A]))
+
+      expect(dropped).toEqual([{ blockId: B, text: 'orphan draft' }])
+      expect(readCrashCopy(W, A)).toBe('live draft')
+      expect(readCrashCopy(W, B)).toBeNull()
+    })
+
+    it("never collects the compose editor's 'new' draft or the open editor's draft", () => {
+      localStorage.setItem(`cowrite:draft:${W}:new`, 'composing')
+      localStorage.setItem(`cowrite:draft:${W}:${A}`, 'editing now')
+      useDocUiStore.setState({
+        editing: { kind: 'snippet', id: A, workId: W, draft: 'editing now' },
+      })
+
+      expect(gcCrashCopies(W, new Set())).toEqual([])
+      expect(readCrashCopy(W, 'new')).toBe('composing')
+      expect(readCrashCopy(W, A)).toBe('editing now')
+    })
+
+    it('leaves other works untouched', () => {
+      const W2 = '01ARZ3NDEKTSV4RRFFQ69G5FA9'
+      localStorage.setItem(`cowrite:draft:${W2}:${B}`, 'other work')
+      expect(gcCrashCopies(W, new Set())).toEqual([])
+      expect(readCrashCopy(W2, B)).toBe('other work')
+    })
   })
 })

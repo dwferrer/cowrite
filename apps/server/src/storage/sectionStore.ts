@@ -305,16 +305,20 @@ export async function setSectionTitle(
 }
 
 /**
- * Write a summary file + EnrichmentMeta stamped with the sourceHash of the CURRENT
- * content.md (§6.5) — a user-edited summary is not stale until the prose changes again.
- * Summaries only exist on leaf sections; missing content.md throws.
+ * Write a summary file + its EnrichmentMeta (§6.5). The stamped `sourceHash` is the
+ * hash of the prose the summary was derived FROM: an agent commit passes the
+ * ASSEMBLY-TIME contentHash via `opts.sourceHash` — if the prose changed while the run
+ * was in flight, the summary still lands but correctly reads stale. A user edit (or an
+ * agent commit without the hash) stamps the CURRENT content.md — a user-edited summary
+ * is not stale until the prose changes again. Summaries only exist on leaf sections;
+ * missing content.md throws.
  */
 export async function putSummary(
   workDirPath: string,
   sectionId: string,
   kind: 'short' | 'long',
   text: string,
-  opts: { source: 'user' | 'agent'; runId?: string },
+  opts: { source: 'user' | 'agent'; runId?: string; sourceHash?: string },
   dirPathHint?: string,
 ): Promise<EnrichmentMeta> {
   const node = await findSection(workDirPath, sectionId, dirPathHint)
@@ -331,7 +335,10 @@ export async function putSummary(
     // runId is null iff source === 'user' (§10.3): user edits carry no run.
     runId: opts.source === 'user' ? null : (opts.runId ?? null),
     generatedAt: nowIso(),
-    sourceHash: await xxh64OfString(content),
+    sourceHash:
+      opts.source === 'agent' && opts.sourceHash !== undefined
+        ? opts.sourceHash
+        : await xxh64OfString(content),
   })
   await writeFileAtomic(summaryPath(node.dirPath, kind), text)
   const enrichments = { ...node.meta.enrichments }

@@ -30,6 +30,12 @@ export interface TaskEntry {
   readonly targetIds: readonly string[]
   /** Settles (never rejects) when the runner finishes; queued-only entries settle on removal. */
   done: Promise<void>
+  /**
+   * Background entries only: settle the entry as cancelled after its lane job was
+   * removed from the queue (queued tasks cancel by removal, 05 §6.3) — the runner
+   * never starts, so someone must move the task to terminal and publish the event.
+   */
+  cancelQueued?: () => void
 }
 
 const TERMINAL_KEEP = 50
@@ -39,7 +45,9 @@ export class WorkTaskState {
   private readonly entries = new Map<string, TaskEntry>()
   private terminalIds: string[] = []
   private interactiveId: string | null = null
-  /** The per-work background lane (structure now, producers in Stage 4). */
+  /** ms timestamp of the instant the interactive lane last became empty (05 §6.2). */
+  private idleSince: number | null = Date.now()
+  /** The per-work background lane (Stage-4 producers: enrich-section, propose-boundaries). */
   readonly background = new QueueLane(QUEUE_LANE_CAPACITY.background)
 
   /** §6.1: a second interactive submit while one runs → 409 busy, never queued. */
@@ -55,6 +63,20 @@ export class WorkTaskState {
     this.assertInteractiveFree()
     this.entries.set(entry.task.id, entry)
     this.interactiveId = entry.task.id
+    this.idleSince = null
+  }
+
+  /** Register a background-lane entry (no occupancy bookkeeping — the lane queues). */
+  registerBackground(entry: TaskEntry): void {
+    this.entries.set(entry.task.id, entry)
+  }
+
+  /**
+   * How long the interactive lane has been empty, in ms — the sweep gate's clock
+   * (05 §6.2: "interactive lane empty 60 s"); null while an interactive task runs.
+   */
+  interactiveIdleMs(now = Date.now()): number | null {
+    return this.idleSince === null ? null : Math.max(0, now - this.idleSince)
   }
 
   /** Move a task to a terminal status; frees the interactive slot, trims history to 50. */
@@ -77,7 +99,10 @@ export class WorkTaskState {
     entry.task.endedAt = endedAt
     entry.task.partialText = outcome.partialText ?? null
     entry.task.unresolvedProposal = outcome.unresolvedProposal ?? null
-    if (this.interactiveId === taskId) this.interactiveId = null
+    if (this.interactiveId === taskId) {
+      this.interactiveId = null
+      this.idleSince = Date.now()
+    }
     this.terminalIds.push(taskId)
     while (this.terminalIds.length > TERMINAL_KEEP) {
       const evict = this.terminalIds.shift()
@@ -119,7 +144,11 @@ export interface LaneJob {
   start: () => Promise<void>
 }
 
-export type EnqueueResult = 'started' | 'queued' | 'deduped'
+export type EnqueueResult =
+  | { status: 'started' | 'queued' }
+  /** A live job already carries this dedupe key — the lane is the ONE dedupe
+   *  mechanism, so it reports whose, letting callers return the existing task. */
+  | { status: 'deduped'; existingId: string }
 
 export class QueueLane {
   private readonly running = new Map<string, Promise<void>>()
@@ -127,19 +156,20 @@ export class QueueLane {
 
   constructor(readonly capacity: number) {}
 
-  /** Dedupe keys currently queued or running. */
-  private readonly liveKeys = new Set<string>()
+  /** Live (queued or running) job id per dedupe key, and the reverse for release. */
+  private readonly idByKey = new Map<string, string>()
   private readonly keyById = new Map<string, string>()
 
   enqueue(job: LaneJob): EnqueueResult {
-    if (job.dedupeKey !== undefined && this.liveKeys.has(job.dedupeKey)) return 'deduped'
     if (job.dedupeKey !== undefined) {
-      this.liveKeys.add(job.dedupeKey)
+      const existingId = this.idByKey.get(job.dedupeKey)
+      if (existingId !== undefined) return { status: 'deduped', existingId }
+      this.idByKey.set(job.dedupeKey, job.id)
       this.keyById.set(job.id, job.dedupeKey)
     }
     if (this.running.size < this.capacity) {
       this.launch(job)
-      return 'started'
+      return { status: 'started' }
     }
     if (job.jumpQueue === true) {
       const at = this.queued.findIndex((q) => q.jumpQueue !== true)
@@ -148,7 +178,7 @@ export class QueueLane {
     } else {
       this.queued.push(job)
     }
-    return 'queued'
+    return { status: 'queued' }
   }
 
   /** Remove a queued job (cancel-by-removal); running jobs cancel via their own signal. */
@@ -181,7 +211,7 @@ export class QueueLane {
     const key = this.keyById.get(id)
     if (key !== undefined) {
       this.keyById.delete(id)
-      this.liveKeys.delete(key)
+      this.idByKey.delete(key)
     }
   }
 

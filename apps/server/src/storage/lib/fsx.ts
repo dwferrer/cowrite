@@ -50,6 +50,36 @@ async function fsyncDirBestEffort(dir: string): Promise<void> {
   }
 }
 
+/** How long `renameWithRetry` keeps retrying a sharing-violation rename before giving up. */
+const RENAME_RETRY_BUDGET_MS = 2_000
+
+/**
+ * Rename with a retry loop for Windows sharing violations: MoveFileEx cannot replace a
+ * destination while ANY handle is open on it, so an atomic replace that races a
+ * concurrent reader of the SAME file (a poll loop, the reconciler, an AV scan) fails
+ * EPERM/EACCES/EBUSY transiently — the same family the lock and consolidation movers
+ * already tolerate (lock.ts tryAcquire, consolidation.ts moveFile). Unlike moveFile this
+ * NEVER deletes the destination first (readers must never observe a missing target); it
+ * waits the reader out and rethrows once the budget is exhausted. The sleep is short and
+ * RANDOMIZED on purpose: a timer-aligned exponential backoff phase-locks with a
+ * timer-aligned reader (both wake together, the reader's handle is open at every
+ * attempt) and can then fail every attempt in a row.
+ */
+async function renameWithRetry(src: string, dest: string): Promise<void> {
+  const deadline = Date.now() + RENAME_RETRY_BUDGET_MS
+  for (;;) {
+    try {
+      await fsp.rename(src, dest)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw err
+      if (Date.now() >= deadline) throw err
+      await new Promise((resolve) => setTimeout(resolve, 1 + Math.random() * 4))
+    }
+  }
+}
+
 /** Atomically replace `filePath` with `data` (tmp file + fsync + rename + dir fsync). */
 export async function writeFileAtomic(filePath: string, data: string | Uint8Array): Promise<void> {
   const dir = path.dirname(filePath)
@@ -65,7 +95,7 @@ export async function writeFileAtomic(filePath: string, data: string | Uint8Arra
     await handle.sync()
     await handle.close()
     handle = undefined
-    await fsp.rename(tmpPath, filePath)
+    await renameWithRetry(tmpPath, filePath)
   } catch (err) {
     if (handle) await handle.close().catch(() => {})
     await fsp.unlink(tmpPath).catch(() => {})

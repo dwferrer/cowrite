@@ -2,9 +2,11 @@ import { api, type SectionRow, type SnippetDto, WORK_EVENT_TYPES, WorkEvent } fr
 import { type QueryClient, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { create } from 'zustand'
-import { useDocUiStore } from '../state/docUiStore.js'
+import { gcCrashCopies, useDocUiStore } from '../state/docUiStore.js'
+import { usePanelStore } from '../state/panelStore.js'
 import { useTaskStore } from '../state/taskStore.js'
-import { pushToast } from '../ui/Toast.js'
+import { dismissToastByKey, pushToast } from '../ui/Toast.js'
+import { ApiError, apiCall } from './client.js'
 import { signalEditing } from './editingSignal.js'
 import { byOrderKey, qk } from './queries.js'
 
@@ -140,6 +142,67 @@ function invalidateWorkQueries(qc: QueryClient, workId: string): void {
   })
 }
 
+/**
+ * §4.1 stale-key GC, run after the refetch a restructure triggers: any fold pin, docUi
+ * ref, or crash-copy draft whose entity id no longer resolves is dropped. Drafts with
+ * content surface once as a "recovered text" toast with a copy action before being lost.
+ */
+function gcStaleKeys(qc: QueryClient, workId: string): void {
+  const sectionRows = qc.getQueryData<SectionRow[]>(qk.sections(workId))
+  const snippetRows = qc.getQueryData<SnippetDto[]>(qk.snippets(workId))
+  // Never GC against an unloaded cache — an empty "live" set would drop every valid
+  // pin/ref/draft on a work whose queries have not resolved yet.
+  if (sectionRows === undefined || snippetRows === undefined) return
+  const liveSectionIds = new Set(sectionRows.map((row) => row.id))
+  const liveIds = new Set([...liveSectionIds, ...snippetRows.map((row) => row.id)])
+
+  usePanelStore.getState().pruneFoldOverrides(workId, liveSectionIds)
+
+  const { selection, editing, peekRevision } = useDocUiStore.getState()
+  for (const id of [selection?.id, editing?.id, peekRevision?.snippetId]) {
+    if (id !== undefined && !liveIds.has(id)) useDocUiStore.getState().clearRefsFor(id)
+  }
+
+  for (const { text } of gcCrashCopies(workId, liveIds)) {
+    if (text.trim().length === 0) continue
+    pushToast('Recovered unsaved edit from a passage that was consolidated away', {
+      ttlMs: 30_000,
+      action: {
+        label: 'Copy',
+        onClick: () => void navigator.clipboard?.writeText(text),
+      },
+    })
+  }
+}
+
+/**
+ * The restructure refetch (04 §4.3): consolidation emits NO snippet.* events by contract —
+ * the frontier list is refetched wholesale here (03 §3.2), which is what makes the
+ * frontier visibly shrink live. GC runs after both refetches resolve.
+ */
+function refetchRestructured(qc: QueryClient, workId: string): void {
+  void Promise.all([
+    qc.invalidateQueries({ queryKey: qk.sections(workId) }),
+    qc.invalidateQueries({ queryKey: qk.snippets(workId) }),
+  ]).then(() => gcStaleKeys(qc, workId))
+}
+
+/** The undo-toast action (04 §4.3): POST the undo route; cache repair rides the
+ *  `consolidation.undone` event. An expired grace surfaces the §14 conflict message. */
+async function undoConsolidation(workId: string, undoToken: string): Promise<void> {
+  try {
+    await apiCall('undoConsolidation', [workId, undoToken])
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'conflict') {
+      pushToast('Undo window has passed', { tone: 'error' })
+    } else {
+      pushToast(`Undo failed — ${err instanceof Error ? err.message : String(err)}`, {
+        tone: 'error',
+      })
+    }
+  }
+}
+
 /** New-stream invalidation, deferred past any in-flight mutations: invalidating while an
  *  optimistic delete's DELETE is still on the wire would resurrect the removed row. */
 function invalidateOnNewStream(qc: QueryClient, workId: string): void {
@@ -207,23 +270,59 @@ export function applyWorkEvent(qc: QueryClient, workId: string, event: WorkEvent
     }
 
     case 'sections.restructured': {
-      // split/merge/reorder ⇒ deliberate refetch. Stale-key GC of fold pins/drafts runs
-      // after the refetch resolves (04 §4.1) — wired with the fold ladder in Stage 4.
-      void qc.invalidateQueries({ queryKey: qk.sections(workId) })
+      // split/merge/reorder ⇒ deliberate refetch of BOTH lists: consolidation emits no
+      // snippet.* events, so the shrunken frontier arrives via this refetch (03 §3.2).
+      // This row OWNS the restructure refetch — the consolidation.applied/undone rows
+      // it always pairs with (02 §6.4 emits both) never refetch again. Stale-key GC of
+      // fold pins/refs/drafts runs after the refetch resolves (04 §4.1 sequencing).
+      refetchRestructured(qc, workId)
       break
     }
 
     case 'consolidation.applied': {
-      // Stage 4 adds the undo toast wired to the undo route; the cache effects apply now.
-      void qc.invalidateQueries({ queryKey: qk.sections(workId) })
-      void qc.invalidateQueries({ queryKey: qk.snippets(workId) })
-      for (const id of event.sectionIds) useDocUiStore.getState().clearRefsFor(id)
+      // Toast + GC only: the paired sections.restructured row (which precedes this one
+      // on the wire) owns the refetch, and its §4.1-sequenced GC runs after that
+      // refetch resolves. The direct GC here covers the synthetic mid-grace attach
+      // frame (03 §8.3), which arrives alone against an already-fresh cache. Chapter
+      // ordinal for the toast: new sections append after the leaves already in cache
+      // (this row only names the toast).
+      const cached = qc.getQueryData<SectionRow[]>(qk.sections(workId))
+      const firstOrdinal = (cached?.filter((row) => row.isLeaf).length ?? 0) + 1
+      gcStaleKeys(qc, workId)
+
+      const count = event.sectionIds.length
+      const label =
+        count === 1
+          ? `Chapter ${firstOrdinal}`
+          : `Chapters ${firstOrdinal}–${firstOrdinal + count - 1}`
+      const title = event.title !== '' ? ` "${event.title}"` : ''
+      // The toast lives exactly as long as the undo grace: the TTL derives from the
+      // event's undoDeadline, so a mid-grace reload (the synthetic attach frame
+      // re-emits this row) shows the TRUE remaining window, never a fresh one.
+      const remainingMs = Date.parse(event.undoDeadline) - Date.now()
+      if (remainingMs <= 0) break // already expired: nothing to offer
+      pushToast(`${label}${title} frozen`, {
+        ttlMs: remainingMs,
+        key: `undo:${event.undoToken}`, // re-attach replaces, finalized dismisses
+        action: {
+          label: 'Undo',
+          onClick: () => void undoConsolidation(workId, event.undoToken),
+        },
+      })
       break
     }
 
     case 'consolidation.undone': {
-      void qc.invalidateQueries({ queryKey: qk.sections(workId) })
-      void qc.invalidateQueries({ queryKey: qk.snippets(workId) })
+      // GC only: the paired sections.restructured row (which follows this one on the
+      // wire, 02 §6.4) owns the one refetch + the §4.1 post-refetch GC for the pair.
+      gcStaleKeys(qc, workId)
+      break
+    }
+
+    case 'consolidation.finalized': {
+      // The grace window is over (expiry, superseded by a new apply, or work close):
+      // the matching undo toast must not keep offering a dead token.
+      dismissToastByKey(`undo:${event.opId}`)
       break
     }
 

@@ -241,6 +241,26 @@ describe('query API', () => {
     expect(db.staleSections()[0]?.illustrationStale).toBe(true)
   })
 
+  it("staleSections('summary') is the sweep's queue: leaf rows with stale summaries only", () => {
+    const summaryStale = '01J2KF0000000000000000SC06'
+    const illustrationOnly = '01J2KF0000000000000000SC07'
+    const interior = '01J2KF0000000000000000SC08'
+    db.upsertSection({ ...makeSection(summaryStale, 'a0'), longSummaryStale: true })
+    db.upsertSection({ ...makeSection(illustrationOnly, 'a1'), illustrationStale: true })
+    db.upsertSection({
+      ...makeSection(interior, 'a2'),
+      contentHash: null, // interior sections carry no summaries
+      shortSummaryStale: true,
+    })
+    expect(db.staleSections('summary').map((r) => r.id)).toEqual([summaryStale])
+    // 'any' still surfaces every stale flag (the Stage-5 sweep's superset view)
+    expect(db.staleSections('any').map((r) => r.id)).toEqual([
+      summaryStale,
+      illustrationOnly,
+      interior,
+    ])
+  })
+
   it('listSnippetRows orders by order_key', () => {
     const a = '01J2KF0000000000000000SN0A'
     const b = '01J2KF0000000000000000SN0B'

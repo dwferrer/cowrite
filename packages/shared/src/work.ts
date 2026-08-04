@@ -11,6 +11,15 @@ import { IsoTime, Ulid } from './ids.js'
  * every inner default.
  */
 
+// "review" mode (store the proposal, wait for confirmation — 02 §6.3 rule 4) is M2:
+// the enum names it so the wire shape is stable, but M1 REJECTS it at parse with a
+// clear message rather than silently auto-applying behind a review-shaped setting.
+const CONSOLIDATION_MODE_M2_MESSAGE =
+  "consolidation mode 'review' ships in M2 — M1 supports 'auto' only (docs/02 §6.3)"
+const consolidationMode = z
+  .enum(['auto', 'review'])
+  .refine((mode) => mode === 'auto', { message: CONSOLIDATION_MODE_M2_MESSAGE })
+
 export const ConsolidationSettings = z.object({
   activeWindowSnippets: z.number().int().positive().default(6),
   activeWindowWords: z.number().int().positive().default(3000),
@@ -19,7 +28,7 @@ export const ConsolidationSettings = z.object({
   maxFrontierWords: z.number().int().positive().default(9000),
   debounceMs: z.number().int().positive().default(30_000),
   undoGraceMs: z.number().int().positive().default(300_000),
-  mode: z.enum(['auto', 'review']).default('auto'), // "review" is M2
+  mode: consolidationMode.default('auto'),
 })
 export type ConsolidationSettings = z.infer<typeof ConsolidationSettings>
 
@@ -83,7 +92,7 @@ export const ConsolidationSettingsUpdate = z.object({
   maxFrontierWords: z.number().int().positive().optional(),
   debounceMs: z.number().int().positive().optional(),
   undoGraceMs: z.number().int().positive().optional(),
-  mode: z.enum(['auto', 'review']).optional(),
+  mode: consolidationMode.optional(),
 })
 export type ConsolidationSettingsUpdate = z.infer<typeof ConsolidationSettingsUpdate>
 

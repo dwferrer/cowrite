@@ -106,7 +106,7 @@ describe('resolveHarnessKnobs', () => {
       connectTimeoutMs: 15_000,
       firstTokenTimeoutMs: 60_000,
       idleTokenTimeoutMs: 30_000,
-      totalTimeoutMs: { high: 300_000, low: 120_000 },
+      totalTimeoutMs: { high: 300_000, low: 300_000 },
       illustrationBudgetMs: 600_000,
       retry: { maxAttempts: 3, backoffMs: 1_000, backoffMaxMs: 4_000 },
       spendWarnUsd: 5,
@@ -116,14 +116,14 @@ describe('resolveHarnessKnobs', () => {
 
   it('sparse overrides keep sibling defaults', () => {
     const knobs = resolveHarnessKnobs({ totalTimeoutMs: { high: 10_000 } })
-    expect(knobs.totalTimeoutMs).toEqual({ high: 10_000, low: 120_000 })
+    expect(knobs.totalTimeoutMs).toEqual({ high: 10_000, low: 300_000 })
     expect(knobs.retry.maxAttempts).toBe(3)
   })
 
   it('per-lane totalMs feeds the client ladder', () => {
     const { high, low } = buildClients(configWithBothLanes())
     expect(high?.ladder().totalMs).toBe(300_000)
-    expect(low?.ladder().totalMs).toBe(120_000)
+    expect(low?.ladder().totalMs).toBe(300_000)
     expect(high?.ladder({ totalMs: 42 }).totalMs).toBe(42)
   })
 })

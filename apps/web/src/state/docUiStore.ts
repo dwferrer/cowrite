@@ -76,6 +76,40 @@ function mirrorCrashCopy(workId: string, blockId: string, text: string): void {
   }, CRASH_COPY_THROTTLE_MS - elapsed)
 }
 
+/**
+ * §4.1 stale-key GC for crash copies: scan this work's drafts and drop every one whose
+ * block id no longer resolves, returning the dropped texts so the caller can surface
+ * them once as recoverable ("recovered text" toast) before they are gone. The compose
+ * editor's synthetic `'new'` block and the currently-open editor are never collected.
+ */
+export function gcCrashCopies(
+  workId: string,
+  liveBlockIds: ReadonlySet<string>,
+): Array<{ blockId: string; text: string }> {
+  const prefix = `cowrite:draft:${workId}:`
+  const dropped: Array<{ blockId: string; text: string }> = []
+  let keys: string[] = []
+  try {
+    keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i) ?? '')
+  } catch {
+    return dropped
+  }
+  const editingId = useDocUiStore.getState().editing?.id
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) continue
+    const blockId = key.slice(prefix.length)
+    if (blockId === 'new' || blockId === editingId || liveBlockIds.has(blockId)) continue
+    try {
+      const text = localStorage.getItem(key)
+      localStorage.removeItem(key)
+      if (text !== null) dropped.push({ blockId, text })
+    } catch {
+      // storage unavailable — crash copies are best-effort
+    }
+  }
+  return dropped
+}
+
 /** Also cancels a pending trailing mirror for the block, so a close can never lose the
  *  race to a timer that would resurrect the just-cleared copy. */
 export function clearCrashCopy(workId: string, blockId: string): void {

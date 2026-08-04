@@ -117,6 +117,31 @@ export const RunsQuery = z.object({
 })
 export type RunsQuery = z.infer<typeof RunsQuery>
 
+/**
+ * POST /consolidate response (§3.8). Usually the enqueued internal `propose-boundaries`
+ * `Task` (watch its task.* events); when the eligible prefix carried explicit scene-break
+ * markers the split applies immediately with no agent (02 §6.3 rule 1) and the response
+ * reports the applied sections + the undo token + grace deadline instead. A forced
+ * evaluation that finds nothing eligible (frontier inside the active window) reports
+ * `{applied: false, reason: 'nothing-eligible'}` — still 202, not an error; 409 stays
+ * for a genuinely busy or closing work.
+ */
+export const ConsolidateNowRes = z.union([
+  Task,
+  z.object({
+    applied: z.literal(true),
+    sectionIds: z.array(z.string()),
+    undoToken: z.string(),
+    /** ISO instant the undo grace window closes (02 §6.4 step 4). */
+    undoDeadline: z.string(),
+  }),
+  z.object({
+    applied: z.literal(false),
+    reason: z.literal('nothing-eligible'),
+  }),
+])
+export type ConsolidateNowRes = z.infer<typeof ConsolidateNowRes>
+
 // ---------------------------------------------------------------------------
 // §6.2 — The route registry. `res` is the 2xx body schema; absent for 204, image bytes
 // (image/png in/out is a raw body, not JSON — see `raw`), and the SSE stream.
@@ -331,11 +356,11 @@ export const api = {
     status: 204,
   },
 
-  // ---- consolidation controls (§3.8; Stage 4 stubs) ----
+  // ---- consolidation controls (§3.8; live with the Stage-4 scheduler) ----
   consolidateNow: {
     method: 'POST',
     path: (w: string) => `/api/works/${w}/consolidate`,
-    res: Task,
+    res: ConsolidateNowRes,
     status: 202,
   },
   undoConsolidation: {

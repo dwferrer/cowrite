@@ -50,16 +50,21 @@ const modelsResponse = (): Response =>
 
 describe('LLM probes', () => {
   it('GETs {baseUrl}/models with the stored bearer key and reports the model list', async () => {
-    const { calls, fetchImpl } = mockFetch(() => modelsResponse())
+    // A keyed probe ALSO fires the 1-token auth check: public listings prove nothing.
+    const { calls, fetchImpl } = mockFetch((url) =>
+      url.endsWith('/models') ? modelsResponse() : new Response('{}', { status: 200 }),
+    )
     const result = await runProbe({ target: 'high' as const }, stored, { fetchImpl })
     expect(result).toMatchObject({ ok: true })
     if (!result.ok) return
     expect(result.latencyMs).toBeGreaterThanOrEqual(0)
     expect(result.detail).toContain('2 models')
     expect(result.detail).toContain("'big' available")
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(2)
     expect(calls[0]?.url).toBe('http://h.example/v1/models')
     expect(calls[0]?.headers.authorization).toBe('Bearer sk-stored')
+    expect(calls[1]?.url).toBe('http://h.example/v1/chat/completions')
+    expect(calls[1]?.headers.authorization).toBe('Bearer sk-stored')
   })
 
   it('candidate merge: apiKey null uses the stored key against the candidate baseUrl', async () => {
@@ -204,5 +209,34 @@ describe('ComfyUI probes', () => {
     const { fetchImpl } = mockFetch(() => new Response('{}', { status: 200 }))
     const result = await runProbe({ target: 'comfyui' as const }, bare, { fetchImpl })
     expect(result).toMatchObject({ ok: false, code: 'config_missing' })
+  })
+})
+
+describe('probe verifies credentials even when the model listing is public', () => {
+  it('fails with auth when /models is public 200 but chat/completions rejects the key', async () => {
+    const { fetchImpl } = mockFetch((url) =>
+      url.endsWith('/models')
+        ? new Response(JSON.stringify({ data: [{ id: 'big' }] }), { status: 200 })
+        : new Response(JSON.stringify({ error: { message: 'Missing Authentication header' } }), {
+            status: 401,
+          }),
+    )
+    const result = await runProbe({ target: 'high' }, stored, { fetchImpl })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.code).toBe('auth')
+  })
+
+  it('skips the auth check for keyless endpoints (local servers)', async () => {
+    const keyless = AppConfig.parse({
+      models: { high: { baseUrl: 'http://h.example/v1', apiKey: '', model: 'big' } },
+    })
+    const { calls, fetchImpl } = mockFetch((url) => {
+      if (url.endsWith('/models'))
+        return new Response(JSON.stringify({ data: [{ id: 'big' }] }), { status: 200 })
+      throw new Error('chat/completions must not be called for keyless probes')
+    })
+    const result = await runProbe({ target: 'high' }, keyless, { fetchImpl })
+    expect(result.ok).toBe(true)
+    expect(calls.every((c) => c.url.endsWith('/models'))).toBe(true)
   })
 })

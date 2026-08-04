@@ -59,11 +59,11 @@ describe('WorkSettings', () => {
 
   it('keeps overrides and fills the siblings', () => {
     const settings = WorkSettings.parse({
-      consolidation: { maxFrontierWords: 12_000, mode: 'review' },
+      consolidation: { maxFrontierWords: 12_000 },
       contextOverrides: { softBudget: 16_000 },
     })
     expect(settings.consolidation.maxFrontierWords).toBe(12_000)
-    expect(settings.consolidation.mode).toBe('review')
+    expect(settings.consolidation.mode).toBe('auto')
     expect(settings.consolidation.maxFrontierSnippets).toBe(18)
     expect(settings.contextOverrides).toEqual({ softBudget: 16_000 })
   })
@@ -72,6 +72,15 @@ describe('WorkSettings', () => {
     expect(ConsolidationSettings.safeParse({ maxFrontierWords: 0 }).success).toBe(false)
     expect(ConsolidationSettings.safeParse({ debounceMs: -1 }).success).toBe(false)
     expect(ConsolidationSettings.safeParse({ activeWindowWords: 1.5 }).success).toBe(false)
+  })
+
+  it("rejects mode 'review' at parse with the M2 message (M1 is auto-only)", () => {
+    const parsed = ConsolidationSettings.safeParse({ mode: 'review' })
+    expect(parsed.success).toBe(false)
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.message).toContain("'review' ships in M2")
+    }
+    expect(ConsolidationSettings.parse({ mode: 'auto' }).mode).toBe('auto')
   })
 })
 
@@ -111,9 +120,15 @@ describe('WorkSummary / WorkDetail (03 §3.1 DTOs)', () => {
 
 describe('WorkPatch', () => {
   it('keeps a sparse settings patch sparse — no materialized defaults', () => {
-    const patch = WorkPatch.parse({ settings: { consolidation: { mode: 'review' } } })
-    expect(patch.settings).toEqual({ consolidation: { mode: 'review' } })
+    const patch = WorkPatch.parse({ settings: { consolidation: { debounceMs: 1000 } } })
+    expect(patch.settings).toEqual({ consolidation: { debounceMs: 1000 } })
     expect(WorkPatch.parse({})).toEqual({})
+  })
+
+  it("rejects mode 'review' in a settings patch too (M1 is auto-only)", () => {
+    expect(WorkPatch.safeParse({ settings: { consolidation: { mode: 'review' } } }).success).toBe(
+      false,
+    )
   })
 
   it('rejects an empty title', () => {

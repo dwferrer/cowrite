@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { parseArgs, stripBom, titleFromPositionals } from './cli.js'
+import { enrichmentBadge, parseArgs, stripBom, titleFromPositionals } from './cli.js'
+import type { SectionRow } from './storage/index/db.js'
 
 describe('parseArgs', () => {
   it('splits positionals from --flag forms', () => {
@@ -27,6 +28,44 @@ describe('titleFromPositionals (works create)', () => {
 
   it('is null for a missing title', () => {
     expect(titleFromPositionals(['works', 'create'])).toBeNull()
+  })
+})
+
+describe('enrichmentBadge (work info fold-relevant fields)', () => {
+  const row = (overrides: Partial<SectionRow>): SectionRow => ({
+    id: '01JGSECTION0000000000000AA',
+    parentId: null,
+    kind: 'chapter',
+    orderKey: 'a0',
+    title: 'One',
+    titleSource: 'agent',
+    dirPath: 'sections/10-one.aaaaaa',
+    wordCount: 1200,
+    contentHash: 'abc',
+    frozenAt: '2026-08-01T00:00:00Z',
+    shortSummaryStale: false,
+    longSummaryStale: false,
+    illustrationStale: false,
+    illustrationHash: null,
+    illustrationWidth: null,
+    illustrationHeight: null,
+    shortSummary: 'A short summary.',
+    longSummary: 'A long summary.',
+    ...overrides,
+  })
+
+  it('reads ok / stale / missing per summary slot', () => {
+    expect(enrichmentBadge(row({}))).toBe('  [short ok / long ok / illus none]')
+    expect(enrichmentBadge(row({ shortSummary: null, longSummaryStale: true }))).toBe(
+      '  [short missing / long stale / illus none]',
+    )
+    expect(enrichmentBadge(row({ illustrationHash: 'ff', illustrationStale: true }))).toBe(
+      '  [short ok / long ok / illus stale]',
+    )
+  })
+
+  it('is empty for interior sections (no enrichments to report)', () => {
+    expect(enrichmentBadge(row({ contentHash: null }))).toBe('')
   })
 })
 

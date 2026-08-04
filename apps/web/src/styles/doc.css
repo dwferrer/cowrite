@@ -38,6 +38,76 @@
   white-space: nowrap;
 }
 
+/* ---- background-lane activity (§4.4): pulse dot + popover ---- */
+
+.background-activity {
+  position: relative;
+}
+
+.background-activity__dot {
+  align-items: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  width: 24px;
+}
+
+.background-activity__pulse {
+  animation: bg-pulse 1.6s ease-in-out infinite;
+  background: var(--accent);
+  border-radius: 999px;
+  display: block;
+  height: 8px;
+  width: 8px;
+}
+
+@keyframes bg-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .background-activity__pulse {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+.background-activity__popover {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-1);
+  box-shadow: var(--shadow-1);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  max-width: 360px;
+  min-width: 220px;
+  padding: var(--space-2);
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 100;
+}
+
+.background-activity__row {
+  color: var(--fg-muted);
+  overflow: hidden;
+  padding: var(--space-1);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .banner {
   font-size: 13px;
   padding: var(--space-2) var(--space-4);
@@ -204,6 +274,69 @@
   color: var(--warn);
   cursor: help;
   font-size: 12px;
+}
+
+/* ---- fold widget (§5.3): four dots + auto, pin glyph when non-auto ---- */
+
+.section-heading__fold-hint {
+  color: var(--fg-faint);
+  font-size: 12px;
+}
+
+.fold-widget {
+  align-items: center;
+  display: inline-flex;
+  gap: 2px;
+  opacity: 0.35;
+  transition: opacity 120ms ease;
+}
+
+.section-heading:hover .fold-widget,
+.fold-widget:focus-within {
+  opacity: 1;
+}
+
+.fold-widget__dot,
+.fold-widget__auto {
+  background: none;
+  border: none;
+  border-radius: var(--radius-1);
+  color: var(--fg-faint);
+  cursor: pointer;
+  font-size: 9px;
+  line-height: 1;
+  padding: 4px 3px;
+}
+
+.fold-widget__auto {
+  font-family: var(--font-ui);
+  font-size: 11px;
+}
+
+.fold-widget__dot[aria-pressed="true"],
+.fold-widget__auto[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.fold-widget__dot:hover,
+.fold-widget__auto:hover {
+  background: var(--bg-sunken);
+  color: var(--fg);
+}
+
+.fold-widget__pin {
+  font-size: 10px;
+}
+
+/* subtle fidelity affordance on collapsed section bodies (§5.1) */
+.section-block__fold-hint {
+  color: var(--fg-faint);
+  display: block;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-style: italic;
+  margin-top: var(--space-1);
+  text-align: right;
 }
 
 /* ---- doc view host (§5.4–5.5) ---- */

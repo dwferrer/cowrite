@@ -109,6 +109,21 @@ export function formatBlockList(specs: readonly ExpectedBlockSpec[]): string {
 }
 
 /**
+ * The message for a failed parse. When the model stopped on `length`, the visible answer was
+ * truncated (commonly a reasoning model spending the token budget on hidden reasoning), so we
+ * point at the fix instead of the symptom — reported through the same `output_invalid` code.
+ */
+export function describeParseFailure(
+  missing: readonly ExpectedBlockSpec[],
+  finishReason: string | null,
+): string {
+  if (finishReason === 'length') {
+    return `the model's output was cut off at the token limit before a complete ${formatBlockList(missing)} block — raise the endpoint's maxOutputTokens (reasoning models need extra headroom)`
+  }
+  return `the model produced no valid ${formatBlockList(missing)} block after one repair turn`
+}
+
+/**
  * Parses a complete model response against the task's declared block set. Leading, trailing,
  * and between-block chatter is discarded. CRLF is normalized to LF once on entry.
  */

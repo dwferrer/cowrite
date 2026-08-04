@@ -202,7 +202,7 @@ z.object({
 
 | Method & path | Req → Res | Notes |
 |---|---|---|
-| `POST /api/works/:w/consolidate` | → `202 Task` | Manual "Consolidate now": enqueues the internal `propose-boundaries` task on the background lane. This is the only way a client triggers that kind. |
+| `POST /api/works/:w/consolidate` | → `202 Task \| {applied: true, sectionIds, undoToken, undoDeadline} \| {applied: false, reason: "nothing-eligible"}` | Manual "Consolidate now": enqueues the internal `propose-boundaries` task on the background lane (the only way a client triggers that kind) — or, when the eligible prefix carries explicit scene-break markers, the split applies immediately with no agent (02 §6.3 rule 1) and the applied shape (with the undo grace deadline) is returned. Nothing eligible — the frontier sits inside the active window — is the third 202 variant, not an error; `409 conflict` stays for a genuinely busy or closing work. |
 | `POST /api/works/:w/consolidations/:undoToken/undo` | → `204` | Undo within the grace window (02 §undo). Cancels pending enrich/illustrate tasks targeting the un-frozen sections, then emits `consolidation.undone`. `409 conflict` when the token has expired or been purged. |
 
 ### 3.9 Agent runs (provenance)
@@ -512,8 +512,15 @@ export const WorkEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("section.changed"),  section: SectionRow }),
   z.object({ type: z.literal("sections.restructured") }),                  // reorder/split/merge
   z.object({ type: z.literal("consolidation.applied"),
-             sectionIds: z.array(Ulid), title: z.string(), undoToken: z.string() }),
+             sectionIds: z.array(Ulid), title: z.string(), undoToken: z.string(),
+             undoDeadline: IsoTime }),      // grace-window close: the undo toast's TTL derives
+                                            //   from it (re-offered as a synthetic attach frame
+                                            //   mid-grace, §8.3)
   z.object({ type: z.literal("consolidation.undone"), sectionIds: z.array(Ulid) }),
+  z.object({ type: z.literal("consolidation.finalized"), opId: z.string() }),
+                                            // the op left its grace window (expiry, superseded
+                                            //   by a new apply, or work close) — the client
+                                            //   dismisses the matching undo toast
   z.object({ type: z.literal("enrichment.updated"), sectionId: Ulid,
              kind: z.enum(["title","short","long","illustration"]),
              section: SectionRow }),                                       // fresh row inline

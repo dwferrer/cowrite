@@ -6,8 +6,9 @@ import type { FoldLevel } from './docUiStore.js'
  * Persisted per-work UI preferences (docs/04-frontend.md §4.4): pane visibility/widths and
  * fold pins. One store, keyed by work id, persisted under `cowrite:ui`. The persisted
  * SHAPE carries every §4.4 slot (widths, edit-task pane, fold pins) so saved prefs
- * survive upgrades, but Stage 2 only mutates `situationOpen` — the other setters return
- * with the UI surfaces that need them (resizer, edit-task pane, fold pin menu).
+ * survive upgrades; the fold-pin actions (setFold + the §4.1 stale-key GC prune) are live
+ * with the Stage-4 ladder UI — the remaining setters (resizer, edit-task pane) return
+ * with the surfaces that need them.
  */
 
 export interface PanelPrefs {
@@ -29,6 +30,14 @@ export const DEFAULT_PANEL_PREFS: PanelPrefs = {
 interface PanelState {
   byWork: Record<string, PanelPrefs>
   setSituationOpen(workId: string, open: boolean): void
+  /** Pin a section's fold level; `'auto'` clears the pin back to the distance default. */
+  setFold(workId: string, sectionId: string, level: FoldLevel | 'auto'): void
+  /**
+   * §4.1 stale-key GC: drop every pin whose section id no longer resolves — run
+   * after the refetch `sections.restructured` (the one restructure refetch owner)
+   * triggers, and directly on `consolidation.applied`/`undone` attach frames.
+   */
+  pruneFoldOverrides(workId: string, liveSectionIds: ReadonlySet<string>): void
 }
 
 export const usePanelStore = create<PanelState>()(
@@ -46,6 +55,27 @@ export const usePanelStore = create<PanelState>()(
             },
           },
         })),
+
+      setFold: (workId, sectionId, level) =>
+        set((state) => {
+          const prefs = state.byWork[workId] ?? DEFAULT_PANEL_PREFS
+          const foldOverrides = { ...prefs.foldOverrides }
+          // 'auto' is the reset — store no key at all, so the record only ever holds pins
+          if (level === 'auto') delete foldOverrides[sectionId]
+          else foldOverrides[sectionId] = level
+          return { byWork: { ...state.byWork, [workId]: { ...prefs, foldOverrides } } }
+        }),
+
+      pruneFoldOverrides: (workId, liveSectionIds) =>
+        set((state) => {
+          const prefs = state.byWork[workId]
+          if (!prefs) return state
+          const stale = Object.keys(prefs.foldOverrides).filter((id) => !liveSectionIds.has(id))
+          if (stale.length === 0) return state
+          const foldOverrides = { ...prefs.foldOverrides }
+          for (const id of stale) delete foldOverrides[id]
+          return { byWork: { ...state.byWork, [workId]: { ...prefs, foldOverrides } } }
+        }),
     }),
     { name: 'cowrite:ui' },
   ),

@@ -7,6 +7,7 @@ import type { ChatMessage, ChatResult, OpenAiCompatClient } from '../models/clie
 import { ModelClientError } from '../models/client.js'
 import { deriveCostUsd } from '../models/usage.js'
 import {
+  describeParseFailure,
   formatBlockList,
   isCloseLine,
   parseOpeningLine,
@@ -51,8 +52,9 @@ export interface RunnerResult {
   usageTotal: { promptTokens: number; completionTokens: number; estimated: boolean }
 }
 
-/** A typed terminal failure raised inside the loop (e.g. output_invalid after repair). */
-class RunFailureError extends Error {
+/** A typed terminal failure raised inside the loop (e.g. output_invalid after repair).
+ *  Exported for the background runner (backgroundTasks.ts), which shares the taxonomy. */
+export class RunFailureError extends Error {
   constructor(
     readonly code: ErrorCode,
     message: string,
@@ -63,7 +65,7 @@ class RunFailureError extends Error {
   }
 }
 
-class AbortedError extends Error {
+export class AbortedError extends Error {
   constructor() {
     super('task cancelled')
     this.name = 'AbortedError'
@@ -500,7 +502,7 @@ export async function runInteractiveTask(
       if (!parsed.ok) {
         throw new RunFailureError(
           'output_invalid',
-          `the model produced no valid ${formatBlockList(parsed.missing)} block after one repair turn`,
+          describeParseFailure(parsed.missing, repaired.finishReason),
           false,
         )
       }
@@ -600,7 +602,8 @@ export async function runInteractiveTask(
   }
 }
 
-function classifyFailure(err: unknown): {
+/** Error → the 05 §11 taxonomy row (exported for the background runner). */
+export function classifyFailure(err: unknown): {
   code: ErrorCode
   message: string
   retryable: boolean

@@ -397,7 +397,13 @@ agent is simply skipped and the next open consolidates (§9.4).
 **Heuristics gate, agent decides, auto-apply with an undo window.**
 
 1. **Heuristic pre-pass (pure code):** explicit break markers in the eligible prefix — a `***` /
-   `---` scene-break line or a user "New chapter" command — split unconditionally.
+   `---` scene-break line — split unconditionally. A snippet *ending* with a marker breaks after
+   itself; one *starting* with a marker breaks after its predecessor; mid-snippet markers are
+   ignored (a boundary can only sit between snippets). A snippet whose text is **only** marker
+   line(s) is glue, never a section of its own: it attaches to the preceding section (the marker
+   rides that section's content tail), and consecutive marker-only snippets collapse into one
+   boundary — emitting boundaries on both sides would mint a junk marker-only section and a junk
+   enrich task with it. (A user "New chapter" command is M2 — no such command exists in M1.)
 2. **Boundary agent** (background task, kind `propose-boundaries`, low lane; prompt assembled by
    its harness handler from the eligible prefix plus the short summaries of the last two frozen
    sections — 05 §task handlers): returns a `BoundaryProposal` (§10.5) — 0..n boundaries inside
@@ -405,15 +411,24 @@ agent is simply skipped and the next open consolidates (§9.4).
    Validation: any `afterSnippetId` that is not in the eligible prefix (agent error, or the
    window moved) causes that boundary to be **dropped**; if all are dropped or none proposed,
    consolidation defers.
-3. **Deferral back-off:** on deferral, the effective thresholds grow ×1.5 **in memory only**
-   (never persisted into settings), capped at 2× the configured values, and reset on the next
-   successful consolidation. After 3 consecutive deferrals the scheduler stops growing the
-   thresholds and logs a server-side notice ("long frontier — consider splitting manually") —
-   **a log line only in MVP, not a `WorkEvent`; the client renders nothing** — so a dead or
-   garbage-returning endpoint cannot let the frontier grow without bound.
+3. **Deferral back-off — owned by storage** (`DeferralBackoff`; the harness only *reports*
+   deferrals that never reached `applyBoundaries` via `noteBoundaryDeferral`): on deferral, the
+   effective thresholds grow ×1.5 **in memory only** (never persisted into settings), capped at
+   2× the configured values, and reset on the next successful consolidation. After 3 consecutive
+   deferrals the growth stops and storage logs a server-side notice ("long frontier — consider
+   splitting manually") through its notice sink — **a log line only in MVP, not a `WorkEvent`;
+   the client renders nothing** — so a dead or garbage-returning endpoint cannot let the
+   frontier grow without bound. Deferrals also arm a **temporal back-off** against boundary-agent
+   spend loops: after *n* consecutive deferrals, no new boundary run starts before
+   `2^n × debounceMs` has elapsed (capped at ~30 min) **and** the eligible prefix has grown past
+   its size at the last deferral — re-running the agent over the identical prefix that just
+   deferred only burns tokens to defer again. "Consolidate now" (`force`) bypasses the temporal
+   gate; scene-break splits (rule 1) are never gated by any of this.
 4. **Apply mode:** `settings.consolidation.mode = "auto"` (default) applies immediately with a
    toast ("Chapter 3 'The Storm Glass' frozen — Undo"); `"review"` mode stores the proposal and
-   waits for confirmation. **M1 ships auto only; review mode is M2.**
+   waits for confirmation. **M1 ships auto only; review mode is M2 — the M1 schema rejects
+   `mode: "review"` at parse with a clear message** rather than silently auto-applying behind a
+   review-shaped setting.
 
 *Rejected:* pure-heuristic boundaries (word-count chapter chopping reads terribly); manual-only
 freezing (violates the automatic transition and accretes an unbounded frontier — which also
@@ -426,17 +441,26 @@ snippet/section write takes), journaled via `.cowrite/pending-ops.json` (§9.2):
 
 1. **Plan** (journal `phase:"planned"`): boundaries, consumed `snippetIds`, and each snippet's
    plan-time `contentHash`.
-2. **Create** section dir(s), `section.json`, `content.md`, `history.jsonl` — idempotent, keyed
-   by `opId`. Under the mutex, each snippet file is **re-read at apply time**; if its text
-   changed since plan (an edit landed while the boundary agent was thinking), the *newer* text is
-   the one written into `content.md` and recorded as `finalText` — a mid-flight edit is folded
-   in as if it were a normal post-freeze edit, never lost.
+2. **Create** section dir(s), `section.json`, `history.jsonl`, `content.md` — idempotent, keyed
+   by `opId`, with **`content.md` written last per section**: its presence is the "this section
+   is complete" marker replay keys on (a replayed section whose `content.md` exists is skipped
+   wholesale; one whose `content.md` is missing is rebuilt). Under the mutex, each snippet file
+   is **re-read at apply time**; if its text changed since plan (an edit landed while the
+   boundary agent was thinking), the *newer* text is the one written into `content.md` and
+   recorded as `finalText` — a mid-flight edit is folded in as if it were a normal post-freeze
+   edit, never lost.
 3. **Stage**: consumed snippet `.md` + revision `.jsonl` files **move atomically to
    `.cowrite/undo/<opId>/`**. From this instant `frontier/` is consistent — the reconciler, the
    context engine, and a full index rebuild see each byte of prose exactly once, with no journal
    awareness needed. Journal → `phase:"applied"`.
-4. **Grace expiry** (undoGraceMs = 5 min, or server shutdown, whichever first): delete
-   `.cowrite/undo/<opId>/`, delete the journal.
+4. **Finalize** — three purge paths, each deleting `.cowrite/undo/<opId>/` and the journal and
+   emitting `consolidation.finalized` (the client dismisses the matching undo toast): **grace
+   expiry** (undoGraceMs = 5 min), **work close / server shutdown** (§9.4), or a **new apply
+   while the previous op is still inside its grace window** — `pending-ops.json` holds exactly
+   one op (§5.2), so the previous *applied* op is finalized early before the new plan is
+   journaled. A previous op still at `planned` (a crashed apply whose in-process rollback also
+   failed) is **rolled forward first, never purged** — purging a planned journal would delete
+   the staged originals and let the same frontier prose consolidate twice (§9.2).
 
 `content.md` holds the final text of each consumed snippet, in order, joined by blank lines
 (scene-break markers preserved verbatim). `history.jsonl` gets one line per consumed snippet:
@@ -702,17 +726,27 @@ line, and the reconciler re-derives anything lost from the primary files. Orphan
 are swept at startup.
 
 ### 9.2 Multi-file operations (consolidation, section split/merge/move)
-Journaled two-phase apply via `.cowrite/pending-ops.json`, as sequenced in §6.4. Recovery at work
-open:
+Journaled two-phase apply via `.cowrite/pending-ops.json`, as sequenced in §6.4. Each section's
+`content.md` is written **last** (§6.4 step 2), so its presence is the per-section completion
+marker recovery keys on. Recovery at work open:
 
-- journal at `planned` → roll forward from step 2 (every step is idempotent, keyed by `opId`);
-- at `applied` → resume the grace timer; on expiry (or immediately at shutdown) delete
-  `.cowrite/undo/<opId>/` and the journal;
+- journal at `planned` → roll forward from step 2 (every step is idempotent, keyed by `opId`).
+  The same rule holds *inside a live process*: a new apply that finds a leftover `planned`
+  journal rolls it forward before finalizing it (§6.4 step 4) — a planned journal is never
+  purged, its staging holds the only undo copies;
+- at `applied` with **every** section's `content.md` present → resume the grace timer; on expiry
+  (or immediately at shutdown) delete `.cowrite/undo/<opId>/` and the journal;
+- at `applied` with **any** section's `content.md` missing → a **crashed undo**: deletion of the
+  section dirs had begun, which means the restore phase already completed (undo restores first,
+  deletes second — §6.4), so every snippet is back in `frontier/` and recovery completes the
+  undo deterministically;
 - a file found in *both* a new section (`content.md`) and `frontier/` (crash inside step 3's
   move loop) → the section wins; the frontier copy matching the journal's `snippetIds` is moved
   to staging.
 
-Undo = reverse replay while phase ≤ `applied` (§6.4, including enrichment-task cancellation).
+Undo = reverse replay while phase ≤ `applied` (§6.4, including enrichment-task cancellation):
+staged files move back into `frontier/` FIRST, section dirs are deleted second — the ordering
+that makes the crashed-undo rule above deterministic.
 
 ### 9.3 Single-writer lock
 `.cowrite/lock` holds `{pid, hostname, nonce, acquiredAt}`, refreshed every 30 s. A second
@@ -768,8 +802,8 @@ export const ConsolidationSettings = z.object({
   maxFrontierWords:     z.number().int().positive().default(9000),  // bounds the engine's
   debounceMs:           z.number().int().positive().default(30_000),// local-context region (§2.4)
   undoGraceMs:          z.number().int().positive().default(300_000),
-  mode: z.enum(["auto", "review"]).default("auto"),                 // "review" is M2
-});
+  mode: z.enum(["auto", "review"]).default("auto"),  // "review" is M2 — M1 REJECTS it at parse
+});                                                  //   (schema refine with a clear message)
 
 export const WorkSettings = z.object({
   consolidation: ConsolidationSettings.default({}),
@@ -917,8 +951,9 @@ obligations toward them:
 
 ## 11. StorageService surface
 
-One in-process service per open work, constructed by `openWork(slug)` (acquire lock → replay
-journal → reconcile → open index). All calls are synchronous or promise-returning library calls;
+One in-process service per open work, constructed by `openWork(slug)` (acquire lock → sweep tmp
+orphans → replay journal → finalize crashed runs → open-or-rebuild index → reconcile). All calls
+are synchronous or promise-returning library calls;
 the API layer (03) maps them to routes, the harness (05) and pipelines call them directly. All
 writes go through the single per-work mutex.
 
@@ -935,6 +970,10 @@ interface StorageService {
 
   // sections
   listSections(): SectionRowSource[];               // index-backed; route inlines summary text
+  staleSections(scope?: "summary" | "any"): SectionRowSource[];  // THE §6.5 staleness query:
+                                                    //   'summary' = leaf rows with stale/missing
+                                                    //   summaries (the sweep's queue); 'any'
+                                                    //   adds illustration staleness (Stage 5)
   getSectionContent(id): { text, contentHash };
   replaceSectionContent(id, text, { baseHash }): OkOrConflict;
   replaceSectionSpan(id, span, text, { runId?, baseHash }): OkOrConflict;   // §6.6
@@ -952,10 +991,17 @@ interface StorageService {
   getRevisions(id): RevisionEvent[];
   setEditingSnippet(id | null): void;               // consolidation guard, fed by 03's route
 
-  // consolidation
-  maybeConsolidate(guards: { taskTargetIds: Ulid[] }): void;  // scheduler entry point (§6.2)
-  applyBoundaries(proposal: BoundaryProposal, { boundaryRunId }): { opId };
+  // consolidation (all async; the harness scheduler is the one caller, 05 §6.2)
+  maybeConsolidate(guards: { taskTargetIds: Ulid[]; force?: boolean }):
+    | { status: "idle" }                            // below thresholds / no eligible prefix
+    | { status: "needs-boundaries"; eligibleSnippetIds: Ulid[] }  // run the boundary agent
+    | { status: "applied"; opId; sectionIds; undoDeadline };      // §6.3 rule-1 scene-break split
+  applyBoundaries(proposal: BoundaryProposal, { boundaryRunId, taskTargetIds? }):
+    | { ok: true; opId; sectionIds; undoDeadline }
+    | { ok: false; deferred: true; droppedBoundaries };  // §6.3: every boundary out of prefix
   undoConsolidation(opId): void;                    // caller must first cancel-by-target (§6.4)
+  pendingConsolidation(): { opId; sectionIds; undoDeadline } | null;  // op inside its grace window
+  noteBoundaryDeferral(reason): void;               // harness-reported deferral → back-off (§6.3)
 
   // world
   listWorldEntries(): WorldEntry[];  getWorldEntry(id): WorldEntry;

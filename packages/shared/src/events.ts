@@ -32,8 +32,14 @@ export const WorkEvent = z.discriminatedUnion('type', [
     sectionIds: z.array(Ulid),
     title: z.string(),
     undoToken: z.string(),
+    /** ISO instant the undo grace window closes — the client's toast TTL derives
+     *  from it (also re-offered as a synthetic attach frame mid-grace, 03 §8.3). */
+    undoDeadline: IsoTime,
   }),
   z.object({ type: z.literal('consolidation.undone'), sectionIds: z.array(Ulid) }),
+  /** The op left its grace window (expiry, superseded by a new apply, or work close):
+   *  the client dismisses the matching undo toast. */
+  z.object({ type: z.literal('consolidation.finalized'), opId: z.string() }),
   z.object({
     type: z.literal('enrichment.updated'),
     sectionId: Ulid,

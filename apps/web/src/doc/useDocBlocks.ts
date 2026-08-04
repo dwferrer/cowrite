@@ -28,7 +28,7 @@ export type Block =
       ordinal: number
     }
   | { kind: 'sectionBody'; key: string; section: SectionRow; fold: Exclude<FoldLevel, 'name'> }
-  | { kind: 'nameCard'; key: string; section: SectionRow }
+  | { kind: 'nameCard'; key: string; section: SectionRow; ordinal: number }
   | { kind: 'snippet'; key: string; snippet: SnippetDto }
   | { kind: 'frontierBar'; key: string }
 
@@ -95,7 +95,7 @@ export function buildBlocks(
     if (!e.row.isLeaf) {
       if (interiorAllName.get(e.row.id)) {
         // the whole part collapses to one card; skip the subtree
-        blocks.push({ kind: 'nameCard', key: `n:${e.row.id}`, section: e.row })
+        blocks.push({ kind: 'nameCard', key: `n:${e.row.id}`, section: e.row, ordinal: e.ordinal })
         collapsedRoots.add(e.row.id)
         collapsedSubtree.add(e.row.id)
         continue
@@ -121,7 +121,7 @@ export function buildBlocks(
       ordinal: e.ordinal,
     })
     if (fold === 'name') {
-      blocks.push({ kind: 'nameCard', key: `n:${e.row.id}`, section: e.row })
+      blocks.push({ kind: 'nameCard', key: `n:${e.row.id}`, section: e.row, ordinal: e.ordinal })
     } else {
       blocks.push({ kind: 'sectionBody', key: `b:${e.row.id}`, section: e.row, fold })
     }

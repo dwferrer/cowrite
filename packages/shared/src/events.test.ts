@@ -41,6 +41,7 @@ describe('WorkEvent names (09 §shared: spellings locked — a rename is a contr
       'sections.restructured',
       'consolidation.applied',
       'consolidation.undone',
+      'consolidation.finalized',
       'enrichment.updated',
       'world.changed',
       'situation.changed',

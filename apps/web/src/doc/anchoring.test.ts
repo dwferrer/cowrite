@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { type BlockPos, computeAnchor, isNearBottom, restoreScrollTop } from './anchoring.js'
+import {
+  type BlockPos,
+  computeAnchor,
+  fallbackAnchorKey,
+  isNearBottom,
+  restoreScrollTop,
+} from './anchoring.js'
 
 const positions: BlockPos[] = [
   { key: 'h:1', start: 0, size: 44 },
@@ -49,6 +55,29 @@ describe('restoreScrollTop', () => {
 
   it('returns null when the anchor block no longer exists', () => {
     expect(restoreScrollTop({ blockKey: 'gone', offsetPx: -10 }, undefined)).toBeNull()
+  })
+})
+
+describe('fallbackAnchorKey (04 §5.5 removed-anchor fallback)', () => {
+  // a consolidation consumed snippets s1..s4; s5 and the old chapter blocks survive
+  const prev = ['h:1', 'b:1', 's:1', 's:2', 's:3', 's:4', 's:5', 'frontier']
+
+  it('prefers the closest PRECEDING surviving block', () => {
+    const live = new Set(['h:1', 'b:1', 's:5', 'frontier', 'h:new', 'b:new'])
+    expect(fallbackAnchorKey(prev, live, 's:3')).toBe('b:1')
+  })
+
+  it('falls forward when nothing before the anchor survived', () => {
+    const live = new Set(['s:5', 'frontier'])
+    expect(fallbackAnchorKey(prev, live, 's:2')).toBe('s:5')
+  })
+
+  it('returns null when the anchor was never in the previous layout', () => {
+    expect(fallbackAnchorKey(prev, new Set(prev), 's:99')).toBeNull()
+  })
+
+  it('returns null when nothing survived at all', () => {
+    expect(fallbackAnchorKey(prev, new Set(), 's:3')).toBeNull()
   })
 })
 

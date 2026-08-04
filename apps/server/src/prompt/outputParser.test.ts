@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { type ExpectedBlockSpec, formatBlockList, parseTaskOutput } from './outputParser.js'
+import {
+  describeParseFailure,
+  type ExpectedBlockSpec,
+  formatBlockList,
+  parseTaskOutput,
+} from './outputParser.js'
 
 const NEW_SNIPPET: ExpectedBlockSpec[] = [{ tag: 'snippet', attrs: { id: 'new' } }]
 
@@ -189,5 +194,18 @@ describe('formatBlockList', () => {
     expect(formatBlockList([{ tag: 'title' }, { tag: 'snippet', attrs: { id: 'A1' } }])).toBe(
       '<title>, <snippet id="A1">',
     )
+  })
+})
+
+describe('describeParseFailure', () => {
+  it('points at maxOutputTokens when the model stopped on length (reasoning-model truncation)', () => {
+    const msg = describeParseFailure(NEW_SNIPPET, 'length')
+    expect(msg).toContain('cut off at the token limit')
+    expect(msg).toContain('maxOutputTokens')
+  })
+
+  it('reports the generic no-valid-block message for other finish reasons', () => {
+    expect(describeParseFailure(NEW_SNIPPET, 'stop')).toContain('no valid <snippet id="new"> block')
+    expect(describeParseFailure(NEW_SNIPPET, null)).toContain('no valid')
   })
 })

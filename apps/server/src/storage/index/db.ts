@@ -413,12 +413,19 @@ export class IndexDb {
     return raw.map(mapSection)
   }
 
-  /** Sections with any stale enrichment — the enrichment sweep's queue (§7.2). */
-  staleSections(): SectionRow[] {
+  /**
+   * Sections with stale enrichment — the enrichment sweep's queue (§7.2). This is THE
+   * §6.5 staleness spelling for consumers: scope `'summary'` restricts to leaf sections
+   * (interior rows carry no summaries) with a stale/missing summary — the Stage-4 sweep;
+   * `'any'` (default) also includes illustration staleness (the Stage-5 sweep).
+   */
+  staleSections(scope: 'summary' | 'any' = 'any'): SectionRow[] {
+    const where =
+      scope === 'summary'
+        ? `content_hash IS NOT NULL AND (short_summary_stale = 1 OR long_summary_stale = 1)`
+        : `short_summary_stale = 1 OR long_summary_stale = 1 OR illustration_stale = 1`
     const raw = this.prepare(
-      `${SECTION_SELECT} WHERE short_summary_stale = 1 OR long_summary_stale = 1
-         OR illustration_stale = 1
-       ORDER BY parent_id, order_key, id`,
+      `${SECTION_SELECT} WHERE ${where} ORDER BY parent_id, order_key, id`,
     ).all() as SectionSqlRow[]
     return raw.map(mapSection)
   }

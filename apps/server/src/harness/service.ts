@@ -1,23 +1,35 @@
 import type {
   AppConfig,
   BudgetKnobsOverrides,
+  HarnessKnobs,
   ProposalApplyRes,
   Task,
+  TaskKind,
   TaskSpec,
   WorkEvent,
 } from '@cowrite/shared'
 import { QUEUE_LANE_CAPACITY } from '@cowrite/shared'
 import { ulid } from 'ulid'
 import { engineFor } from '../context/routes.js'
+import { hydrateSection } from '../events/adapter.js'
 import { AppError } from '../http/errors.js'
 import type { OpenWork } from '../http/workRegistry.js'
 import { buildClients, type LaneDeps, resolveHarnessKnobs } from '../models/lanes.js'
 import { deriveCostUsd } from '../models/usage.js'
 import { loadTemplates, type TemplateSet } from '../prompt/templates/loader.js'
 import type { WorkHandle } from '../storage/service.js'
+import {
+  type BackgroundOutcome,
+  type BackgroundSpec,
+  backgroundDedupeKey,
+  backgroundStartTarget,
+  backgroundTargetIds,
+  runBackgroundTask,
+} from './backgroundTasks.js'
 import { applyProposal, discardProposal, listRunIds, reconstructProposal } from './proposals.js'
 import { QueueLane, type TaskEntry, TERMINAL_STATUSES, WorkTaskState } from './queue.js'
 import { runInteractiveTask } from './runner.js'
+import { type SchedulerHost, type SchedulerOptions, WorkScheduler } from './scheduler.js'
 import {
   buildTask,
   isInteractiveSpec,
@@ -47,6 +59,8 @@ export interface AgentHarnessDeps {
   laneDeps?: LaneDeps
   /** Prompt template directory override (defaults to the checked-in set). */
   templatesDir?: string
+  /** Background-scheduler tuning (sweep cadence/idle/cap — test injection). */
+  scheduler?: SchedulerOptions
   now?: () => Date
   onError?: (context: string, err: unknown) => void
 }
@@ -54,6 +68,9 @@ export interface AgentHarnessDeps {
 export class AgentHarness {
   private readonly deps: AgentHarnessDeps
   private readonly states = new WeakMap<WorkHandle, WorkTaskState>()
+  private readonly schedulers = new WeakMap<WorkHandle, WorkScheduler>()
+  /** taskId → settle promise for live background tasks (dedupe returns the original). */
+  private readonly backgroundOutcomes = new Map<string, Promise<BackgroundOutcome>>()
   private templatesPromise: Promise<TemplateSet> | null = null
   /** The single app-wide illustration slot (05 §6.1) — Stage 5 fills the pipeline. */
   readonly illustrationLane = new QueueLane(QUEUE_LANE_CAPACITY.illustration)
@@ -96,34 +113,30 @@ export class AgentHarness {
         'propose-boundaries is internal; use POST /works/:w/consolidate',
       )
     }
+    if (spec.kind === 'enrich-section') {
+      // The user's "refresh summary" button (05 §2). Validate the target up front so a
+      // bad id answers 404/400 instead of a quiet background failure.
+      const row = open.handle.getSection(spec.sectionId)
+      if (row === null) throw new AppError('not_found', `no section '${spec.sectionId}'`)
+      if (row.contentHash === null) {
+        throw new AppError(
+          'validation',
+          'enrich-section targets a leaf section — interior sections carry no summaries',
+        )
+      }
+      return { ...this.submitBackground(open, spec).task }
+    }
     if (!isInteractiveSpec(spec)) {
       throw new AppError(
         'not_implemented',
-        `task kind '${spec.kind}' is not implemented yet (M1 Stage ${spec.kind === 'edit-task' ? '— M2' : '4/5'})`,
+        `task kind '${spec.kind}' is not implemented yet (M1 Stage ${spec.kind === 'edit-task' ? '— M2' : '5'})`,
       )
     }
 
     const config = this.deps.config() // per-task snapshot (05 §3.1)
     const knobs = resolveHarnessKnobs(config.harness)
-    // Spend guard (05 §cost): past the hard stop, NEW submissions fail 409 spend_stop
-    // until restart or a knob change — in-flight tasks are never killed.
-    if (knobs.spendStopUsd !== null && this.spentUsdTotal >= knobs.spendStopUsd) {
-      throw new AppError(
-        'spend_stop',
-        `this process has spent $${this.spentUsdTotal.toFixed(2)}, at or over ` +
-          `harness.spendStopUsd ($${knobs.spendStopUsd.toFixed(2)}) — restart cowrite or raise the knob`,
-        { spentUsd: this.spentUsdTotal, thresholdUsd: knobs.spendStopUsd },
-      )
-    }
-    const modelLane = modelLaneFor(config, spec.kind)
-    const client = buildClients(config, this.deps.laneDeps ?? {})[modelLane]
-    if (client === null) {
-      throw new AppError(
-        'config_missing',
-        `the ${modelLane} model lane is not configured — add models.${modelLane} in settings`,
-        { lane: modelLane },
-      )
-    }
+    this.assertSpendAllowed(knobs)
+    const client = this.clientFor(config, spec.kind)
 
     await validateInteractiveSpec(open.handle, spec)
     const plan = planFor(spec)
@@ -208,6 +221,166 @@ export class AgentHarness {
     return { ...task }
   }
 
+  // -- background lane (Stage 4: enrich-section, propose-boundaries) --------------------
+
+  /**
+   * Enqueue a background task on the per-work background lane (05 §6.1: capacity 2,
+   * FIFO, `(kind, targetId)` dedupe, propose-boundaries jumps the queue). Shared by the
+   * user-facing enrich submit and the scheduler host. Throws `409 config_missing` /
+   * `409 spend_stop` — the scheduler pre-checks `backgroundReady` so its sweeps back
+   * off instead of spinning into these.
+   */
+  private submitBackground(
+    open: OpenWork,
+    spec: BackgroundSpec,
+  ): { task: Task; outcome: Promise<BackgroundOutcome>; deduped: boolean } {
+    const config = this.deps.config() // per-task snapshot (05 §3.1)
+    const knobs = resolveHarnessKnobs(config.harness)
+    this.assertSpendAllowed(knobs)
+    const client = this.clientFor(config, spec.kind)
+
+    const state = this.state(open)
+    const dedupeKey = backgroundDedupeKey(spec) as string
+
+    const task = buildTask(ulid(), open.handle.work.id, spec, this.now().toISOString())
+    const abort = new AbortController()
+    let settle!: (outcome: BackgroundOutcome) => void
+    const outcome = new Promise<BackgroundOutcome>((resolve) => {
+      settle = resolve
+    })
+
+    const finishCancelledQueued = (): void => {
+      if (task.status !== 'queued') return
+      state.finish(task.id, 'cancelled', null, this.now().toISOString())
+      open.bus.publish({ type: 'task.cancelled', taskId: task.id, partialText: null })
+      settle({ status: 'cancelled', errorCode: null, proposal: null })
+    }
+    const entry: TaskEntry = {
+      task,
+      abort,
+      targetIds: backgroundTargetIds(spec),
+      done: outcome.then(() => {}),
+      cancelQueued: finishCancelledQueued,
+    }
+
+    const position = state.background.queuedIds().length
+    const enqueued = state.background.enqueue({
+      id: task.id,
+      dedupeKey,
+      // Consolidation is waiting on the boundary agent — it jumps the queue (05 §6.1).
+      jumpQueue: spec.kind === 'propose-boundaries',
+      start: async () => {
+        if (task.status !== 'queued') return // cancelled by removal before launch
+        if (abort.signal.aborted) {
+          finishCancelledQueued()
+          return
+        }
+        task.status = 'running'
+        task.startedAt = this.now().toISOString()
+        open.bus.publish({
+          type: 'task.started',
+          task: { ...task },
+          lane: 'background',
+          target: backgroundStartTarget(spec),
+        })
+        try {
+          const templates = await this.templates()
+          const result = await runBackgroundTask(
+            task,
+            spec,
+            {
+              handle: open.handle,
+              bus: open.bus,
+              client,
+              templates,
+              knobs,
+              ...(this.deps.now === undefined ? {} : { now: this.deps.now }),
+            },
+            abort.signal,
+          )
+          this.recordSpend(open, deriveCostUsd(result.usageTotal, client.endpoint), knobs)
+          state.finish(
+            task.id,
+            result.status === 'ok' ? 'done' : result.status,
+            result.error === null
+              ? null
+              : { code: result.error.code, message: result.error.message },
+            this.now().toISOString(),
+          )
+          settle({
+            status: result.status,
+            errorCode: result.error?.code ?? null,
+            proposal: result.proposal,
+          })
+        } catch (err) {
+          // The background runner reports its own failures; reaching here is a bug —
+          // record it so the task never wedges the lane slot or the scheduler cycle.
+          this.deps.onError?.(`background runner for task ${task.id}`, err)
+          state.finish(
+            task.id,
+            'error',
+            { code: 'internal', message: err instanceof Error ? err.message : String(err) },
+            this.now().toISOString(),
+          )
+          open.bus.publish({
+            type: 'task.failed',
+            taskId: task.id,
+            code: 'internal',
+            message: err instanceof Error ? err.message : String(err),
+            partialText: null,
+            retryable: false,
+          })
+          settle({ status: 'error', errorCode: 'internal', proposal: null })
+        }
+      },
+    })
+    if (enqueued.status === 'deduped') {
+      // Dedupe (05 §6.1): enqueueing an enrich for an already-queued section is a
+      // no-op — the LANE is the one dedupe mechanism and reports the live job id;
+      // the caller gets that existing task. Nothing above was registered/published.
+      const existing = state.get(enqueued.existingId)
+      return {
+        task: existing?.task ?? task,
+        outcome:
+          this.backgroundOutcomes.get(enqueued.existingId) ??
+          Promise.resolve({ status: 'cancelled', errorCode: null, proposal: null }),
+        deduped: true,
+      }
+    }
+    state.registerBackground(entry)
+    this.backgroundOutcomes.set(task.id, outcome)
+    void outcome.then(() => this.backgroundOutcomes.delete(task.id))
+    open.bus.publish({ type: 'task.queued', task: { ...task }, position })
+    return { task, outcome, deduped: false }
+  }
+
+  /** Spend guard (05 §cost): past the hard stop, NEW submissions fail `409 spend_stop`
+   *  until restart or a knob change — in-flight tasks are never killed. */
+  private assertSpendAllowed(knobs: HarnessKnobs): void {
+    if (knobs.spendStopUsd !== null && this.spentUsdTotal >= knobs.spendStopUsd) {
+      throw new AppError(
+        'spend_stop',
+        `this process has spent $${this.spentUsdTotal.toFixed(2)}, at or over ` +
+          `harness.spendStopUsd ($${knobs.spendStopUsd.toFixed(2)}) — restart cowrite or raise the knob`,
+        { spentUsd: this.spentUsdTotal, thresholdUsd: knobs.spendStopUsd },
+      )
+    }
+  }
+
+  /** Route the kind to its model lane and build the client; `409 config_missing` if unset. */
+  private clientFor(config: AppConfig, kind: TaskKind) {
+    const modelLane = modelLaneFor(config, kind)
+    const client = buildClients(config, this.deps.laneDeps ?? {})[modelLane]
+    if (client === null) {
+      throw new AppError(
+        'config_missing',
+        `the ${modelLane} model lane is not configured — add models.${modelLane} in settings`,
+        { lane: modelLane },
+      )
+    }
+    return client
+  }
+
   /** GET /works/:w/tasks — queued + running + last 50 terminal (in-memory by design). */
   list(open: OpenWork): Task[] {
     return this.state(open)
@@ -221,14 +394,26 @@ export class AgentHarness {
     return entry === undefined ? null : { ...entry.task }
   }
 
-  /** POST /works/:w/tasks/:t/cancel — idempotent; running tasks abort, terminal no-op. */
+  /** POST /works/:w/tasks/:t/cancel — idempotent; running tasks abort, queued
+   *  background tasks cancel by removal (05 §6.3), terminal no-op. */
   cancel(open: OpenWork, taskId: string): Task {
     const entry = this.state(open).get(taskId)
     if (entry === undefined) throw new AppError('not_found', `no task '${taskId}' in this process`)
-    if (!TERMINAL_STATUSES.has(entry.task.status)) {
-      entry.abort.abort(new Error('cancelled by user'))
-    }
+    if (!TERMINAL_STATUSES.has(entry.task.status)) this.cancelEntry(open, entry)
     return { ...entry.task }
+  }
+
+  /** Abort a running entry; remove-and-settle a still-queued background entry. */
+  private cancelEntry(open: OpenWork, entry: TaskEntry, reason = 'cancelled by user'): void {
+    if (
+      entry.task.lane === 'background' &&
+      entry.task.status === 'queued' &&
+      this.state(open).background.removeQueued(entry.task.id)
+    ) {
+      entry.cancelQueued?.()
+      return
+    }
+    entry.abort.abort(new Error(reason))
   }
 
   /** Consolidation-undo hook (05 §6.2): cancel queued/running tasks touching these ids. */
@@ -236,9 +421,20 @@ export class AgentHarness {
     const wanted = new Set(targetIds)
     for (const entry of this.state(open).live()) {
       if (entry.targetIds.some((id) => wanted.has(id))) {
-        entry.abort.abort(new Error('cancelled: target withdrawn'))
+        this.cancelEntry(open, entry, 'cancelled: target withdrawn')
       }
     }
+  }
+
+  /** Cancel-by-target AND wait for the affected runners to settle — the pre-undo
+   *  barrier (02 §6.4: an enrichment run must never write into a dir being deleted). */
+  async cancelByTargetAndSettle(open: OpenWork, targetIds: readonly string[]): Promise<void> {
+    const wanted = new Set(targetIds)
+    const affected = this.state(open)
+      .live()
+      .filter((entry) => entry.targetIds.some((id) => wanted.has(id)))
+    this.cancelByTarget(open, targetIds)
+    await Promise.allSettled(affected.map((entry) => entry.done))
   }
 
   /** Live target ids for storage's consolidation guard (05 §5.6). */
@@ -246,13 +442,72 @@ export class AgentHarness {
     return this.state(open).liveTargetIds()
   }
 
-  /** Work close (05 §6.2): cancel interactive work and wait for runners to settle. */
+  /** Work close (05 §6.2): stop the scheduler, cancel lanes, wait for runners. */
   async closeWork(open: OpenWork): Promise<void> {
+    this.schedulers.get(open.handle)?.dispose()
     const state = this.states.get(open.handle)
     if (state === undefined) return
     const live = state.live()
-    for (const entry of live) entry.abort.abort(new Error('cancelled: work closing'))
+    for (const entry of live) this.cancelEntry(open, entry, 'cancelled: work closing')
     await Promise.allSettled(live.map((entry) => entry.done))
+  }
+
+  // -- consolidation controls (03 §3.8) -------------------------------------------------
+
+  /** POST /works/:w/consolidate — the manual "Consolidate now" trigger. */
+  consolidateNow(open: OpenWork): ReturnType<WorkScheduler['consolidateNow']> {
+    return this.schedulerFor(open).consolidateNow()
+  }
+
+  /** POST /works/:w/consolidations/:undoToken/undo — cancel-by-target THEN undo. */
+  undoWorkConsolidation(open: OpenWork, undoToken: string): Promise<void> {
+    return this.schedulerFor(open).undo(undoToken)
+  }
+
+  /** The per-work scheduler; created by attachWork, lazily otherwise (presence-less). */
+  private schedulerFor(open: OpenWork, presence?: () => boolean): WorkScheduler {
+    let scheduler = this.schedulers.get(open.handle)
+    if (scheduler !== undefined) return scheduler
+    scheduler = new WorkScheduler(
+      open.handle,
+      { onLocal: (listener) => open.bus.onLocal(listener) },
+      this.schedulerHost(open, presence ?? (() => false)),
+      this.deps.scheduler ?? {},
+    )
+    this.schedulers.set(open.handle, scheduler)
+    scheduler.start()
+    // Registry-driven close (idle timeout, DELETE) also tears the timers down even
+    // when no onClose→closeWork hook was registered at this composition root.
+    open.addCloseResource(() => scheduler?.dispose())
+    return scheduler
+  }
+
+  /** The scheduler's window into this harness (scheduler.ts `SchedulerHost`). */
+  private schedulerHost(open: OpenWork, presence: () => boolean): SchedulerHost {
+    return {
+      hasSubscribers: presence,
+      interactiveIdleMs: () => this.state(open).interactiveIdleMs(),
+      liveTargetIds: () => this.liveTargetIds(open),
+      backgroundReady: (kind) => {
+        const config = this.deps.config()
+        const knobs = resolveHarnessKnobs(config.harness)
+        if (knobs.spendStopUsd !== null && this.spentUsdTotal >= knobs.spendStopUsd) return false
+        return buildClients(config, this.deps.laneDeps ?? {})[modelLaneFor(config, kind)] !== null
+      },
+      enqueueEnrich: (sectionId) => {
+        const res = this.submitBackground(open, { kind: 'enrich-section', sectionId })
+        // The outcome feeds the scheduler's per-section failure cooldown (05 §6.5).
+        return { deduped: res.deduped, outcome: res.outcome }
+      },
+      enqueueBoundaries: (eligibleSnippetIds) => {
+        const res = this.submitBackground(open, {
+          kind: 'propose-boundaries',
+          eligibleSnippetIds,
+        })
+        return { task: res.task, outcome: res.outcome }
+      },
+      cancelByTargetAndSettle: (targetIds) => this.cancelByTargetAndSettle(open, targetIds),
+    }
   }
 
   // -- spend guard (05 §cost) ---------------------------------------------------------
@@ -288,10 +543,38 @@ export class AgentHarness {
    * Install this work's attach-state provider on its bus — registered via the registry's
    * `onOpen` hook at every composition root, so a fresh EventSource hydrates the
    * interactive slot (and any pending keep-partial/conflict offer) purely from the
-   * stream, with no fetch-to-subscribe gap.
+   * stream, with no fetch-to-subscribe gap. Also starts the work's background scheduler
+   * (scheduler.ts); `presence` reports "≥ 1 SSE subscriber" for its sweep gate — absent
+   * (CLI compositions) the sweep stays gated off and only the consolidation driver and
+   * explicit submits run.
    */
-  attachWork(open: OpenWork): void {
+  attachWork(open: OpenWork, presence?: () => boolean): void {
     open.bus.setAttachStateProvider(() => this.taskStateFrames(open))
+    // Mid-grace hydration (02 §6.4; 03 §8.3): a reload/restart while a consolidation
+    // is still inside its undo window re-offers the undo toast with the TRUE remaining
+    // deadline — a synthetic consolidation.applied frame on every attach.
+    open.bus.addAttachProvider(() => this.pendingConsolidationFrames(open))
+    this.schedulerFor(open, presence)
+  }
+
+  private async pendingConsolidationFrames(open: OpenWork): Promise<WorkEvent[]> {
+    try {
+      const pending = await open.handle.pendingConsolidation()
+      if (pending === null || pending.undoDeadline === null) return []
+      const first = pending.sectionIds[0]
+      const section = first === undefined ? null : hydrateSection(open.handle, first)
+      return [
+        {
+          type: 'consolidation.applied',
+          sectionIds: pending.sectionIds,
+          title: section?.title ?? '',
+          undoToken: pending.opId,
+          undoDeadline: pending.undoDeadline,
+        },
+      ]
+    } catch {
+      return [] // a broken journal read must not break the stream
+    }
   }
 
   private stateFrame(task: Task): WorkEvent {

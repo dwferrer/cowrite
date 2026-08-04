@@ -83,6 +83,43 @@ export function registerTaskRoutes(app: RouteApp, deps: ResourceDeps, harness: A
     },
   })
 
+  // ---- consolidation controls (03 §3.8; 05 §6.2 scheduler) -------------------------
+  app.route({
+    method: 'POST',
+    url: '/api/works/:w/consolidate',
+    schema: { response: { 202: api.consolidateNow.res } },
+    handler: async (req, reply) => {
+      const open = await openWork(deps, req)
+      const result = await harness.consolidateNow(open)
+      // Nothing-eligible is a 202 union variant, not an error (03 §3.8): the frontier
+      // simply sits inside the active window. 409 stays for busy/closing works.
+      return reply.status(202).send(
+        result.kind === 'task'
+          ? result.task
+          : result.kind === 'applied'
+            ? {
+                applied: true as const,
+                sectionIds: result.sectionIds,
+                undoToken: result.undoToken,
+                undoDeadline: result.undoDeadline,
+              }
+            : { applied: false as const, reason: 'nothing-eligible' as const },
+      )
+    },
+  })
+
+  app.route({
+    method: 'POST',
+    url: '/api/works/:w/consolidations/:undoToken/undo',
+    handler: async (req, reply) => {
+      const open = await openWork(deps, req)
+      // Cancel-by-target runs BEFORE storage touches directories (02 §6.4); an
+      // unknown/expired token surfaces as the storage layer's typed 409.
+      await harness.undoWorkConsolidation(open, param(req, 'undoToken'))
+      return reply.status(204).send()
+    },
+  })
+
   // ---- runs / provenance (03 §3.9) -------------------------------------------------
   app.route({
     method: 'GET',

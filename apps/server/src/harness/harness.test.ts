@@ -12,6 +12,7 @@ import {
   type HarnessTestCtx,
   makeHarnessCtx,
   openWork,
+  seedFrozenSection,
   until,
   waitForTerminal,
 } from './testUtil.js'
@@ -852,6 +853,17 @@ describe('retry-after abort + spend guard (dedicated contexts)', () => {
       })
       expect(refused.statusCode).toBe(409)
       expect((refused.json() as { error: { code: string } }).error.code).toBe('spend_stop')
+
+      // The guard also covers submitBackground (05 §cost): a background enrich submit
+      // past the stop is refused too — not just the interactive lane.
+      const sectionId = await seedFrozenSection(stopper, work.id)
+      const refusedEnrich = await stopper.app.inject({
+        method: 'POST',
+        url: `/api/works/${work.id}/tasks`,
+        payload: { kind: 'enrich-section', sectionId },
+      })
+      expect(refusedEnrich.statusCode).toBe(409)
+      expect((refusedEnrich.json() as { error: { code: string } }).error.code).toBe('spend_stop')
       stopper.llm.scenario.assertDrained()
     } finally {
       await destroyHarnessCtx(stopper)

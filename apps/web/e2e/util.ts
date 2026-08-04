@@ -75,6 +75,103 @@ export async function createSnippet(
 }
 
 // ---------------------------------------------------------------------------
+// Stage-4 consolidation plumbing (docs/02 §6; docs/05 §6.2): settings patches,
+// scripted boundary/enrich responses, and API-level polling for the pipeline.
+// ---------------------------------------------------------------------------
+
+/** ~40 words of scene prose per snippet (no ---/*** lines — the scene-break heuristic
+ *  must stay cold so the boundary agent path is what these specs exercise). */
+export const PAGE =
+  'The storm pressed the town flat while the two of them worked the pump in turns, ' +
+  'counting strokes out loud, trading the handle at fifty, listening to the cellar fill ' +
+  'anyway, patient and dark and certain as the tide coming home.'
+
+/** A full consolidation settings block: the server PATCH replaces the whole settings
+ *  object (schema defaults refill omitted fields), so specs always spell out all of it. */
+export interface ConsolidationBlock {
+  activeWindowSnippets: number
+  activeWindowWords: number
+  maxFrontierSnippets: number
+  maxFrontierWords: number
+  debounceMs: number
+  undoGraceMs: number
+  mode: 'auto' | 'review'
+}
+
+export const MANUAL_CONSOLIDATION: ConsolidationBlock = {
+  activeWindowSnippets: 2,
+  activeWindowWords: 10,
+  maxFrontierSnippets: 6,
+  maxFrontierWords: 50_000,
+  debounceMs: 600_000, // manual-only: specs drive POST /consolidate themselves
+  undoGraceMs: 60_000,
+  mode: 'auto',
+}
+
+export async function patchConsolidation(
+  request: APIRequestContext,
+  workId: string,
+  consolidation: ConsolidationBlock,
+): Promise<void> {
+  const res = await request.patch(`/api/works/${workId}`, {
+    data: { settings: { consolidation } },
+  })
+  expect(res.ok()).toBe(true)
+}
+
+/** The boundary agent's tagged JSON response (07 boundaries.md; 02 §10.5). */
+export function boundariesBlock(cuts: Array<[afterSnippetId: string, title: string]>): string {
+  const boundaries = cuts.map(([afterSnippetId, title]) => ({
+    afterSnippetId,
+    kind: 'chapter',
+    title,
+  }))
+  return `<boundaries>\n${JSON.stringify({ boundaries })}\n</boundaries>`
+}
+
+/** The enrichment agent's tagged response (07 enrich.md). */
+export function enrichBlock(title: string, short: string, long: string): string {
+  return (
+    `<title>\n${title}\n</title>\n` +
+    `<summary-short>\n${short}\n</summary-short>\n` +
+    `<summary-long>\n${long}\n</summary-long>`
+  )
+}
+
+export interface SectionRowLite {
+  id: string
+  title: string | null
+  isLeaf: boolean
+  shortSummary: string | null
+  longSummary: string | null
+  stale: { short: boolean; long: boolean; illustration: boolean }
+}
+
+export async function listSections(
+  request: APIRequestContext,
+  workId: string,
+): Promise<SectionRowLite[]> {
+  const res = await request.get(`/api/works/${workId}/sections`)
+  expect(res.ok()).toBe(true)
+  return (await res.json()) as SectionRowLite[]
+}
+
+export async function listSnippets(
+  request: APIRequestContext,
+  workId: string,
+): Promise<Array<{ id: string; text: string }>> {
+  const res = await request.get(`/api/works/${workId}/snippets`)
+  expect(res.ok()).toBe(true)
+  return (await res.json()) as Array<{ id: string; text: string }>
+}
+
+/** Force an immediate consolidation evaluation (03 §3.8). */
+export async function consolidateNow(request: APIRequestContext, workId: string): Promise<void> {
+  const res = await request.post(`/api/works/${workId}/consolidate`)
+  expect(res.status(), await res.text()).toBe(202)
+}
+
+// ---------------------------------------------------------------------------
 // Mock-LLM scripting over the cross-process control routes (docs/09 §2.2/§2.3).
 // The step types come straight from @cowrite/mock-llm — plain JSON by design,
 // so the same shapes travel over POST /__mock/scenario. One source, no drift.

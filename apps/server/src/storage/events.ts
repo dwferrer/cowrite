@@ -17,6 +17,22 @@ export type StorageChange =
   | { type: 'snippet.updated'; snippetId: Ulid }
   | { type: 'snippet.removed'; snippetId: Ulid }
   | { type: 'section.changed'; sectionId: Ulid }
+  /** The section tree was restructured wholesale (consolidation apply/undo) — the
+   *  canonical union's refetch signal (03 §8.2). */
+  | { type: 'sections.restructured' }
+  /** Consolidation applied (§6.4): `undoToken` (= opId) drives the undo route;
+   *  `undoDeadline` (ISO) is when the grace window closes — the client's toast TTL. */
+  | {
+      type: 'consolidation.applied'
+      opId: string
+      sectionIds: Ulid[]
+      undoToken: string
+      undoDeadline: string
+    }
+  | { type: 'consolidation.undone'; opId: string; sectionIds: Ulid[] }
+  /** The op's grace window is finished — purged by expiry, superseded by a new apply,
+   *  or closed with the work. The client dismisses the matching undo toast. */
+  | { type: 'consolidation.finalized'; opId: string }
   | { type: 'enrichment.updated'; sectionId: Ulid; enrichment: EnrichmentName }
   | { type: 'world.updated'; entryId: Ulid }
   | { type: 'world.removed'; entryId: Ulid }

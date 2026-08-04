@@ -37,7 +37,10 @@ export const HarnessKnobs = z.object({
   totalTimeoutMs: z
     .object({
       high: z.number().int().positive().default(300_000), // whole model call, high lane
-      low: z.number().int().positive().default(120_000), // whole model call, low lane
+      // The low lane runs the reasoning-heavy background tasks (boundary decisions,
+      // enrichment); a reasoning model deliberating a whole chapter needs writing-lane
+      // headroom, so this matches the high lane rather than the old tight 120 s.
+      low: z.number().int().positive().default(300_000), // whole model call, low lane
     })
     .prefault({}),
   illustrationBudgetMs: z.number().int().positive().default(600_000), // whole illustration run
@@ -88,7 +91,10 @@ export const ModelEndpoint = z.object({
   baseUrl: z.url(), // ".../v1" — OpenAI-compatible root
   apiKey: z.string().default(''), // "" for keyless local servers
   model: z.string().min(1),
-  maxOutputTokens: z.number().int().positive().default(2048),
+  // Generous by default: reasoning models spend hidden reasoning tokens against this same
+  // budget before emitting content, so a tight ceiling truncates the visible answer. Cheap
+  // per-token models make the headroom nearly free; lower it in config for expensive ones.
+  maxOutputTokens: z.number().int().positive().default(8192),
   temperature: z.number().min(0).max(2).default(0.8),
   promptCostPerMTok: z.number().nonnegative().nullable().default(null),
   completionCostPerMTok: z.number().nonnegative().nullable().default(null),

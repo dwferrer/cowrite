@@ -17,6 +17,20 @@ import {
   IllustrationMeta as IllustrationMetaSchema,
   WorkMeta as WorkMetaSchema,
 } from '@cowrite/shared'
+import {
+  applyPlannedOp,
+  applyPlannedOpWithRollback,
+  computeEligiblePrefix,
+  DeferralBackoff,
+  effectiveThresholds,
+  heuristicBoundaryIds,
+  type PlannedBoundary,
+  planConsolidation,
+  purgeAppliedOp,
+  type ReplayResult,
+  replayPendingOp,
+  undoAppliedOp,
+} from './consolidation.js'
 import { StorageError } from './errors.js'
 import { type StorageChangeListener, StorageEvents, type Unsubscribe } from './events.js'
 import {
@@ -38,15 +52,18 @@ import {
   removeEntityRows,
   removeFileRow,
   toWorkRelative,
+  upsertSectionFromDisk,
   upsertSnippetFromDisk,
   upsertWorldEntryFromDisk,
 } from './index/ingest.js'
 import { fullRebuild } from './index/scan.js'
+import { type PendingOp, readPendingOp, writePendingOp } from './journal.js'
 import { readIfExists, sweepTmpFiles } from './lib/fsx.js'
 import { Mutex } from './lib/mutex.js'
 import {
-  cowriteDir,
+  frontierSnippetsDir,
   indexPath,
+  sectionsDir,
   workDir as workDirOf,
   workMetaPath,
   worldImageRelPath,
@@ -102,10 +119,10 @@ export class ReadOnlyError extends StorageError {
   }
 }
 
-/** Consolidation entry points exist on the interface but land in M1 Stage 4 (docs/10). */
+/** Interface-stable entry points whose subsystem has not landed yet (docs/10 stages). */
 export class NotImplementedError extends StorageError {
   constructor(what: string) {
-    super(`${what} is not implemented yet (M1 Stage 4)`, 'not_implemented')
+    super(`${what} is not implemented yet (see docs/10-roadmap.md)`, 'not_implemented')
     this.name = 'NotImplementedError'
   }
 }
@@ -120,6 +137,70 @@ export class WorkClosedError extends StorageError {
 export interface OpenWorkOptions {
   /** Lock tuning (test injection of refresh/staleness windows). */
   lock?: LockOptions
+  /**
+   * Sink for the §6.3 log-only consolidation notice ("long frontier — consider
+   * splitting manually"); NOT a WorkEvent — the client renders nothing in MVP.
+   * Defaults to console.warn.
+   */
+  onNotice?: (message: string) => void
+}
+
+// ---------------------------------------------------------------------------
+// Consolidation seam (02 §6.2–§6.4). The harness scheduler (05 §scheduler) is the ONE
+// caller: it debounces frontier writes, supplies the live-task guard ids, runs the
+// boundary agent, and drives apply/undo. Storage owns the evaluation (thresholds,
+// active window, eligible prefix), the scene-break heuristic, the in-memory deferral
+// back-off, and the journaled apply/undo with its grace window.
+// ---------------------------------------------------------------------------
+
+export interface ConsolidationGuards {
+  /** Snippet ids targeted by queued/running tasks — excluded from the prefix (05 §5.6). */
+  taskTargetIds: string[]
+  /** "Consolidate now": skip the threshold gate; the eligibility guards still apply. */
+  force?: boolean
+}
+
+export type ConsolidationEvaluation =
+  /** Below thresholds, or no eligible prefix after exclusions — nothing to do. */
+  | { status: 'idle' }
+  /** Over thresholds with an eligible prefix: run the boundary agent over these ids. */
+  | { status: 'needs-boundaries'; eligibleSnippetIds: string[] }
+  /** A §6.3 rule-1 scene-break split applied immediately — no boundary agent needed. */
+  | ({ status: 'applied' } & ConsolidationApplied)
+
+export interface ConsolidationApplied {
+  /** The journal opId — doubles as the undo token (02 §6.4, 03 §3.8). */
+  opId: string
+  /** The newly created (frozen) section ids, in document order. */
+  sectionIds: string[]
+  /** ISO instant the undo grace window closes (§6.4 step 4). */
+  undoDeadline: string
+}
+
+export type ApplyBoundariesResult =
+  | ({ ok: true } & ConsolidationApplied)
+  /** §6.3: every proposed boundary fell outside the eligible prefix (or none were
+   *  proposed) — consolidation defers and the in-memory back-off grows. */
+  | { ok: false; deferred: true; droppedBoundaries: number }
+
+/** The op currently inside its undo grace window, if any (drives 03 §3.8's undo route). */
+export interface PendingConsolidation {
+  opId: string
+  sectionIds: string[]
+  undoDeadline: string | null
+}
+
+/** Thrown by undoConsolidation when the token is unknown, expired, or already undone —
+ *  the API layer maps the 'conflict' code to the 409 of 03 §3.8. */
+export class ConsolidationUndoExpiredError extends StorageError {
+  constructor(readonly opId: string) {
+    super(
+      `consolidation ${opId} cannot be undone: the undo grace window has expired or the token is unknown (spec 02 §6.4)`,
+      'conflict',
+      { kind: 'consolidation', id: opId },
+    )
+    this.name = 'ConsolidationUndoExpiredError'
+  }
 }
 
 export interface WorkHandle {
@@ -144,6 +225,10 @@ export interface WorkHandle {
   // (never a conflict result: the conflict shape cannot represent a missing target);
   // the API layer maps it to 404.
   listSections(): SectionRow[]
+  /** THE §6.5 staleness query (index-derived): scope 'summary' returns leaf sections
+   *  with stale/missing summaries — the enrichment sweep's queue; 'any' (default)
+   *  includes illustration staleness for Stage 5. */
+  staleSections(scope?: 'summary' | 'any'): SectionRow[]
   /** One index row by id (point lookup, no file I/O); null for an unknown section. */
   getSection(sectionId: string): SectionRow | null
   getSectionContent(sectionId: string): Promise<{ text: string; contentHash: string }>
@@ -168,7 +253,13 @@ export interface WorkHandle {
     sectionId: string,
     kind: 'short' | 'long',
     text: string,
-    opts: { source: 'user' | 'agent'; runId?: string },
+    opts: {
+      source: 'user' | 'agent'
+      runId?: string
+      /** Agent commits: the ASSEMBLY-TIME contentHash the summary was derived from
+       *  (02 §6.5); absent (user edits) the current content.md is hashed at commit. */
+      sourceHash?: string
+    },
   ): Promise<EnrichmentMeta>
   putIllustration(sectionId: string, png: Uint8Array, meta: IllustrationMeta): Promise<void>
   suppressIllustration(sectionId: string): Promise<void>
@@ -213,13 +304,44 @@ export interface WorkHandle {
   setEditingSnippet(snippetId: string | null): void
   getEditingSnippet(): string | null
 
-  // consolidation — API shape is stable now; the engine lands in M1 Stage 4 (docs/10)
-  maybeConsolidate(guards: { taskTargetIds: string[] }): void
+  // consolidation (§6.2–§6.4). All three run under the work mutex; applying while a
+  // previous op is still inside its grace window finalizes (purges) that op first —
+  // pending-ops.json holds exactly one op (§5.2).
+  /**
+   * The §6.2 trigger + eligibility evaluation, called by the scheduler after its 30 s
+   * debounce (and by "Consolidate now" with `force`). When the eligible prefix contains
+   * explicit scene-break markers, the split is applied immediately (§6.3 rule 1) and
+   * `status: 'applied'` is returned; otherwise the caller runs the boundary agent over
+   * `eligibleSnippetIds` and feeds its proposal to `applyBoundaries`.
+   */
+  maybeConsolidate(guards: ConsolidationGuards): Promise<ConsolidationEvaluation>
+  /**
+   * Validate a BoundaryProposal against the CURRENT eligible prefix (§6.3: out-of-prefix
+   * boundaries are dropped; all-dropped/none ⇒ deferral) and run the §6.4 journaled
+   * apply. Emits `sections.restructured` + `consolidation.applied` and starts the undo
+   * grace timer. The §6.6 conflict story is fold-in, not conflict: snippets edited
+   * between plan and apply are re-read under the mutex and the newer text wins.
+   */
   applyBoundaries(
     proposal: BoundaryProposal,
-    opts: { boundaryRunId: string | null },
-  ): { opId: string }
-  undoConsolidation(opId: string): void
+    opts: { boundaryRunId: string | null; taskTargetIds?: string[] },
+  ): Promise<ApplyBoundariesResult>
+  /**
+   * Reverse-replay an applied op inside its grace window (§6.4). CONTRACT: the caller
+   * (harness) must first cancel queued/running enrich-section / illustrate-section
+   * tasks targeting `pendingConsolidation().sectionIds` via its cancel-by-target hook
+   * (05 §6.2) — storage never calls the harness, and an enrichment run must never
+   * write into a directory being deleted. Throws ConsolidationUndoExpiredError (409)
+   * when the token is unknown or the window is gone.
+   */
+  undoConsolidation(opId: string): Promise<void>
+  /** The op currently inside its undo grace window; null when idle. */
+  pendingConsolidation(): Promise<PendingConsolidation | null>
+  /**
+   * Record a boundary-agent deferral that never reached applyBoundaries (garbage or
+   * unreachable endpoint, 05 §6.5): grows the same in-memory back-off (§6.3).
+   */
+  noteBoundaryDeferral(reason: string): void
 
   // world (§2.6). upsert honors the optional §6.6-style baseHash token (body hash);
   // without one it stays last-write-wins, and a conflict is returned, never thrown.
@@ -317,6 +439,15 @@ export async function openWork(
   const events = new StorageEvents()
   const mutex = new Mutex()
   const reservations = new OrderKeyReservations()
+  const backoff = new DeferralBackoff()
+  const onNotice = opts.onNotice ?? ((message: string) => console.warn(message))
+  let graceTimer: NodeJS.Timeout | null = null
+  const clearGraceTimer = (): void => {
+    if (graceTimer !== null) {
+      clearTimeout(graceTimer)
+      graceTimer = null
+    }
+  }
 
   const callerStandDown = opts.lock?.onStandDown
   const acquired = await WorkLock.acquire(dir, {
@@ -330,14 +461,12 @@ export async function openWork(
   if (lock === null) readOnly = true
 
   // §11 open lifecycle (writer only — a read-only opener must not write anything the
-  // live writer owns): sweep tmp orphans (§9.1), finalize crashed runs (§10.7), then
-  // open-or-rebuild the index (§7.3). Deviation from §11 pending Stage 4: the
-  // pending-ops.json journal replay slots in here once consolidation (the only journal
-  // writer) exists — until then there is never a journal to replay.
+  // live writer owns): sweep tmp orphans (§9.1), REPLAY the pending-ops journal (§9.2 —
+  // before the index opens or rebuilds, so both see the post-replay tree), finalize
+  // crashed runs (§10.7), then open-or-rebuild the index (§7.3).
   const idxPath = indexPath(dir)
   const openOrRebuildIndex = async (): Promise<IndexDb> => {
     if (!readOnly) {
-      await sweepTmpFiles(dir, true)
       const { finalized } = await finalizeCrashedRuns(dir)
       if (needsRebuild(idxPath)) {
         await removeIndexFiles(idxPath)
@@ -378,7 +507,12 @@ export async function openWork(
   }
 
   let db: IndexDb
+  let replayed: ReplayResult | null = null
   try {
+    if (!readOnly) {
+      await sweepTmpFiles(dir, true)
+      replayed = await replayPendingOp(dir, workMeta.settings.consolidation.undoGraceMs)
+    }
     db = await openOrRebuildIndex()
   } catch (err) {
     // A failed open must not leak the held lock, its 30 s refresh timer, or a db
@@ -401,6 +535,108 @@ export async function openWork(
       await guardWritable()
       return fn()
     })
+
+  // -- consolidation machinery (§6.2–§6.4) -----------------------------------------
+
+  const deepestKind = (): string =>
+    workMeta.levelScheme[workMeta.levelScheme.length - 1] ?? 'chapter'
+  /** A kind outside the level scheme (agent error) falls back to the deepest level. */
+  const normalizeKind = (kind: string): string =>
+    workMeta.levelScheme.includes(kind) ? kind : deepestKind()
+
+  const recordDeferral = (reason: string): void => {
+    const { noticeDue } = backoff.recordDeferral(workMeta.settings.consolidation.debounceMs)
+    if (noticeDue) {
+      // §6.3: a LOG-ONLY notice, deliberately not a WorkEvent — the client renders
+      // nothing in MVP.
+      onNotice(
+        `work '${slug}': consolidation deferred ${backoff.consecutiveDeferrals}x (${reason}) — ` +
+          'long frontier; consider splitting manually (spec 02 §6.3)',
+      )
+    }
+  }
+
+  /** (Re)arm the §6.4 grace-expiry timer for an applied op; purges on the deadline. */
+  const scheduleGraceExpiry = (op: PendingOp): void => {
+    clearGraceTimer()
+    const deadline = op.expiresAt === null ? Date.now() : Date.parse(op.expiresAt)
+    const timer = setTimeout(
+      () => {
+        graceTimer = null
+        void mutate(async () => {
+          const current = await readPendingOp(dir)
+          if (current !== null && current.opId === op.opId && current.phase === 'applied') {
+            await purgeAppliedOp(dir, current)
+            events.emit({ type: 'consolidation.finalized', opId: current.opId })
+          }
+        }).catch(() => {
+          // closed or lost the lock mid-expiry: the next opener resumes/purges (§9.2)
+        })
+      },
+      Math.max(0, deadline - Date.now()),
+    )
+    timer.unref?.()
+    graceTimer = timer
+  }
+
+  /** Index update for an applied op: consumed snippets out, new sections in (reusing
+   *  the ingest loaders — a full rebuild reproduces this state, §7.3/§8). */
+  const indexAppliedOp = async (applied: PendingOp): Promise<void> => {
+    for (const section of applied.sections) {
+      for (const snip of section.snippets) removeEntityRows(db, 'snippet', snip.snippetId)
+    }
+    for (const section of applied.sections) {
+      await upsertSectionFromDisk(db, dir, path.join(sectionsDir(dir), section.dirName))
+    }
+  }
+
+  /** Plan + journal + §6.4 apply for validated boundaries. Caller holds the mutex. */
+  const applyConsolidation = async (
+    files: SnippetFile[],
+    boundaries: PlannedBoundary[],
+    boundaryRunId: string | null,
+  ): Promise<ConsolidationApplied> => {
+    // pending-ops.json holds exactly one op (§5.2): applying while a previous op is
+    // still inside its grace window finalizes (purges) that op first. A previous op
+    // still at 'planned' (a live-process apply crashed mid-way and its rollback failed
+    // too) must be ROLLED FORWARD first — purging a planned journal would delete the
+    // staged originals and let the same frontier prose consolidate twice (§9.2).
+    const previous = await readPendingOp(dir)
+    if (previous !== null) {
+      clearGraceTimer()
+      let finished = previous
+      if (previous.phase === 'planned') {
+        finished = await applyPlannedOp(dir, previous, workMeta.settings.consolidation.undoGraceMs)
+        await indexAppliedOp(finished)
+        events.emit({ type: 'sections.restructured' })
+      }
+      await purgeAppliedOp(dir, finished)
+      events.emit({ type: 'consolidation.finalized', opId: finished.opId })
+    }
+    const planned = await planConsolidation(dir, files, boundaries, { boundaryRunId })
+    await writePendingOp(dir, planned)
+    // A thrown apply rolls back immediately (reverse replay); only if the rollback
+    // fails too does the planned journal survive for openWork's §9.2 replay.
+    const applied = await applyPlannedOpWithRollback(
+      dir,
+      planned,
+      workMeta.settings.consolidation.undoGraceMs,
+    )
+    await indexAppliedOp(applied)
+    backoff.reset()
+    scheduleGraceExpiry(applied)
+    const sectionIds = applied.sections.map((s) => s.sectionId)
+    const undoDeadline = applied.expiresAt ?? new Date().toISOString()
+    events.emit({ type: 'sections.restructured' })
+    events.emit({
+      type: 'consolidation.applied',
+      opId: applied.opId,
+      sectionIds,
+      undoToken: applied.opId,
+      undoDeadline,
+    })
+    return { opId: applied.opId, sectionIds, undoDeadline }
+  }
 
   /** Re-index one snippet. Callers that already know the written file (revise/restore
    *  return it) pass it in; otherwise readSnippet resolves it (index-hint fast path). */
@@ -493,6 +729,7 @@ export async function openWork(
 
     // -- sections -------------------------------------------------------------
     listSections: () => db.listSectionRows(),
+    staleSections: (scope) => db.staleSections(scope),
     getSection: (id) => db.getSection(id),
     getSectionContent: (id) => sections.getSectionContent(dir, id, sectionDirHint(id)),
     replaceSectionContent: (id, text, o) =>
@@ -623,15 +860,106 @@ export async function openWork(
     },
     getEditingSnippet: () => editingSnippetId,
 
-    // -- consolidation (M1 Stage 4) ------------------------------------------------
-    maybeConsolidate: () => {
-      throw new NotImplementedError('maybeConsolidate')
+    // -- consolidation (§6.2–§6.4) ---------------------------------------------------
+    maybeConsolidate: (guards) =>
+      mutate(async (): Promise<ConsolidationEvaluation> => {
+        const settings = workMeta.settings.consolidation
+        // The threshold gate answers from INDEX rows (§7.2) — the debounced evaluation
+        // fires on every quiet frontier, and an under-threshold pass must cost zero
+        // snippet file reads. Full files are only read once the gate is passed.
+        const rows = db.listSnippetRows()
+        const thresholds = effectiveThresholds(settings, backoff.thresholdMultiplier)
+        const totalWords = rows.reduce((n, r) => n + r.wordCount, 0)
+        const over =
+          rows.length > thresholds.maxFrontierSnippets || totalWords > thresholds.maxFrontierWords
+        if (!over && guards.force !== true) return { status: 'idle' }
+        const files = await snippets.listSnippetFiles(dir)
+        const prefix = computeEligiblePrefix(files, settings, {
+          taskTargetIds: guards.taskTargetIds,
+          editingSnippetId,
+        })
+        if (prefix.length === 0) return { status: 'idle' }
+        // §6.3 rule 1: explicit scene-break markers split unconditionally, no agent —
+        // never gated by the deferral back-off below.
+        const breakIds = heuristicBoundaryIds(prefix)
+        if (breakIds.length > 0) {
+          const kind = deepestKind()
+          const applied = await applyConsolidation(
+            files,
+            breakIds.map((afterSnippetId) => ({ afterSnippetId, kind, title: null })),
+            null, // pure-heuristic break: boundaryRunId is null in provenance (§10.5)
+          )
+          return { status: 'applied', ...applied }
+        }
+        // §6.3 temporal deferral back-off: after a deferral, no new boundary run until
+        // its not-before deadline passes AND the eligible prefix has grown (re-running
+        // the agent over the identical prefix is a pure spend loop). Force bypasses.
+        if (guards.force !== true && backoff.blocksBoundaryRun(prefix.length)) {
+          return { status: 'idle' }
+        }
+        backoff.noteEligiblePrefix(prefix.length)
+        return { status: 'needs-boundaries', eligibleSnippetIds: prefix.map((f) => f.meta.id) }
+      }),
+    applyBoundaries: (proposal, o) =>
+      mutate(async (): Promise<ApplyBoundariesResult> => {
+        const files = await snippets.listSnippetFiles(dir)
+        // §6.3 validation against the CURRENT prefix: the window may have moved while
+        // the boundary agent was thinking; out-of-prefix boundaries are dropped.
+        const prefix = computeEligiblePrefix(files, workMeta.settings.consolidation, {
+          taskTargetIds: o.taskTargetIds ?? [],
+          editingSnippetId,
+        })
+        const prefixIds = new Set(prefix.map((f) => f.meta.id))
+        const kept: PlannedBoundary[] = proposal.boundaries
+          .filter((b) => prefixIds.has(b.afterSnippetId))
+          .map((b) => ({
+            afterSnippetId: b.afterSnippetId,
+            kind: normalizeKind(b.kind),
+            title: b.title,
+          }))
+        if (kept.length === 0) {
+          backoff.noteEligiblePrefix(prefix.length)
+          recordDeferral(
+            proposal.boundaries.length === 0
+              ? 'the boundary agent proposed no boundaries'
+              : 'every proposed boundary fell outside the eligible prefix',
+          )
+          return { ok: false, deferred: true, droppedBoundaries: proposal.boundaries.length }
+        }
+        const applied = await applyConsolidation(files, kept, o.boundaryRunId)
+        return { ok: true, ...applied }
+      }),
+    undoConsolidation: (opId) =>
+      mutate(async () => {
+        const op = await readPendingOp(dir)
+        if (op === null || op.opId !== opId || op.phase !== 'applied') {
+          throw new ConsolidationUndoExpiredError(opId)
+        }
+        clearGraceTimer()
+        // The harness has already cancelled enrich/illustrate tasks targeting these
+        // sections (interface contract above) — safe to delete the directories.
+        await undoAppliedOp(dir, op)
+        const sectionIds = op.sections.map((s) => s.sectionId)
+        for (const section of op.sections) removeEntityRows(db, 'section', section.sectionId)
+        for (const section of op.sections) {
+          for (const snip of section.snippets) {
+            await upsertSnippetFromDisk(db, dir, path.join(frontierSnippetsDir(dir), snip.fileName))
+          }
+        }
+        events.emit({ type: 'consolidation.undone', opId, sectionIds })
+        events.emit({ type: 'sections.restructured' })
+      }),
+    pendingConsolidation: async () => {
+      const op = await readPendingOp(dir)
+      if (op === null || op.phase !== 'applied') return null
+      return {
+        opId: op.opId,
+        sectionIds: op.sections.map((s) => s.sectionId),
+        undoDeadline: op.expiresAt,
+      }
     },
-    applyBoundaries: () => {
-      throw new NotImplementedError('applyBoundaries')
-    },
-    undoConsolidation: () => {
-      throw new NotImplementedError('undoConsolidation')
+    noteBoundaryDeferral: (reason) => {
+      recordDeferral(reason)
     },
 
     // -- world -----------------------------------------------------------------------
@@ -787,9 +1115,18 @@ export async function openWork(
       mutex.runExclusive(async () => {
         if (closed) return
         closed = true
+        clearGraceTimer()
         if (lock?.isValid) {
-          // §9.4: the undo grace window does not survive a close.
-          await fsp.rm(path.join(cowriteDir(dir), 'undo'), { recursive: true, force: true })
+          // §9.4: an APPLIED op's undo grace window does not survive a close — its
+          // staging is purged and the journal deleted. A 'planned' journal (a crashed
+          // apply awaiting §9.2 replay) is PRESERVED, staged files and all: purging it
+          // would delete the originals and let the next open consolidate frontier
+          // prose twice; the next open rolls it forward instead.
+          const op = await readPendingOp(dir).catch(() => null)
+          if (op !== null && op.phase === 'applied') {
+            await purgeAppliedOp(dir, op)
+            events.emit({ type: 'consolidation.finalized', opId: op.opId })
+          }
         }
         await lock?.release()
         db.close()
@@ -805,6 +1142,15 @@ export async function openWork(
       // stops its refresh timer, and closes the db before we rethrow.
       await handle.close().catch(() => {})
       throw err
+    }
+    // §9.2: an op replayed to — or found at — 'applied' resumes its grace timer here
+    // (a rolled-forward op gets a fresh full window; 'purged'/'undo-completed' need
+    // nothing further).
+    if (
+      replayed !== null &&
+      (replayed.outcome === 'grace-resumed' || replayed.outcome === 'rolled-forward')
+    ) {
+      scheduleGraceExpiry(replayed.op)
     }
   }
 

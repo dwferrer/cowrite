@@ -33,8 +33,12 @@ a complete alternate front-end to the storage layer and, later, the agent harnes
 tool for live testing against real models without going through the web app. Stage 1: works /
 snippets / situation / world / search / reconcile / rebuild. Stage 3 adds `continue`, `instruct`,
 `quick-edit` (streaming to stdout), `prompt render` (dump the exact assembled prompt, no model
-call), and `context preview` (fidelity map + token counts). Stages 4–5 add `consolidate`,
-`enrich`, and `illustrate`. Anything the web app can trigger, the CLI can trigger headlessly.
+call), and `context preview` (fidelity map + token counts). Stage 4 adds `consolidate [--now]`
+(evaluate the 02 §6.2 trigger / force the boundary agent), `undo-consolidation` (the grace-window
+undo), and `enrich [--section <id>]` (force one section or every stale one); `work info` grows
+the fold-relevant fields (enrichment presence/staleness per frozen section, thresholds, pending
+undo token). Stage 5 adds `illustrate`. Anything the web app can trigger, the CLI can trigger
+headlessly.
 
 ### Stage 2 — API + web shell
 Fastify routes and the SSE event bus per 03 (canonical `WorkEvent` union, ring buffer + resume),

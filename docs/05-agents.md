@@ -503,15 +503,22 @@ All presence conditions are server-observable — SSE subscription is the proxy 
 no browser-focus signal exists anywhere in the design.
 
 - **Consolidation applied** (storage `onChange` → `consolidation.applied`): enqueue
-  `enrich-section` for each new section; enqueue `illustrate-section` after its enrich
-  succeeds.
+  `enrich-section` for each new section — **routed through the same per-window sweep budget**
+  as everything else (one spend bound); a batch larger than the remaining budget is drained by
+  later sweeps, because missing summaries count as stale (02 §staleness). Enqueueing
+  `illustrate-section` after a successful enrich is **Stage 5** (docs/10) — not wired in M1.
 - **Staleness sweep**: when the interactive lane has been empty **60 s** and the work has ≥ 1
-  SSE subscriber, enqueue refreshes for stale enrichments/illustrations — where *missing* on a
-  frozen, non-suppressed section counts as stale (02 §staleness) — capped at **4 per sweep** to
-  bound surprise API spend.
+  SSE subscriber, enqueue refreshes for stale summaries (storage's `staleSections('summary')`
+  query) — where *missing* on a frozen leaf section counts as stale (02 §staleness) — capped at
+  **4 per sweep window** to bound surprise API spend. **Illustration staleness is deliberately
+  skipped until Stage 5** lands the `illustrate-section` pipeline (sweeping it now would
+  enqueue a kind with no handler). A **failed enrich arms a per-section cooldown**: exponential
+  not-before (base = one sweep window, doubling per consecutive failure, capped ~1 h), reset on
+  section content change or a later success — a persistently failing endpoint cannot spin the
+  sweep into a spend loop.
 - **`enrichment_wanted`** (engine's in-process channel, 03 §in-process channels): the model
   expanded an un-enriched section mid-task; the scheduler enqueues an enrich under the same
-  sweep cap.
+  sweep cap (and the same failure cooldown).
 - **Consolidation undo**: the scheduler exposes `cancelByTarget(sectionIds)`; undo cancels
   queued/running enrich/illustrate tasks for the un-frozen sections *before* directories are
   touched (02 §undo).

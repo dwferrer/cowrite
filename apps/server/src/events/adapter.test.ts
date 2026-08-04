@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { SectionRow, SnippetDto, type WorkEvent } from '@cowrite/shared'
+import { SectionRow, SnippetDto, type WorkEvent, WorkSettings } from '@cowrite/shared'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { StorageChangeListener } from '../storage/events.js'
 import type { SectionRow as IndexSectionRow } from '../storage/index/db.js'
@@ -169,6 +169,60 @@ describe('storage → SSE adapter', () => {
     await drain()
     expect(wire).toHaveLength(0)
     expect(local.map((e) => e.type)).toEqual(['work.changed'])
+  })
+
+  it('maps consolidation apply/undo onto the canonical rows, hydrating the toast title', async () => {
+    // Shrink the active window so the fixture's 3-snippet frontier has an eligible
+    // prefix (02 §6.2), then drive a real apply → undo through the handle.
+    await handle.updateWork({
+      settings: WorkSettings.parse({
+        consolidation: { activeWindowSnippets: 1, activeWindowWords: 1 },
+      }),
+    })
+    const applied = await handle.applyBoundaries(
+      { boundaries: [{ afterSnippetId: FIX.snip1, kind: 'chapter', title: 'The Confrontation' }] },
+      { boundaryRunId: FIX.run1 },
+    )
+    if (!applied.ok) throw new Error('expected ok apply')
+    await drain()
+    // work.changed stays local; the consolidation pair rides the wire in commit order
+    expect(wire.map((e) => e.type)).toEqual(['sections.restructured', 'consolidation.applied'])
+    expect(wire[1]).toEqual({
+      type: 'consolidation.applied',
+      sectionIds: applied.sectionIds,
+      title: 'The Confrontation', // hydrated from the frozen section row
+      undoToken: applied.opId,
+      undoDeadline: applied.undoDeadline, // the client toast's TTL source
+    })
+
+    wire.length = 0
+    await handle.undoConsolidation(applied.opId)
+    await drain()
+    expect(wire).toEqual([
+      { type: 'consolidation.undone', sectionIds: applied.sectionIds },
+      { type: 'sections.restructured' },
+    ])
+  })
+
+  it('maps consolidation.finalized (early-finalize by a new apply) onto the wire', async () => {
+    await handle.updateWork({
+      settings: WorkSettings.parse({
+        consolidation: { activeWindowSnippets: 1, activeWindowWords: 1 },
+      }),
+    })
+    const first = await handle.applyBoundaries(
+      { boundaries: [{ afterSnippetId: FIX.snip1, kind: 'chapter', title: 'First' }] },
+      { boundaryRunId: null },
+    )
+    if (!first.ok) throw new Error('expected ok first apply')
+    const second = await handle.applyBoundaries(
+      { boundaries: [{ afterSnippetId: FIX.snip2, kind: 'chapter', title: 'Second' }] },
+      { boundaryRunId: null },
+    )
+    if (!second.ok) throw new Error('expected ok second apply')
+    await drain()
+    // the superseded op's finalized row rides the wire — the client dismisses its toast
+    expect(wire).toContainEqual({ type: 'consolidation.finalized', opId: first.opId })
   })
 
   it('publishes in commit order even though hydration is async', async () => {

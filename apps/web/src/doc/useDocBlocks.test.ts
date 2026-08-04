@@ -52,15 +52,20 @@ describe('buildBlocks', () => {
     ).toMatchSnapshot()
   })
 
-  it('renders every leaf at full while no summaries exist (Stage 2 graceful degradation)', () => {
+  it('degrades summary-less leaves by the 04 §5.3 matrix: near ones full, far ones name', () => {
+    // 20 bare leaves, d=19..0: base full/long (d≤5) degrade to FULL (no summaries);
+    // base short/name (d≥6) degrade to NAME — a NameCard renders from the title alone.
     const sections = Array.from({ length: 20 }, (_, i) => chapter(i + 1))
     const blocks = buildBlocks(sections, [], {})
     const bodies = blocks.filter((b) => b.kind === 'sectionBody')
-    expect(bodies).toHaveLength(20)
+    expect(bodies).toHaveLength(6)
     for (const b of bodies) {
       if (b.kind === 'sectionBody') expect(b.fold).toBe('full')
     }
-    expect(blocks.some((b) => b.kind === 'nameCard')).toBe(false)
+    const cards = blocks.filter((b) => b.kind === 'nameCard')
+    expect(cards).toHaveLength(14)
+    // name cards carry their document ordinal so untitled ones read "Chapter N"
+    expect(cards.every((b) => b.kind === 'nameCard' && b.ordinal >= 1)).toBe(true)
   })
 
   it('applies the fold ladder once summaries exist, and header/body stay separate blocks', () => {
@@ -132,7 +137,8 @@ describe('estimateBlockSize', () => {
 
   it('uses fixed sizes for chrome blocks', () => {
     expect(estimateBlockSize({ kind: 'frontierBar', key: 'frontier' })).toBe(88)
-    expect(estimateBlockSize({ kind: 'nameCard', key: 'n:x', section: chapter(1) })).toBe(96)
+    expect(estimateBlockSize({ kind: 'nameCard', key: 'n:x', section: chapter(1), ordinal: 1 })) //
+      .toBe(96)
   })
 })
 

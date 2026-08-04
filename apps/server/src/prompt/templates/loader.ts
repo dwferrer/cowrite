@@ -29,11 +29,10 @@ export const TEMPLATE_NAMES = [
 export type TemplateName = (typeof TEMPLATE_NAMES)[number]
 
 /**
- * The templates whose bytes actually drive interactive-run prompts — exactly what
- * `promptsHash` covers. `enrich`/`boundaries` are loaded but NOT hashed: until Stage 4
- * wires the background producers, their bytes drive nothing, and hashing them would
- * attribute phantom cache breaks to wording that never reached a model. Stage 4 must
- * extend this list (or introduce a per-lane hash) when they start driving bytes.
+ * The templates whose bytes actually drive run prompts — exactly what `promptsHash`
+ * covers. `enrich`/`boundaries` joined the set with the Stage-4 background handlers
+ * (backgroundTasks.ts): their bytes now reach the low model, so wording edits must be
+ * attributable in run meta like every other template.
  */
 export const PROMPT_DRIVING_TEMPLATES = [
   'system',
@@ -42,6 +41,8 @@ export const PROMPT_DRIVING_TEMPLATES = [
   'instructed-continue-task',
   'quick-edit',
   'quick-edit-task',
+  'enrich',
+  'boundaries',
   'refresh',
   'repair',
 ] as const satisfies readonly TemplateName[]

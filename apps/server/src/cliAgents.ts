@@ -1,6 +1,13 @@
 import process from 'node:process'
 import type { MockLlm } from '@cowrite/mock-llm'
-import type { AppConfig, RunArtifact, RunEvent, WorkEvent, WorkEventOf } from '@cowrite/shared'
+import type {
+  AppConfig,
+  RunArtifact,
+  RunEvent,
+  Task,
+  WorkEvent,
+  WorkEventOf,
+} from '@cowrite/shared'
 import { RunEvent as RunEventSchema } from '@cowrite/shared'
 import { formatConfigIssues, resolveEffectiveConfig } from './config/effective.js'
 import { engineFor } from './context/routes.js'
@@ -10,6 +17,7 @@ import { AgentHarness } from './harness/service.js'
 import type { InteractiveSpec } from './harness/tasks.js'
 import { type OpenWork, WorkRegistry } from './http/workRegistry.js'
 import type { LaneDeps } from './models/lanes.js'
+import type { SectionRow } from './storage/index/db.js'
 import { readJsonlBoundaryLines, readJsonlTailLines } from './storage/lib/fsx.js'
 import { wordCount } from './storage/lib/hash.js'
 import { shortId } from './storage/lib/paths.js'
@@ -578,4 +586,319 @@ export async function runsShowCommand(
   const events = await open.handle.readRun(runId) // RunNotFoundError → message
   options.out(`run ${runId} — ${events.length} event(s)\n`)
   for (const event of events) options.out(`${formatRunEvent(event, options)}\n`)
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 commands (docs/10 §Stage 1 dev-CLI note): consolidate / undo-consolidation /
+// enrich — the same harness/scheduler code paths as POST /consolidate, the undo route,
+// and POST /tasks {kind:"enrich-section"} (03 §3.7–§3.8).
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const MOCK_ENRICH =
+  '<title>\nMock Chapter\n</title>\n' +
+  '<summary-short>\nA deterministic mock summary of the frozen chapter.\n</summary-short>\n' +
+  '<summary-long>\nThe mock model summarizes the frozen chapter in one steady paragraph, ' +
+  'deterministic enough for demos and tests alike.\n</summary-long>'
+
+function scriptMockEnrich(llm: MockLlm, count: number): void {
+  for (let i = 0; i < count; i++) llm.scenario.respond(MOCK_ENRICH)
+}
+
+/**
+ * One deterministic mid-prefix cut — the mock boundary agent's whole personality. The
+ * matching enrich response is scripted HERE, with the proposal: the scheduler enqueues
+ * the enrich the instant the proposal applies, long before the CLI's event polling
+ * observes it, so scripting later would lose the race to an unscripted mock request.
+ * One boundary ⇒ exactly one section ⇒ exactly one enrich.
+ */
+function scriptMockBoundaryCycle(llm: MockLlm, eligibleSnippetIds: readonly string[]): void {
+  const cut = eligibleSnippetIds[Math.floor((eligibleSnippetIds.length - 1) / 2)]
+  const proposal = {
+    boundaries: [{ afterSnippetId: cut, kind: 'chapter', title: 'Mock Chapter' }],
+  }
+  llm.scenario.respond(`<boundaries>\n${JSON.stringify(proposal)}\n</boundaries>`)
+  scriptMockEnrich(llm, 1)
+}
+
+/** THE CLI spelling of one summary slot's presence + staleness (02 §6.5: missing counts
+ *  as stale): `ok` current, `stale` needs the sweep, `missing` never landed. Shared by
+ *  `enrichmentBadge` (cli.ts), the enrich status lines, and `needsEnrichment`. */
+export function summarySlotStatus(text: string | null, stale: boolean): 'ok' | 'stale' | 'missing' {
+  return text === null ? 'missing' : stale ? 'stale' : 'ok'
+}
+
+/** True when either summary slot is not `ok` — 'work info's needing-enrichment count. */
+export function needsEnrichment(row: SectionRow): boolean {
+  return (
+    summarySlotStatus(row.shortSummary, row.shortSummaryStale) !== 'ok' ||
+    summarySlotStatus(row.longSummary, row.longSummaryStale) !== 'ok'
+  )
+}
+
+function enrichmentStatusLine(row: SectionRow | null, sectionId: string): string {
+  if (row === null) return `  section ${sectionId}: (gone)`
+  const short = summarySlotStatus(row.shortSummary, row.shortSummaryStale)
+  const long = summarySlotStatus(row.longSummary, row.longSummaryStale)
+  return (
+    `  ${row.kind} "${row.title ?? '(untitled)'}"  #${shortId(row.id)}  ` +
+    `short ${short}, long ${long}`
+  )
+}
+
+/** Wait for the post-consolidation enrich tasks on these sections to settle, then print
+ *  one status line per section. Quiet failures stay quiet (05 §6.5) — a missing summary
+ *  simply reads `missing` and the staleness sweep will retry later. */
+async function reportEnrichment(
+  rt: CliRuntime,
+  open: OpenWork,
+  sectionIds: readonly string[],
+  out: CliWrite,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const wanted = new Set(sectionIds)
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const enriched = sectionIds.every((id) => {
+      const row = open.handle.getSection(id)
+      return row !== null && row.shortSummary !== null && row.longSummary !== null
+    })
+    if (enriched) break
+    const live = rt.harness
+      .list(open)
+      .some(
+        (t) =>
+          t.spec.kind === 'enrich-section' &&
+          wanted.has(t.spec.sectionId) &&
+          (t.status === 'queued' || t.status === 'running'),
+      )
+    if (!live || Date.now() > deadline) break // failed/unconfigured: report what exists
+    await sleep(50)
+  }
+  out(`enrichment (${sectionIds.length} section(s)):\n`)
+  for (const id of sectionIds) out(`${enrichmentStatusLine(open.handle.getSection(id), id)}\n`)
+}
+
+export interface ConsolidateResult {
+  status: 'idle' | 'needs-boundaries' | 'applied' | 'deferred' | 'failed' | 'nothing-eligible'
+  sectionIds: string[]
+  undoToken: string | null
+}
+
+export interface ConsolidateOptions {
+  /** Force the evaluation (skip the threshold gate) and run the boundary agent. */
+  now: boolean
+  out: CliWrite
+}
+
+/**
+ * `consolidate <slug>`: the 02 §6.2 evaluation through storage — scene-break heuristic
+ * splits (§6.3 rule 1) apply right here, that IS the evaluation semantics; over-threshold
+ * frontiers without markers report their eligible prefix and point at `--now`.
+ * `consolidate <slug> --now`: the same forced path as POST /works/:w/consolidate — the
+ * boundary agent runs as a recorded background task and the proposal is applied. In mock
+ * mode the boundary proposal (one mid-prefix cut) and the enrich responses are scripted.
+ */
+export async function consolidateCommand(
+  rt: CliRuntime,
+  slug: string,
+  options: ConsolidateOptions,
+): Promise<ConsolidateResult> {
+  const { out } = options
+  const open = await rt.openBySlug(slug)
+  const settings = open.handle.work.settings.consolidation
+  const snippetRows = open.handle.listSnippets()
+  const frontierWords = snippetRows.reduce((sum, row) => sum + row.wordCount, 0)
+  out(
+    `frontier: ${snippetRows.length} snippet(s), ${frontierWords}w ` +
+      `(thresholds: ${settings.maxFrontierSnippets} snippets / ${settings.maxFrontierWords}w)\n`,
+  )
+
+  const reportApplied = async (
+    sectionIds: string[],
+    undoToken: string,
+    how: string,
+    scriptEnrich = true,
+  ): Promise<ConsolidateResult> => {
+    if (scriptEnrich && rt.mockLlm !== null) scriptMockEnrich(rt.mockLlm, sectionIds.length)
+    out(
+      `applied (${how}): ${sectionIds.length} section(s) frozen — ` +
+        `undo token ${undoToken} (undo-consolidation ${slug} ${undoToken})\n`,
+    )
+    await reportEnrichment(rt, open, sectionIds, out)
+    return { status: 'applied', sectionIds, undoToken }
+  }
+
+  if (!options.now) {
+    const evaluation = await open.handle.maybeConsolidate({
+      taskTargetIds: rt.harness.liveTargetIds(open),
+    })
+    if (evaluation.status === 'idle') {
+      out('idle: below thresholds, or no eligible prefix (active window / task guards)\n')
+      return { status: 'idle', sectionIds: [], undoToken: null }
+    }
+    if (evaluation.status === 'needs-boundaries') {
+      out(
+        `over thresholds: ${evaluation.eligibleSnippetIds.length} snippet(s) eligible — ` +
+          'run again with --now to invoke the boundary agent\n',
+      )
+      return { status: 'needs-boundaries', sectionIds: [], undoToken: null }
+    }
+    return reportApplied(evaluation.sectionIds, evaluation.opId, 'scene-break heuristic')
+  }
+
+  // --now: capture the apply off the work stream while the scheduler drives the cycle.
+  let applied: WorkEventOf<'consolidation.applied'> | null = null
+  const detach = attachEventListener(open, (event) => {
+    if (event.type === 'consolidation.applied') applied = event
+  })
+  try {
+    const result = await rt.harness.consolidateNow(open)
+    if (result.kind === 'nothing-eligible') {
+      out('nothing to consolidate — the frontier is inside the active window\n')
+      return { status: 'nothing-eligible', sectionIds: [], undoToken: null }
+    }
+    if (result.kind === 'applied') {
+      return await reportApplied(result.sectionIds, result.undoToken, 'scene-break heuristic')
+    }
+
+    const task = result.task
+    const spec = task.spec
+    if (spec.kind === 'propose-boundaries' && rt.mockLlm !== null) {
+      scriptMockBoundaryCycle(rt.mockLlm, spec.eligibleSnippetIds)
+    }
+    const eligible = spec.kind === 'propose-boundaries' ? spec.eligibleSnippetIds.length : 0
+    out(`boundary agent running over ${eligible} eligible snippet(s) (run ${task.id})\n`)
+
+    // The apply happens AFTER the boundary task settles (scheduler cycle); wait for the
+    // task, then give the apply a short grace before calling it a deferral.
+    const taskDeadline = Date.now() + 10 * 60_000
+    let terminal: Task | null = null
+    while (Date.now() < taskDeadline) {
+      if ((applied as WorkEventOf<'consolidation.applied'> | null) !== null) break
+      const current = rt.harness.get(open, task.id)
+      if (
+        current !== null &&
+        (current.status === 'done' || current.status === 'error' || current.status === 'cancelled')
+      ) {
+        terminal = current
+        break
+      }
+      await sleep(25)
+    }
+    const applyDeadline = Date.now() + 5_000
+    while ((applied as WorkEventOf<'consolidation.applied'> | null) === null) {
+      if (Date.now() > applyDeadline) break
+      if (terminal !== null && terminal.status !== 'done') break
+      await sleep(25)
+    }
+    const appliedEvent = applied as WorkEventOf<'consolidation.applied'> | null
+    if (appliedEvent !== null) {
+      // false: the mock enrich was scripted alongside the boundary proposal above.
+      return await reportApplied(
+        appliedEvent.sectionIds,
+        appliedEvent.undoToken,
+        'boundary proposal',
+        false,
+      )
+    }
+    if (terminal !== null && terminal.status !== 'done') {
+      out(
+        `boundary run ${task.id} ${terminal.status}` +
+          `${terminal.error === null ? '' : ` [${terminal.error.code}] ${terminal.error.message}`}\n`,
+      )
+      return { status: 'failed', sectionIds: [], undoToken: null }
+    }
+    out(
+      'deferred: the proposal contained no usable boundary (02 §6.3) — ' +
+        'the frontier keeps accreting and the back-off grew\n',
+    )
+    return { status: 'deferred', sectionIds: [], undoToken: null }
+  } finally {
+    detach()
+  }
+}
+
+/** `undo-consolidation <slug> <opId|token>` — cancel-by-target THEN reverse-replay, the
+ *  same ordering contract as the HTTP undo route (02 §6.4; 05 §6.2). */
+export async function undoConsolidationCommand(
+  rt: CliRuntime,
+  slug: string,
+  undoToken: string,
+  out: CliWrite,
+): Promise<void> {
+  const open = await rt.openBySlug(slug)
+  const pending = await open.handle.pendingConsolidation()
+  const before = open.handle.listSnippets().length
+  // Unknown/expired tokens throw the storage layer's typed conflict — main() prints it.
+  await rt.harness.undoWorkConsolidation(open, undoToken)
+  const after = open.handle.listSnippets().length
+  const sections = pending !== null && pending.opId === undoToken ? pending.sectionIds.length : 0
+  out(
+    `undone: ${sections} section(s) removed, ${after - before} snippet(s) restored ` +
+      `(frontier now ${after})\n`,
+  )
+}
+
+export interface EnrichOptions {
+  /** Force ONE section regardless of staleness; absent ⇒ every stale frozen leaf. */
+  sectionId?: string
+  out: CliWrite
+}
+
+export interface EnrichResult {
+  results: Array<{ sectionId: string; status: Task['status'] }>
+}
+
+/** `enrich <slug> [--section <id>]` — user-facing enrich submits through the SAME
+ *  harness path as POST /tasks {kind:"enrich-section"} (05 §2 "refresh summary"). */
+export async function enrichCommand(
+  rt: CliRuntime,
+  slug: string,
+  options: EnrichOptions,
+): Promise<EnrichResult> {
+  const { out } = options
+  const open = await rt.openBySlug(slug)
+  const leaves = open.handle.listSections().filter((row) => row.contentHash !== null)
+
+  let targets: SectionRow[]
+  if (options.sectionId !== undefined) {
+    const row = leaves.find((r) => r.id === options.sectionId)
+    if (row === undefined) {
+      throw new Error(`no frozen leaf section '${options.sectionId}' in '${slug}'`)
+    }
+    targets = [row]
+  } else {
+    // The same §6.5 staleness spelling the sweep uses (missing counts as stale).
+    targets = open.handle.staleSections('summary')
+    if (targets.length === 0) {
+      out('nothing stale: every frozen section is enriched and current\n')
+      return { results: [] }
+    }
+  }
+
+  if (rt.mockLlm !== null) scriptMockEnrich(rt.mockLlm, targets.length)
+  const tasks: Array<{ sectionId: string; taskId: string }> = []
+  for (const row of targets) {
+    const task = await rt.harness.submit(open, { kind: 'enrich-section', sectionId: row.id })
+    tasks.push({ sectionId: row.id, taskId: task.id })
+    out(`enrich queued: ${row.kind} "${row.title ?? '(untitled)'}" #${shortId(row.id)}\n`)
+  }
+
+  const results: EnrichResult['results'] = []
+  for (const { sectionId, taskId } of tasks) {
+    const deadline = Date.now() + 120_000
+    let status: Task['status'] = 'queued'
+    while (Date.now() < deadline) {
+      const current = rt.harness.get(open, taskId)
+      if (current === null) break
+      status = current.status
+      if (status === 'done' || status === 'error' || status === 'cancelled') break
+      await sleep(50)
+    }
+    results.push({ sectionId, status })
+    out(`${enrichmentStatusLine(open.handle.getSection(sectionId), sectionId)}  [${status}]\n`)
+  }
+  return { results }
 }

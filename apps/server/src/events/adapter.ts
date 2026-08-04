@@ -150,6 +150,27 @@ export function attachStorageAdapter(
         const section = sectionFor(change.sectionId)
         return section === null ? null : { type: 'section.changed', section }
       }
+      case 'sections.restructured':
+        // deliberate refetch signal (03 §8.2) — no payload to hydrate
+        return { type: 'sections.restructured' }
+      case 'consolidation.applied': {
+        // The wire row carries the toast title (03 §8.2): the first frozen section's
+        // title, or '' until the enrichment agent names it (heuristic splits start
+        // untitled) — plus the grace deadline the client's toast TTL derives from.
+        const first = change.sectionIds[0]
+        const section = first === undefined ? null : sectionFor(first)
+        return {
+          type: 'consolidation.applied',
+          sectionIds: change.sectionIds,
+          title: section?.title ?? '',
+          undoToken: change.undoToken,
+          undoDeadline: change.undoDeadline,
+        }
+      }
+      case 'consolidation.undone':
+        return { type: 'consolidation.undone', sectionIds: change.sectionIds }
+      case 'consolidation.finalized':
+        return { type: 'consolidation.finalized', opId: change.opId }
       case 'enrichment.updated': {
         const section = sectionFor(change.sectionId)
         if (section === null) return null

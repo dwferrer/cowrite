@@ -125,11 +125,29 @@ async function probeLlm(endpoint: ModelEndpoint, deps: Required<ProbeDeps>): Pro
         signal: AbortSignal.timeout(deps.timeoutMs),
       })
     }
-    const latencyMs = Math.max(0, Math.round(deps.now() - start))
     if (!res.ok) return failureFromStatus(res.status, await safeBody(res))
     if (viaFallback) {
+      const latencyMs = Math.max(0, Math.round(deps.now() - start))
       return { ok: true, latencyMs, detail: 'chat/completions responded (no /models endpoint)' }
     }
+    // A model listing can be PUBLIC (OpenRouter serves /models without auth), so a 200 here
+    // proves reachability, not credentials. When a key is configured, verify it with a
+    // 1-token completion — otherwise the settings screen green-lights a bad key that every
+    // real task then fails on.
+    if (endpoint.apiKey !== '') {
+      const authRes = await deps.fetchImpl(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: endpoint.model,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'ping' }],
+        }),
+        signal: AbortSignal.timeout(deps.timeoutMs),
+      })
+      if (!authRes.ok) return failureFromStatus(authRes.status, await safeBody(authRes))
+    }
+    const latencyMs = Math.max(0, Math.round(deps.now() - start))
     return { ok: true, latencyMs, detail: await modelListDetail(res, endpoint.model) }
   } catch (err) {
     return failureFromError(err, deps.timeoutMs)

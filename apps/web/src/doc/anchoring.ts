@@ -57,3 +57,28 @@ export function restoreScrollTop(
   if (newBlockStart === undefined) return null
   return Math.max(0, newBlockStart - anchor.offsetPx)
 }
+
+/**
+ * The removed-anchor fallback (04 §5.5): when the anchored block vanished from the list
+ * (consolidation consumed its snippet, a restructure replaced the section), pick the
+ * nearest block from the PREVIOUS layout that still exists — preferring the closest
+ * preceding block (content above the viewport moved together with the anchor), then the
+ * closest following one. Returns null when nothing around the anchor survived.
+ */
+export function fallbackAnchorKey(
+  prevKeys: readonly string[],
+  liveKeys: ReadonlySet<string>,
+  missingKey: string,
+): string | null {
+  const at = prevKeys.indexOf(missingKey)
+  if (at === -1) return null
+  for (let i = at - 1; i >= 0; i--) {
+    const key = prevKeys[i]
+    if (key !== undefined && liveKeys.has(key)) return key
+  }
+  for (let i = at + 1; i < prevKeys.length; i++) {
+    const key = prevKeys[i]
+    if (key !== undefined && liveKeys.has(key)) return key
+  }
+  return null
+}

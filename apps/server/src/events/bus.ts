@@ -104,6 +104,9 @@ export class WorkEventBus {
   private readonly now: () => number
   private heartbeat: NodeJS.Timeout | null = null
   private attachStateProvider: AttachStateProvider | null = null
+  /** Additional attach-time frame providers (e.g. the mid-grace consolidation offer);
+   *  written AFTER the task-state provider so `task.state` keeps preceding snapshots. */
+  private readonly extraAttachProviders = new Set<AttachStateProvider>()
 
   constructor(options: WorkEventBusOptions = {}) {
     this.heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
@@ -246,6 +249,19 @@ export class WorkEventBus {
   }
 
   /**
+   * Register an ADDITIONAL attach-time frame provider (same sync/async semantics as
+   * the task-state provider): its frames are written on every attach, after the
+   * task-state frames. Used for state a fresh EventSource must re-learn without a
+   * fetch — e.g. a consolidation still inside its undo grace window. Returns detach.
+   */
+  addAttachProvider(provider: AttachStateProvider): Unsubscribe {
+    this.extraAttachProviders.add(provider)
+    return () => {
+      this.extraAttachProviders.delete(provider)
+    }
+  }
+
+  /**
    * Attach one SSE subscriber. Writes the `hello` frame, then the synthetic `task.state`
    * frame(s) from the attach-state provider (EVERY attach — hydration needs no
    * pre-fetch), then the §8.3 negotiation (exact replay when `lastEventId` is in-ring
@@ -279,19 +295,28 @@ export class WorkEventBus {
     // Attach-time task state (03 §8.3): sync providers (a live in-memory task) write
     // BEFORE the snapshot sequence so the snapshot has a slot to land in; async ones
     // (lazy post-restart reconstruction from the run files) write when they settle.
-    const stateEvents = this.attachStateProvider?.()
     const writeStateFrames = (events: WorkEvent[]): void => {
       for (const event of events) write(formatFrame(this.cursor(), event))
     }
-    if (Array.isArray(stateEvents)) {
-      writeStateFrames(stateEvents)
-    } else if (stateEvents !== undefined) {
+    const writeProviderFrames = (provider: AttachStateProvider): void => {
+      let stateEvents: WorkEvent[] | Promise<WorkEvent[]>
+      try {
+        stateEvents = provider()
+      } catch {
+        return // a broken provider must not break the stream
+      }
+      if (Array.isArray(stateEvents)) {
+        writeStateFrames(stateEvents)
+        return
+      }
       void stateEvents
         .then((events) => {
           if (!this.ended && this.sinks.has(sink)) writeStateFrames(events)
         })
         .catch(() => {}) // a broken provider must not break the stream
     }
+    if (this.attachStateProvider !== null) writeProviderFrames(this.attachStateProvider)
+    for (const provider of [...this.extraAttachProviders]) writeProviderFrames(provider)
 
     const resume = lastEventId === undefined ? null : this.parseCursor(lastEventId)
     if (resume === null) {
@@ -341,6 +366,7 @@ export class WorkEventBus {
     }
     this.sinks.clear()
     this.localListeners.clear()
+    this.extraAttachProviders.clear()
     this.accumulators.clear()
     for (const window of this.deltaWindows.values()) clearTimeout(window.timer)
     this.deltaWindows.clear()

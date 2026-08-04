@@ -5,13 +5,18 @@ import { fileURLToPath } from 'node:url'
 import {
   type CliRuntime,
   type CliTaskRequest,
+  consolidateCommand,
   contextPreviewCommand,
   contextStateCommand,
   createCliRuntime,
+  enrichCommand,
+  needsEnrichment,
   promptRenderCommand,
   runsListCommand,
   runsShowCommand,
   runTaskCommand,
+  summarySlotStatus,
+  undoConsolidationCommand,
 } from './cliAgents.js'
 import type { SectionRow, SnippetRow } from './storage/index/db.js'
 import { wordCount } from './storage/lib/hash.js'
@@ -55,7 +60,16 @@ agents (model lanes from ~/.cowrite/config.jsonc; COWRITE_MOCK_LLM=1 runs modell
   context preview <slug>                  region/item table: fidelity, tokens, budgets
   context state <slug>                    the elevation ledger + anchors
   runs list <slug>                        run summaries from the run files
-  runs show <slug> <runId> [--full]       one run's transcript (--full prints messages)`
+  runs show <slug> <runId> [--full]       one run's transcript (--full prints messages)
+
+consolidation & enrichment (Stage 4):
+  consolidate <slug> [--now]              evaluate the trigger (scene-break splits apply
+                                          immediately); --now forces the boundary agent
+                                          and applies its proposal
+  undo-consolidation <slug> <token>       undo inside the grace window (token from the
+                                          consolidate report or 'work info')
+  enrich <slug> [--section <id>]          re-enrich one section (forced), or every
+                                          stale frozen section`
 
 interface Args {
   positionals: string[]
@@ -118,12 +132,17 @@ async function readStdin(): Promise<string> {
   return stripBom(Buffer.concat(chunks).toString('utf8'))
 }
 
-function staleBadges(row: SectionRow): string {
-  const badges: string[] = []
-  if (row.shortSummaryStale) badges.push('short-summary stale')
-  if (row.longSummaryStale) badges.push('long-summary stale')
-  if (row.illustrationStale) badges.push('illustration stale')
-  return badges.length > 0 ? `  [${badges.join(', ')}]` : ''
+/** Presence + staleness at a glance, per enrichment slot (the fold ladder's inputs,
+ *  04 §5), spelled via the shared `summarySlotStatus` helper (02 §6.5: missing counts
+ *  as stale). Empty for interior sections (no summaries). Exported for the CLI
+ *  formatting tests. */
+export function enrichmentBadge(row: SectionRow): string {
+  if (row.contentHash === null) return '' // interior sections carry no enrichments
+  const short = summarySlotStatus(row.shortSummary, row.shortSummaryStale)
+  const long = summarySlotStatus(row.longSummary, row.longSummaryStale)
+  const illustration =
+    row.illustrationHash === null ? 'none' : row.illustrationStale ? 'stale' : 'ok'
+  return `  [short ${short} / long ${long} / illus ${illustration}]`
 }
 
 function printSectionTree(rows: SectionRow[]): void {
@@ -138,7 +157,7 @@ function printSectionTree(rows: SectionRow[]): void {
       const indent = '  '.repeat(depth + 1)
       const title = row.title ?? '(untitled)'
       console.log(
-        `${indent}${row.kind} "${title}"  #${shortId(row.id)}  ${row.wordCount}w${staleBadges(row)}`,
+        `${indent}${row.kind} "${title}"  #${shortId(row.id)}  ${row.wordCount}w${enrichmentBadge(row)}`,
       )
       printLevel(row.id, depth + 1)
     }
@@ -198,14 +217,33 @@ async function cmdWorkInfo(dataDir: string, slug: string): Promise<void> {
     console.log(`situation: ${wordCount(situation.text)}w, updated ${situation.updatedAt}`)
 
     const sectionRows = handle.listSections()
-    console.log(`\nsections (${sectionRows.length}):`)
+    const frozen = sectionRows.filter((row) => row.contentHash !== null)
+    const needing = frozen.filter(needsEnrichment)
+    console.log(
+      `\nsections (${sectionRows.length}): ${frozen.length} frozen, ` +
+        `${frozen.length - needing.length} enriched, ` +
+        `${needing.length} needing enrichment`,
+    )
     if (sectionRows.length === 0) console.log('  (none frozen yet)')
     else printSectionTree(sectionRows)
 
     const snippetRows = handle.listSnippets()
     const frontierWords = snippetRows.reduce((sum, row) => sum + row.wordCount, 0)
-    console.log(`\nfrontier (${snippetRows.length} snippets, ${frontierWords}w):`)
+    const consolidation = work.settings.consolidation
+    console.log(
+      `\nfrontier (${snippetRows.length} snippets, ${frontierWords}w; consolidates past ` +
+        `${consolidation.maxFrontierSnippets} snippets / ${consolidation.maxFrontierWords}w):`,
+    )
     for (const row of snippetRows) console.log(snippetLine(row))
+
+    const pending = await handle.pendingConsolidation()
+    if (pending !== null) {
+      const deadline = pending.undoDeadline === null ? '' : ` until ${pending.undoDeadline}`
+      console.log(
+        `\npending consolidation: ${pending.sectionIds.length} section(s) inside the undo ` +
+          `grace window${deadline} — undo token ${pending.opId}`,
+      )
+    }
   })
 }
 
@@ -404,6 +442,38 @@ async function cmdContext(dataDir: string, args: Args): Promise<void> {
   )
 }
 
+/** `consolidate <slug> [--now]` — 02 §6.2 evaluation; --now runs the boundary agent. */
+async function cmdConsolidate(dataDir: string, args: Args): Promise<void> {
+  const slug = args.positionals[1]
+  if (slug === undefined) fail('usage: consolidate <slug> [--now]')
+  await withRuntime(dataDir, (rt) =>
+    consolidateCommand(rt, slug, { now: args.flags.now === true, out: stdoutWrite }),
+  )
+}
+
+/** `undo-consolidation <slug> <opId|token>` — undo within the grace window (03 §3.8). */
+async function cmdUndoConsolidation(dataDir: string, args: Args): Promise<void> {
+  const [, slug, token] = args.positionals
+  if (slug === undefined || token === undefined) {
+    fail('usage: undo-consolidation <slug> <opId|token>')
+  }
+  await withRuntime(dataDir, (rt) => undoConsolidationCommand(rt, slug, token, stdoutWrite))
+}
+
+/** `enrich <slug> [--section <id>]` — force one section, or sweep everything stale. */
+async function cmdEnrich(dataDir: string, args: Args): Promise<void> {
+  const slug = args.positionals[1]
+  if (slug === undefined) fail('usage: enrich <slug> [--section <id>]')
+  const sectionId = args.flags.section
+  if (sectionId === true) fail('--section takes a section id')
+  await withRuntime(dataDir, (rt) =>
+    enrichCommand(rt, slug, {
+      out: stdoutWrite,
+      ...(typeof sectionId === 'string' ? { sectionId } : {}),
+    }),
+  )
+}
+
 async function cmdRuns(dataDir: string, args: Args): Promise<void> {
   const [, sub, slug, runId] = args.positionals
   if (sub === 'list' && slug !== undefined) {
@@ -456,6 +526,12 @@ async function main(): Promise<void> {
       return cmdContext(dataDir, args)
     case 'runs':
       return cmdRuns(dataDir, args)
+    case 'consolidate':
+      return cmdConsolidate(dataDir, args)
+    case 'undo-consolidation':
+      return cmdUndoConsolidation(dataDir, args)
+    case 'enrich':
+      return cmdEnrich(dataDir, args)
     default:
       fail(USAGE)
   }

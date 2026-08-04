@@ -28,9 +28,11 @@ export function resourceRoutes(deps: ResourceDeps): FastifyPluginAsync {
     // Default harness: all-defaults config ⇒ unconfigured lanes ⇒ 409 config_missing at
     // task creation; runs/proposal routes work regardless (they read storage).
     const harness = deps.harness ?? new AgentHarness({ config: () => AppConfig.parse({}) })
-    // Every open work's bus gets the harness's attach-time task-state provider, so a
-    // fresh SSE connection hydrates without a pre-fetch (03 §8.3 hydration fencing).
-    deps.works.onOpen((open) => harness.attachWork(open))
+    // Every open work's bus gets the harness's attach-time task-state provider (03 §8.3
+    // hydration fencing) and its background scheduler; SSE presence gates the sweep.
+    deps.works.onOpen((open) =>
+      harness.attachWork(open, () => deps.works.subscriberCount(open.slug) > 0),
+    )
     registerWorkRoutes(zodApp, deps)
     registerSectionRoutes(zodApp, deps)
     registerSnippetRoutes(zodApp, deps)

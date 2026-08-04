@@ -15,18 +15,26 @@ export interface ToastAction {
 
 export interface ToastItem {
   id: number
+  /** Optional stable identity (e.g. `undo:<opId>`): pushing the same key replaces the
+   *  existing toast, and `dismissByKey` removes it from anywhere (the SSE reducer). */
+  key?: string
   message: string
   tone: 'info' | 'error'
   action?: ToastAction
 }
 
+export interface ToastOptions {
+  tone?: 'info' | 'error'
+  action?: ToastAction
+  ttlMs?: number
+  key?: string
+}
+
 interface ToastState {
   toasts: ToastItem[]
-  push(
-    message: string,
-    opts?: { tone?: 'info' | 'error'; action?: ToastAction; ttlMs?: number },
-  ): void
+  push(message: string, opts?: ToastOptions): void
   dismiss(id: number): void
+  dismissByKey(key: string): void
 }
 
 let nextToastId = 1
@@ -37,22 +45,28 @@ export const useToastStore = create<ToastState>()((set, get) => ({
     const id = nextToastId++
     const toast: ToastItem = {
       id,
+      ...(opts?.key === undefined ? {} : { key: opts.key }),
       message,
       tone: opts?.tone ?? 'info',
       ...(opts?.action ? { action: opts.action } : {}),
     }
-    set((state) => ({ toasts: [...state.toasts, toast] }))
+    set((state) => ({
+      // same key ⇒ replace (a re-attach re-offering the undo toast must not stack)
+      toasts: [...state.toasts.filter((t) => opts?.key === undefined || t.key !== opts.key), toast],
+    }))
     const ttl = opts?.ttlMs ?? 6_000
     if (ttl > 0) setTimeout(() => get().dismiss(id), ttl)
   },
   dismiss: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
+  dismissByKey: (key) => set((state) => ({ toasts: state.toasts.filter((t) => t.key !== key) })),
 }))
 
-export function pushToast(
-  message: string,
-  opts?: { tone?: 'info' | 'error'; action?: ToastAction; ttlMs?: number },
-): void {
+export function pushToast(message: string, opts?: ToastOptions): void {
   useToastStore.getState().push(message, opts)
+}
+
+export function dismissToastByKey(key: string): void {
+  useToastStore.getState().dismissByKey(key)
 }
 
 export function Toaster() {

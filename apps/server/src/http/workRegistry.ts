@@ -91,6 +91,12 @@ export class WorkRegistry {
     return this.states.size
   }
 
+  /** Live SSE subscriber count for a work — the harness scheduler's presence gate
+   *  (03 §4.1: "≥ 1 SSE subscriber" is the only "app open" observable). */
+  subscriberCount(slug: string): number {
+    return this.states.get(slug)?.subscribers ?? 0
+  }
+
   /**
    * Register a work-close hook, run at the START of the §4.2 close path — before the
    * SSE stream ends and the handle closes, so the hook can still publish final events

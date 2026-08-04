@@ -3,21 +3,42 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useRef } from 'react'
 import { apiCall } from '../../api/client.js'
 import { qk } from '../../api/queries.js'
+import type { FoldLevel } from '../../state/docUiStore.js'
+import { usePanelStore } from '../../state/panelStore.js'
 import { testids } from '../../testids.js'
 
 /**
- * Section heading block (docs/04-frontend.md §5.2): title (or "Chapter N"), slim rule, a
- * staleness-badge slot. Hovering for 150 ms prefetches the leaf's content so expanding feels
- * instant (§5.6). The fold widget lands with the ladder rendering (Stage 4).
+ * Section heading block (docs/04-frontend.md §5.2, §5.3, §6): title (or "Chapter N"), slim
+ * rule, the fold widget (four dots + auto reset, pin glyph when non-auto), and the staleness
+ * badge whose tooltip names exactly what is out of date. Hovering for 150 ms prefetches the
+ * leaf's content so expanding feels instant (§5.6).
  */
 
 const PREFETCH_HOVER_MS = 150
+
+/** Widget order mirrors the ladder top-to-bottom: most prose → least (04 §5.3). */
+const FOLD_LEVELS: readonly FoldLevel[] = ['full', 'long', 'short', 'name']
+
+const FOLD_LABEL: Record<FoldLevel, string> = {
+  full: 'full prose',
+  long: 'long summary',
+  short: 'short summary',
+  name: 'name card',
+}
 
 export interface SectionHeaderProps {
   workId: string
   section: SectionRow
   ordinal: number
   depth: number
+  /** The effective fold this header currently renders at (block model, §5.2). */
+  fold: FoldLevel
+  /**
+   * Called BEFORE a pin mutates the fold, so DocView can anchor the viewport to THIS
+   * header — the section you asked to (un)fold stays put while everything below grows
+   * (§5.5 "expanding a section you clicked").
+   */
+  onBeforeFoldChange?: (sectionId: string) => void
 }
 
 export function sectionDisplayTitle(section: SectionRow, ordinal: number): string {
@@ -27,9 +48,28 @@ export function sectionDisplayTitle(section: SectionRow, ordinal: number): strin
   return `${kind} ${ordinal}`
 }
 
-export function SectionHeader({ workId, section, ordinal, depth }: SectionHeaderProps) {
+/** Tooltip naming what is stale (04 §6). Illustration staleness is Stage 5 — deliberately
+ *  excluded here until the illustrate-section pipeline exists to refresh it. */
+export function staleTooltip(stale: SectionRow['stale']): string | null {
+  const parts: string[] = []
+  if (stale.short) parts.push('short summary')
+  if (stale.long) parts.push('long summary')
+  if (parts.length === 0) return null
+  return `Out of date: ${parts.join(', ')} — will refresh with enrichment`
+}
+
+export function SectionHeader({
+  workId,
+  section,
+  ordinal,
+  depth,
+  fold,
+  onBeforeFoldChange,
+}: SectionHeaderProps) {
   const qc = useQueryClient()
   const hoverTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const override = usePanelStore((s) => s.byWork[workId]?.foldOverrides[section.id] ?? 'auto')
+  const setFold = usePanelStore((s) => s.setFold)
 
   const prefetch = () => {
     if (!section.isLeaf || section.contentHash === null) return
@@ -40,13 +80,20 @@ export function SectionHeader({ workId, section, ordinal, depth }: SectionHeader
     })
   }
 
-  const stale = section.stale.short || section.stale.long
+  const pin = (level: FoldLevel | 'auto') => {
+    if (level === override) return
+    onBeforeFoldChange?.(section.id)
+    setFold(workId, section.id, level)
+  }
+
+  const tooltip = staleTooltip(section.stale)
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: hover/focus here only warm the prefetch cache (§5.6) — no behavior is gated on them
     <div
       className="section-heading"
       data-testid={testids.sectionHeader}
       data-section-id={section.id}
+      data-fold={fold}
       style={{ paddingLeft: depth * 16 }}
       onMouseEnter={() => {
         hoverTimer.current = setTimeout(prefetch, PREFETCH_HOVER_MS)
@@ -57,13 +104,44 @@ export function SectionHeader({ workId, section, ordinal, depth }: SectionHeader
       onFocus={prefetch}
     >
       <span className="section-heading__title">{sectionDisplayTitle(section, ordinal)}</span>
-      {stale ? (
-        <span
-          className="stale-badge"
-          data-testid={testids.staleBadge}
-          title="Summary outdated — will refresh with enrichment"
-        >
+      {tooltip !== null ? (
+        <span className="stale-badge" data-testid={testids.staleBadge} title={tooltip}>
           ⟳
+        </span>
+      ) : null}
+      {fold !== 'full' ? <span className="section-heading__fold-hint">({fold})</span> : null}
+      {section.isLeaf ? (
+        <span className="fold-widget" data-testid={testids.foldWidget}>
+          {override !== 'auto' ? (
+            <span className="fold-widget__pin" title="Pinned — reset with auto" aria-hidden>
+              📌
+            </span>
+          ) : null}
+          {FOLD_LEVELS.map((level) => (
+            <button
+              key={level}
+              type="button"
+              className="fold-widget__dot"
+              data-testid={testids.foldDot}
+              data-level={level}
+              aria-pressed={fold === level}
+              title={`Pin to ${FOLD_LABEL[level]}`}
+              onClick={() => pin(level)}
+              onFocus={level === 'full' ? prefetch : undefined}
+            >
+              ●
+            </button>
+          ))}
+          <button
+            type="button"
+            className="fold-widget__auto"
+            data-testid={testids.foldAuto}
+            aria-pressed={override === 'auto'}
+            title="Follow the distance default"
+            onClick={() => pin('auto')}
+          >
+            auto
+          </button>
         </span>
       ) : null}
     </div>

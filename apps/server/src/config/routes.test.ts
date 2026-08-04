@@ -115,7 +115,11 @@ describe('config routes', () => {
     expect(res.statusCode).toBe(200)
     const probe = ProbeResult.parse(res.json())
     expect(probe.ok).toBe(true)
-    expect(urls).toEqual(['http://cand.example/v1/models'])
+    // keyed probes fire /models AND the 1-token auth check (public listings prove nothing)
+    expect(urls).toEqual([
+      'http://cand.example/v1/models',
+      'http://cand.example/v1/chat/completions',
+    ])
   })
 
   it('a candidate that explicitly clears a lane gets config_missing, not the stored probe', async () => {

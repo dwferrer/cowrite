@@ -148,7 +148,7 @@ describe('precedence: defaults < file < env < flags', () => {
       baseUrl: 'http://llm.example/v1',
       apiKey: 'sk-env',
       model: 'big-model',
-      maxOutputTokens: 2048, // schema default fills the rest
+      maxOutputTokens: 8192, // schema default fills the rest
     })
     expect(result.config.models.low).toBeNull()
     const paths = result.overrides.map((o) => o.path).sort()

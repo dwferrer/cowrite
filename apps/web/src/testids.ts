@@ -40,8 +40,12 @@ export const testids = {
   sectionBlock: 'section-block',
   sectionHeader: 'section-header',
   sectionSkeleton: 'section-skeleton',
+  sectionFoldHint: 'section-fold-hint',
   staleBadge: 'stale-badge',
   nameCard: 'name-card',
+  foldWidget: 'fold-widget',
+  foldDot: 'fold-dot',
+  foldAuto: 'fold-auto',
   streamingBlock: 'streaming-block',
   streamingPlanning: 'streaming-planning',
   streamingText: 'streaming-text',
@@ -128,6 +132,11 @@ export const testids = {
   worldImageUpload: 'world-image-upload',
   worldImageDelete: 'world-image-delete',
   worldPanelClose: 'world-panel-close',
+
+  // background-lane activity (04 §4.4)
+  backgroundDot: 'background-dot',
+  backgroundPopover: 'background-popover',
+  backgroundTaskRow: 'background-task-row',
 
   // ui atoms
   toast: 'toast',

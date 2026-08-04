@@ -204,6 +204,57 @@ function matchStep(step: LlmStep, captured: CapturedChatRequest): string | null 
   return null
 }
 
+/** Deterministic default bodies for improvised background responses. */
+export const IMPROVISED_TITLE = 'Improvised Chapter'
+export const IMPROVISED_SHORT_SUMMARY =
+  'The mock model summarizes the chapter in two steady sentences. Nothing is invented.'
+export const IMPROVISED_LONG_SUMMARY =
+  'The mock model walks the chapter start to finish in one deterministic paragraph, ' +
+  'flat and factual, listing what happened in order and where the prose leaves off.'
+
+/**
+ * Recognize an unscripted background-task request by its template markers and build a
+ * deterministic response step; null for anything that is not background-shaped (the
+ * caller then falls through to the strict queue and its loud exhausted failure).
+ *
+ * - enrich-section (07 §6.5's template): instructions name the `<summary-short>` /
+ *   `<summary-long>` blocks and carry a `<target>` region. A `<title>` block is only
+ *   emitted when the template still asks for one (a user-pinned title drops that line).
+ * - propose-boundaries (07 §6.6): instructions name the `<boundaries>` block over a
+ *   `<local-context>` of `<snippet id="…">` items; the improviser cuts after the
+ *   middle listed snippet (or proposes nothing when none are listed).
+ */
+export function improviseBackgroundStep(captured: CapturedChatRequest): LlmStep | null {
+  const last = messageText(captured.messages[captured.messages.length - 1])
+  if (last === '') return null
+
+  const enrichShaped =
+    last.includes('<summary-short>') && last.includes('<summary-long>') && last.includes('<target>')
+  if (enrichShaped) {
+    const wantsTitle = last.includes('<title> —')
+    const blocks = [
+      ...(wantsTitle ? [`<title>\n${IMPROVISED_TITLE}\n</title>`] : []),
+      `<summary-short>\n${IMPROVISED_SHORT_SUMMARY}\n</summary-short>`,
+      `<summary-long>\n${IMPROVISED_LONG_SUMMARY}\n</summary-long>`,
+    ]
+    return { type: 'respond', text: blocks.join('\n') }
+  }
+
+  const boundariesShaped = last.includes('<boundaries>') && last.includes('<local-context>')
+  if (boundariesShaped) {
+    const local = last.slice(last.indexOf('<local-context>'))
+    const ids = [...local.matchAll(/<snippet id="([^"]+)"/g)].map((m) => m[1] as string)
+    const cut = ids[Math.floor((ids.length - 1) / 2)]
+    const proposal =
+      cut === undefined
+        ? { boundaries: [] }
+        : { boundaries: [{ afterSnippetId: cut, kind: 'chapter', title: IMPROVISED_TITLE }] }
+    return { type: 'respond', text: `<boundaries>\n${JSON.stringify(proposal)}\n</boundaries>` }
+  }
+
+  return null
+}
+
 interface CompletionPayload {
   content: string | null
   toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
@@ -283,10 +334,19 @@ export async function createMockLlm(options?: MockLlmOptions): Promise<MockLlm> 
         body,
       }
       requests.push(captured)
-      const step = scenario.queue.take(
-        `POST /v1/chat/completions (model=${String(captured.model)}, stream=${captured.stream})`,
-        (s) => matchStep(s, captured),
-      )
+      // Background improviser (docs/09 §2.3): an UNSCRIPTED enrich-section /
+      // propose-boundaries shaped request (recognized by its template markers) gets a
+      // quiet deterministic answer instead of poisoning the strict scenario queue —
+      // sweeps and debounced consolidations under COWRITE_MOCK_LLM=1 run whenever they
+      // like, and a test cannot script what it did not trigger. Scripted steps always
+      // take precedence, and interactive kinds keep the loud exhausted-queue failure.
+      const improvised = scenario.queue.pending === 0 ? improviseBackgroundStep(captured) : null
+      const step =
+        improvised ??
+        scenario.queue.take(
+          `POST /v1/chat/completions (model=${String(captured.model)}, stream=${captured.stream})`,
+          (s) => matchStep(s, captured),
+        )
       completionCounter += 1
       await executeStep(step, captured, res, base.timers, completionCounter)
       return

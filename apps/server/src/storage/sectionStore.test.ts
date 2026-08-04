@@ -301,6 +301,30 @@ describe('putSummary', () => {
     expect((await readSectionMeta(dir)).enrichments.shortSummary).toEqual(enrichment)
   })
 
+  // BUG regression (02 §6.5): agent summaries used to stamp the COMMIT-time hash —
+  // an edit between assembly and commit made a summary of old prose read fresh.
+  it('stamps an agent summary with the caller-supplied ASSEMBLY-time sourceHash', async () => {
+    const meta = newMeta('a0')
+    await makeSection(sectionsDir(workDir), 10, 'ch', meta, 'prose v2 (edited mid-run)')
+    const assemblyHash = await xxh64OfString('prose v1 (what the agent actually read)')
+    const enrichment = await putSummary(workDir, meta.id, 'short', 'Summary of v1.', {
+      source: 'agent',
+      runId: ulid(),
+      sourceHash: assemblyHash,
+    })
+    expect(enrichment.sourceHash).toBe(assemblyHash) // NOT the current content hash
+  })
+
+  it('ignores a supplied sourceHash for user-edited summaries (commit-time re-read)', async () => {
+    const meta = newMeta('a0')
+    await makeSection(sectionsDir(workDir), 10, 'ch', meta, 'current prose')
+    const enrichment = await putSummary(workDir, meta.id, 'short', 'User summary.', {
+      source: 'user',
+      sourceHash: await xxh64OfString('something else entirely'),
+    })
+    expect(enrichment.sourceHash).toBe(await xxh64OfString('current prose'))
+  })
+
   it('forces runId null for user-edited summaries (§10.3)', async () => {
     const meta = newMeta('a0')
     await makeSection(sectionsDir(workDir), 10, 'ch', meta, 'prose')

@@ -93,7 +93,7 @@ describe('HarnessKnobs (05 §6.4 — the config.harness fragment)', () => {
       connectTimeoutMs: 15_000,
       firstTokenTimeoutMs: 60_000,
       idleTokenTimeoutMs: 30_000,
-      totalTimeoutMs: { high: 300_000, low: 120_000 },
+      totalTimeoutMs: { high: 300_000, low: 300_000 },
       illustrationBudgetMs: 600_000,
       retry: { maxAttempts: 3, backoffMs: 1_000, backoffMaxMs: 4_000 },
       spendWarnUsd: 5,
@@ -131,10 +131,10 @@ describe('HarnessKnobs (05 §6.4 — the config.harness fragment)', () => {
 })
 
 describe('ModelEndpoint', () => {
-  it('defaults apiKey "", 2048 max output tokens, temperature 0.8, null prices', () => {
+  it('defaults apiKey "", 8192 max output tokens, temperature 0.8, null prices', () => {
     const parsed = ModelEndpoint.parse({ baseUrl: highEndpoint.baseUrl, model: 'm' })
     expect(parsed.apiKey).toBe('')
-    expect(parsed.maxOutputTokens).toBe(2048)
+    expect(parsed.maxOutputTokens).toBe(8192)
     expect(parsed.temperature).toBe(0.8)
     expect(parsed.promptCostPerMTok).toBeNull()
     expect(parsed.completionCostPerMTok).toBeNull()

@@ -6,10 +6,10 @@ import type { FoldLevel } from '../state/docUiStore.js'
  * override + graceful degradation when enrichment lags. This ladder is pure UI ergonomics —
  * the model's context map is computed independently by the engine (06).
  *
- * Degradation rule: never render an empty body. A level whose summary text is missing falls
- * toward the nearest level that has something to show, bottoming out at `full` (real prose is
- * always available). Until summaries exist (they are produced by consolidation/enrichment,
- * Stage 4) every section therefore resolves to `full`.
+ * Degradation follows §5.3's letter exactly: a `long` with no long summary falls to
+ * `short` when the short exists, else to `full`; a `short` with no short summary falls
+ * to `name` (the NameCard renders from the title alone — untitled sections show
+ * "Chapter N"). `name` never degrades: it needs no summary text to render.
  */
 
 /** Distance thresholds, exported as one constants object so profiling can tune them. */
@@ -41,10 +41,10 @@ export function effectiveFold(
 ): FoldLevel {
   const ov = overrides[s.id]
   const base = ov !== undefined && ov !== 'auto' ? ov : defaultFold(d)
-  // graceful degradation when enrichment lags: fall toward whatever text exists, ending at
-  // `full` — with no summaries at all (pre-Stage 4) everything resolves to `full`.
-  if (base === 'name' && !s.shortSummary) return s.longSummary ? 'long' : 'full'
-  if (base === 'short' && !s.shortSummary) return s.longSummary ? 'long' : 'full'
+  // graceful degradation when enrichment lags (04 §5.3, verbatim): long falls toward
+  // short/full; short falls to name (a NameCard needs no summary — title alone renders);
+  // name stands on its own.
   if (base === 'long' && !s.longSummary) return s.shortSummary ? 'short' : 'full'
+  if (base === 'short' && !s.shortSummary) return 'name'
   return base
 }

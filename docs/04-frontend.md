@@ -249,9 +249,10 @@ implementation of `api/events.ts`:
 | `snippet.revised` | `{ snippet }` | patch item in `qk.snippets` (skip if `(id, rev)` already present); drop `qk.revisions(s)` |
 | `snippet.deleted` | `{ id }` | remove from `qk.snippets`; clear/repair `docUiStore` refs pointing at it |
 | `section.changed` | `{ section: SectionRow }` | patch row in `qk.sections`; invalidate `qk.sectionText(s)` if `contentHash` changed |
-| `sections.restructured` | — | invalidate `qk.sections` (split/merge, reorder); GC stale keys (§4.1) |
-| `consolidation.applied` | `{ sectionIds, title, undoToken }` | invalidate `qk.sections` + `qk.snippets`; clear dangling `docUiStore` refs; toast "Chapter frozen — Undo" wired to the undo route, auto-dismissed at the undo grace (work settings, default 5 min) |
-| `consolidation.undone` | `{ sectionIds }` | invalidate `qk.sections` + `qk.snippets` |
+| `sections.restructured` | — | THE restructure refetch owner: invalidate `qk.sections` + `qk.snippets` (split/merge, reorder — consolidation emits no `snippet.*` events, 03 §3.2), then GC stale keys after the refetch resolves (§4.1). Storage always pairs it with the `consolidation.*` rows below, which therefore never refetch again |
+| `consolidation.applied` | `{ sectionIds, title, undoToken, undoDeadline }` | toast only ("Chapter frozen — Undo" wired to the undo route); TTL derives from `undoDeadline`, keyed by `undoToken` so the synthetic mid-grace attach frame (03 §8.3) replaces rather than stacks. The paired `sections.restructured` already owns the refetch + GC |
+| `consolidation.undone` | `{ sectionIds }` | no-op — the paired `sections.restructured` owns the refetch |
+| `consolidation.finalized` | `{ opId }` | dismiss the matching undo toast (grace expiry / superseded / work close) |
 | `enrichment.updated` | `{ sectionId, kind, section: SectionRow }` | patch the inlined row (summary text, staleness, illustration version/dimensions); if `kind === "illustration"`, the new `illustration.version` busts the image URL |
 | `world.changed` | `{ entryId? }` | invalidate `qk.world` (undefined `entryId` ⇒ full refetch); bump `worldVersion` → rebuild key matcher (§6.3) |
 | `situation.changed` | `{ text, updatedAt }` | `setQueryData(qk.situation)` unless the pane is dirty — then show a "changed on disk" chip (§9.1) |

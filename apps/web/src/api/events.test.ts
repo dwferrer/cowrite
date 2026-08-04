@@ -4,6 +4,7 @@ import { renderHook, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useDocUiStore } from '../state/docUiStore.js'
+import { usePanelStore } from '../state/panelStore.js'
 import { useTaskStore } from '../state/taskStore.js'
 import { useToastStore } from '../ui/Toast.js'
 import {
@@ -63,11 +64,18 @@ function makeClient(): QueryClient {
   return new QueryClient({ defaultOptions: { queries: { retry: false } } })
 }
 
+/** A live undo grace deadline (5 min out) for consolidation.applied rows. */
+function futureDeadline(): string {
+  return new Date(Date.now() + 300_000).toISOString()
+}
+
 beforeEach(() => {
   useWorkStatusStore.getState().reset()
   useDocUiStore.setState({ selection: null, editing: null, peekRevision: null, followBottom: true })
   useTaskStore.getState().reset()
+  usePanelStore.setState({ byWork: {} })
   useToastStore.setState({ toasts: [] })
+  localStorage.clear()
   dropPendingDeltas()
   vi.mocked(signalEditing).mockClear()
 })
@@ -135,34 +143,210 @@ describe('applyWorkEvent — storage-originated rows (04 §4.3)', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sectionText(W, S1) })
   })
 
-  it('sections.restructured invalidates the tree', () => {
+  it('sections.restructured invalidates the tree AND the snippet list (03 §3.2)', () => {
     const qc = makeClient()
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
     applyWorkEvent(qc, W, { type: 'sections.restructured' })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
   })
 
-  it('consolidation.applied invalidates sections + snippets and clears refs', () => {
+  it('sections.restructured GCs stale fold pins and docUi refs after the refetch (§4.1)', async () => {
+    const qc = makeClient()
+    // post-refetch cache: S1 lives on; S2 (section) and S3 (snippet) are gone
+    qc.setQueryData(qk.sections(W), [section(S1)])
+    qc.setQueryData(qk.snippets(W), [])
+    usePanelStore.setState({ byWork: {} })
+    usePanelStore.getState().setFold(W, S1, 'full')
+    usePanelStore.getState().setFold(W, S2, 'name')
+    useDocUiStore.setState({
+      selection: { kind: 'snippet', id: S3 },
+      peekRevision: { snippetId: S3, rev: 1 },
+    })
+
+    applyWorkEvent(qc, W, { type: 'sections.restructured' })
+
+    await waitFor(() => {
+      expect(usePanelStore.getState().byWork[W]?.foldOverrides).toEqual({ [S1]: 'full' })
+      expect(useDocUiStore.getState().selection).toBeNull()
+      expect(useDocUiStore.getState().peekRevision).toBeNull()
+    })
+  })
+
+  it('sections.restructured never GCs against an unloaded cache', async () => {
+    const qc = makeClient() // neither sections nor snippets ever loaded
+    usePanelStore.setState({ byWork: {} })
+    usePanelStore.getState().setFold(W, S1, 'full')
+
+    applyWorkEvent(qc, W, { type: 'sections.restructured' })
+    await Promise.resolve() // let the refetch promise settle
+
+    expect(usePanelStore.getState().byWork[W]?.foldOverrides).toEqual({ [S1]: 'full' })
+  })
+
+  it('consolidation.applied toasts the undo offer; the paired restructured row refetches + GCs', async () => {
     const qc = makeClient()
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
-    useDocUiStore.setState({ selection: { kind: 'section', id: S2 } })
+    // pre-consolidation cache: two frozen chapters + the snippet being consumed
+    qc.setQueryData(qk.sections(W), [
+      section(S1, { orderKey: 'a0' }),
+      section(S2, { orderKey: 'a1' }),
+    ])
+    qc.setQueryData(qk.snippets(W), [snippet(S3, 'b0')])
+    useDocUiStore.setState({ selection: { kind: 'snippet', id: S3 } })
+
+    // The wire pair (02 §6.4): sections.restructured first, consolidation.applied second.
+    applyWorkEvent(qc, W, { type: 'sections.restructured' })
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: ['01ARZ3NDEKTSV4RRFFQ69G5FB1'],
+      title: 'The Ferry',
+      undoToken: 'tok',
+      undoDeadline: futureDeadline(),
+    })
+
+    // ONE refetch for the pair — the restructured row owns it; applied adds none.
+    expect(invalidate).toHaveBeenCalledTimes(2)
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
+
+    // toast: ordinal = leaves in cache (2) + 1, boundary title quoted, Undo action wired
+    const toast = useToastStore.getState().toasts[0]
+    expect(toast?.message).toBe('Chapter 3 "The Ferry" frozen')
+    expect(toast?.action?.label).toBe('Undo')
+
+    // post-refetch GC (§4.1 sequencing rides the restructured row): the cache still
+    // holds the consumed snippet in this seeded test, so simulate the refetch result
+    // before the microtask GC runs
+    qc.setQueryData(qk.snippets(W), [])
+    await waitFor(() => {
+      expect(useDocUiStore.getState().selection).toBeNull()
+    })
+  })
+
+  it('consolidation.applied names a multi-chapter freeze as a range', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.sections(W), [])
+    qc.setQueryData(qk.snippets(W), [])
 
     applyWorkEvent(qc, W, {
       type: 'consolidation.applied',
-      sectionIds: [S2],
-      title: 'Chapter 3',
+      sectionIds: [S1, S2, S3],
+      title: 'One',
       undoToken: 'tok',
+      undoDeadline: futureDeadline(),
     })
 
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
-    expect(useDocUiStore.getState().selection).toBeNull()
+    expect(useToastStore.getState().toasts[0]?.message).toBe('Chapters 1–3 "One" frozen')
   })
 
-  it('consolidation.undone invalidates sections + snippets', () => {
+  it('the undo toast TTL derives from undoDeadline; an expired deadline offers nothing', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.sections(W), [])
+    qc.setQueryData(qk.snippets(W), [])
+
+    // already expired (a stale attach frame): no toast at all
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S1],
+      title: 'Too Late',
+      undoToken: 'tok-old',
+      undoDeadline: new Date(Date.now() - 1_000).toISOString(),
+    })
+    expect(useToastStore.getState().toasts).toHaveLength(0)
+
+    // mid-grace: the toast appears, keyed by its undo token so a re-attach replaces
+    // rather than stacks (the synthetic attach frame re-emits this row on reload)
+    const deadline = futureDeadline()
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S1],
+      title: 'On Time',
+      undoToken: 'tok-live',
+      undoDeadline: deadline,
+    })
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S1],
+      title: 'On Time',
+      undoToken: 'tok-live',
+      undoDeadline: deadline,
+    })
+    const undoToasts = useToastStore.getState().toasts.filter((t) => t.key === 'undo:tok-live')
+    expect(undoToasts).toHaveLength(1)
+  })
+
+  it('consolidation.finalized dismisses the matching undo toast', () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.sections(W), [])
+    qc.setQueryData(qk.snippets(W), [])
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S1],
+      title: 'Superseded',
+      undoToken: 'tok-a',
+      undoDeadline: futureDeadline(),
+    })
+    applyWorkEvent(qc, W, {
+      type: 'consolidation.applied',
+      sectionIds: [S2],
+      title: 'Fresh',
+      undoToken: 'tok-b',
+      undoDeadline: futureDeadline(),
+    })
+    expect(useToastStore.getState().toasts).toHaveLength(2)
+
+    // grace expiry / early-finalize / close all emit finalized for the dead op
+    applyWorkEvent(qc, W, { type: 'consolidation.finalized', opId: 'tok-a' })
+    const remaining = useToastStore.getState().toasts
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]?.key).toBe('undo:tok-b')
+  })
+
+  it('the undo toast action POSTs the undo route and reports an expired grace', async () => {
+    const qc = makeClient()
+    qc.setQueryData(qk.sections(W), [])
+    qc.setQueryData(qk.snippets(W), [])
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { code: 'conflict', message: 'undo window has passed' } }),
+          { status: 409, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+    try {
+      applyWorkEvent(qc, W, {
+        type: 'consolidation.applied',
+        sectionIds: [S1],
+        title: '',
+        undoToken: 'tok-x',
+        undoDeadline: futureDeadline(),
+      })
+      useToastStore.getState().toasts[0]?.action?.onClick()
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          `/api/works/${W}/consolidations/tok-x/undo`,
+          expect.objectContaining({ method: 'POST' }),
+        )
+        expect(
+          useToastStore.getState().toasts.some((t) => t.message === 'Undo window has passed'),
+        ).toBe(true)
+      })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('consolidation.undone leaves the one refetch to its paired sections.restructured', () => {
     const qc = makeClient()
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    // The wire pair (02 §6.4): consolidation.undone first, sections.restructured second.
     applyWorkEvent(qc, W, { type: 'consolidation.undone', sectionIds: [S2] })
+    expect(invalidate).not.toHaveBeenCalled() // the undone row itself refetches nothing
+    applyWorkEvent(qc, W, { type: 'sections.restructured' })
+    expect(invalidate).toHaveBeenCalledTimes(2) // one sections + one snippets refetch
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sections(W) })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.snippets(W) })
   })

@@ -314,3 +314,78 @@ describe('control routes', () => {
     llm.scenario.assertDrained()
   })
 })
+
+describe('background improviser (unscripted enrich/boundaries requests)', () => {
+  const ENRICH_PROMPT =
+    '<instructions>\nProduce, in this order:\n' +
+    '<title> — a human-readable chapter name.\n' +
+    '<summary-short> — 2–4 sentences.\n<summary-long> — 1–3 paragraphs.\n</instructions>\n' +
+    '<target>\n<section id="01JGSEC" name="" fidelity="full">\nProse.\n</section>\n</target>'
+  const BOUNDARIES_PROMPT =
+    '<instructions>\nPropose boundaries as one <boundaries> block containing only JSON.\n' +
+    '</instructions>\n<local-context>\n' +
+    '<snippet id="01JGAAA">\nOne.\n</snippet>\n' +
+    '<snippet id="01JGBBB">\nTwo.\n</snippet>\n' +
+    '<snippet id="01JGCCC">\nThree.\n</snippet>\n</local-context>'
+
+  const chat = (content: string) =>
+    postJson(chatUrl(), { model: 'mock-low', messages: [{ role: 'user', content }] })
+
+  it('improvises an enrich-shaped request when the queue is empty — no poisoning', async () => {
+    llm = await createMockLlm()
+    const res = await chat(ENRICH_PROMPT)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { choices: Array<{ message: { content: string } }> }
+    const text = body.choices[0]?.message.content ?? ''
+    expect(text).toContain('<title>')
+    expect(text).toContain('<summary-short>')
+    expect(text).toContain('<summary-long>')
+    llm.scenario.assertDrained() // nothing scripted, nothing failed
+  })
+
+  it('drops the <title> block when the template pinned the title away', async () => {
+    llm = await createMockLlm()
+    const pinned = ENRICH_PROMPT.replace('<title> — a human-readable chapter name.\n', '')
+    const res = await chat(pinned)
+    const body = (await res.json()) as { choices: Array<{ message: { content: string } }> }
+    const text = body.choices[0]?.message.content ?? ''
+    expect(text).not.toContain('<title>')
+    expect(text).toContain('<summary-short>')
+    llm.scenario.assertDrained()
+  })
+
+  it('improvises a mid-prefix boundary cut from the listed snippet ids', async () => {
+    llm = await createMockLlm()
+    const res = await chat(BOUNDARIES_PROMPT)
+    const body = (await res.json()) as { choices: Array<{ message: { content: string } }> }
+    const text = body.choices[0]?.message.content ?? ''
+    const json = text.slice(text.indexOf('\n') + 1, text.lastIndexOf('\n</boundaries>'))
+    const proposal = JSON.parse(json) as {
+      boundaries: Array<{ afterSnippetId: string; kind: string }>
+    }
+    expect(proposal.boundaries).toHaveLength(1)
+    expect(proposal.boundaries[0]?.afterSnippetId).toBe('01JGBBB')
+    expect(proposal.boundaries[0]?.kind).toBe('chapter')
+    llm.scenario.assertDrained()
+  })
+
+  it('scripted steps take precedence over the improviser', async () => {
+    llm = await createMockLlm()
+    llm.scenario.respond('<summary-short>\nScripted.\n</summary-short>')
+    const res = await chat(ENRICH_PROMPT)
+    const body = (await res.json()) as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toBe('<summary-short>\nScripted.\n</summary-short>')
+    llm.scenario.assertDrained()
+  })
+
+  it('interactive requests keep the loud exhausted-queue failure', async () => {
+    llm = await createMockLlm()
+    const res = await postJson(chatUrl(), BASE_REQUEST) // not background-shaped
+    expect(res.status).toBe(500)
+    const body = (await res.json()) as { error: { type: string; message: string } }
+    expect(body.error.type).toBe('mock_scenario_error')
+    expect(body.error.message).toContain('scenario exhausted')
+    expect(llm.scenario.state().errors).toHaveLength(1)
+    llm.scenario.reset() // clear the recorded failure so afterEach teardown stays clean
+  })
+})
