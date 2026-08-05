@@ -211,6 +211,22 @@ export const IMPROVISED_SHORT_SUMMARY =
 export const IMPROVISED_LONG_SUMMARY =
   'The mock model walks the chapter start to finish in one deterministic paragraph, ' +
   'flat and factual, listing what happened in order and where the prose leaves off.'
+/** 08 §4.2 rule 2: one flowing paragraph, 60–120 words — this one is 68. */
+export const IMPROVISED_IMAGE_PROMPT =
+  'A single quiet room at dusk, seen from a low angle near the doorway, holding one steady ' +
+  'moment rather than a montage: warm lamplight pooling across a worn wooden table, dust ' +
+  'drifting in the last low sun through a half-open window, long soft shadows stretching ' +
+  'toward the foreground, muted amber and grey palette, a stillness that reads as the ' +
+  'scene pausing to breathe, medium shot, gentle natural light.'
+/** Always accepts on attempt 1 — the improviser exists to keep an UNTRIGGERED background
+ *  run quiet, not to exercise the revise loop (08 §4.1, §4.3). */
+export const IMPROVISED_CRITIQUE = {
+  verdict: 'accept' as const,
+  scores: { subject: 4, consistency: 4, craft: 4, mood: 4 },
+  overall: 8,
+  problems: [] as string[],
+  promptAdvice: '',
+}
 
 /**
  * Recognize an unscripted background-task request by its template markers and build a
@@ -223,6 +239,11 @@ export const IMPROVISED_LONG_SUMMARY =
  * - propose-boundaries (07 §6.6): instructions name the `<boundaries>` block over a
  *   `<local-context>` of `<snippet id="…">` items; the improviser cuts after the
  *   middle listed snippet (or proposes nothing when none are listed).
+ * - illustrate-compose / illustrate-revise (08 §4.2): both ask for one `<image-prompt>`
+ *   block — every enrich-section completion auto-triggers `illustrate-section` for a
+ *   stale/missing image (05 §6.2), which a test scripting only enrich never asked for.
+ * - illustrate-critique (08 §4.3): the VLM critic's fenced-JSON instructions; always
+ *   improvised as an immediate accept so the auto-triggered run commits in one attempt.
  */
 export function improviseBackgroundStep(captured: CapturedChatRequest): LlmStep | null {
   const last = messageText(captured.messages[captured.messages.length - 1])
@@ -250,6 +271,22 @@ export function improviseBackgroundStep(captured: CapturedChatRequest): LlmStep 
         ? { boundaries: [] }
         : { boundaries: [{ afterSnippetId: cut, kind: 'chapter', title: IMPROVISED_TITLE }] }
     return { type: 'respond', text: `<boundaries>\n${JSON.stringify(proposal)}\n</boundaries>` }
+  }
+
+  const imagePromptShaped = last.includes('<image-prompt>')
+  if (imagePromptShaped) {
+    return {
+      type: 'respond',
+      text: `Sure, here is the prompt:\n<image-prompt>\n${IMPROVISED_IMAGE_PROMPT}\n</image-prompt>`,
+    }
+  }
+
+  const critiqueShaped = last.includes('Reply with only a single fenced JSON code block')
+  if (critiqueShaped) {
+    return {
+      type: 'respond',
+      text: `Here is my review:\n\`\`\`json\n${JSON.stringify(IMPROVISED_CRITIQUE)}\n\`\`\``,
+    }
   }
 
   return null

@@ -42,6 +42,6 @@ export function resourceRoutes(deps: ResourceDeps): FastifyPluginAsync {
     registerImageRoutes(zodApp, deps)
     registerContextRoutes(zodApp, deps)
     registerTaskRoutes(zodApp, deps, harness)
-    registerStubRoutes(zodApp)
+    registerStubRoutes(zodApp, harness)
   }
 }

@@ -27,8 +27,29 @@ export const IllustrationMeta = z.object({
 })
 export type IllustrationMeta = z.infer<typeof IllustrationMeta>
 
-/** Pipeline phase enum (08 §4) — the vocabulary of SSE `task.progress` (03 §8.2). */
-export const IllustrationPhase = z.enum([
+/**
+ * VLM critique result (docs/08-illustration.md §4.3). One low-model call per successful attempt
+ * scores the image on a four-axis rubric; the loop stops early iff
+ * `verdict === "accept" && overall >= acceptScore`. Parsed from a fenced JSON block with one
+ * repair retry, then a neutral `{verdict: "revise", overall: 5}` fallback (§10) so a flaky critic
+ * never wedges the loop. Recorded verbatim as a `vlm.critique` toolCall run event.
+ */
+export const CritiqueResult = z.object({
+  verdict: z.enum(['accept', 'revise']),
+  scores: z.object({
+    subject: z.number().min(0).max(5), // is the chosen moment depicted? key elements present?
+    consistency: z.number().min(0).max(5), // do characters/places match the brief's descriptions?
+    craft: z.number().min(0).max(5), // artifacts: anatomy, garbled text, bad crops, dup limbs
+    mood: z.number().min(0).max(5), // tone/lighting/palette vs the section's mood
+  }),
+  overall: z.number().min(0).max(10),
+  problems: z.array(z.string()).max(5), // concrete, e.g. "the lighthouse is absent"
+  promptAdvice: z.string().max(600), // one actionable rewrite instruction for the reviser
+})
+export type CritiqueResult = z.infer<typeof CritiqueResult>
+
+/** Pipeline phase enum (08 §8) — the vocabulary of SSE `task.progress` (03 §8.2). */
+export const PipelinePhase = z.enum([
   'composing',
   'submitting',
   'queued',
@@ -37,7 +58,7 @@ export const IllustrationPhase = z.enum([
   'revising',
   'committing',
 ])
-export type IllustrationPhase = z.infer<typeof IllustrationPhase>
+export type PipelinePhase = z.infer<typeof PipelinePhase>
 
 // ---------------------------------------------------------------------------
 // ComfyUI configuration (08 §3) — `config.comfyui`.

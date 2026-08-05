@@ -183,14 +183,25 @@ export async function putWorldImage(
   const entry = await getWorldEntry(workDirPath, entryId)
   const valid = IllustrationMeta.parse(meta)
   await ensureDir(worldImagesDir(workDirPath))
-  await writeFileAtomic(worldImagePath(workDirPath, entryId), png)
-  await writeFileAtomic(
-    worldImageSidecarPath(workDirPath, entryId),
-    `${JSON.stringify(valid, null, 2)}\n`,
-  )
+  // Crash-consistent commit (§14): stage the PNG, write the sidecar meta + point the entry's
+  // frontmatter at the image, then swap the PNG into place last. A failure before the final
+  // rename discards the staged bytes, so a crash mid-first-generation never leaves an orphaned,
+  // invisible PNG (bytes on disk that nothing references and nothing sweeps).
+  const finalPng = worldImagePath(workDirPath, entryId)
+  const stagedPng = `${finalPng}.staging`
   const imagePath = worldImageRelPath(entryId)
-  const updated = WorldEntryMeta.parse({ ...entry.meta, image: imagePath })
-  await writeFileAtomic(entry.filePath, serializeEntry(updated, entry.body))
+  try {
+    await writeFileAtomic(stagedPng, png)
+    await writeFileAtomic(
+      worldImageSidecarPath(workDirPath, entryId),
+      `${JSON.stringify(valid, null, 2)}\n`,
+    )
+    const updated = WorldEntryMeta.parse({ ...entry.meta, image: imagePath })
+    await writeFileAtomic(entry.filePath, serializeEntry(updated, entry.body))
+    await fsp.rename(stagedPng, finalPng)
+  } finally {
+    await fsp.rm(stagedPng, { force: true }).catch(() => undefined)
+  }
   return { imagePath }
 }
 

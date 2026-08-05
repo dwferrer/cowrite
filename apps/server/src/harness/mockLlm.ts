@@ -1,5 +1,5 @@
 import type { AppConfig } from '@cowrite/shared'
-import { ModelEndpoint } from '@cowrite/shared'
+import { ComfyConfig, ModelEndpoint } from '@cowrite/shared'
 
 /**
  * COWRITE_MOCK_LLM=1 / --mock wiring (docs/09-testing.md §2.3): the composition root
@@ -21,4 +21,23 @@ export function withMockModels(config: AppConfig, mockUrl: string): AppConfig {
     ...config,
     models: { high: endpoint('mock-high'), low: endpoint('mock-low') },
   }
+}
+
+/**
+ * The mock ComfyUI config (docs/09 §2.3, 08 §11): a one-entry `default` workflow routed to
+ * both kinds, pointed at the in-process mock and a hermetic workflow dir the harness seeds
+ * with the shipped sample. Built ONCE per boot so the harness's reference-compared runtime
+ * cache (§3 hot-apply) never rebuilds spuriously.
+ */
+export function buildMockComfyConfig(baseUrl: string, workflowsDir: string): ComfyConfig {
+  return ComfyConfig.parse({
+    baseUrl,
+    workflowsDir,
+    workflows: { default: { file: 'default.json', label: 'Default (mock SDXL)' } },
+  })
+}
+
+/** Overlay the ComfyUI block with a prebuilt (stable-reference) mock config. */
+export function withMockComfy(config: AppConfig, comfyui: ComfyConfig): AppConfig {
+  return { ...config, comfyui }
 }

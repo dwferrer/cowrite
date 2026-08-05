@@ -1,5 +1,6 @@
 import {
   api,
+  type SectionRow,
   type SituationDto,
   type SnippetDto,
   type TaskSpec,
@@ -28,6 +29,9 @@ export const qk = {
   world: (w: string) => ['work', w, 'world'] as const,
   tasks: (w: string) => ['work', w, 'tasks'] as const,
   run: (w: string, r: string) => ['work', w, 'run', r] as const,
+  runsByArtifact: (w: string, artifact: string) =>
+    ['work', w, 'runs', 'artifact', artifact] as const,
+  illustrationHealth: () => ['illustrationHealth'] as const,
   ctxCandidates: (w: string) => ['work', w, 'ctx', 'candidates'] as const, // M2
 }
 
@@ -118,6 +122,24 @@ export function useRun(workId: string, runId: string, enabled = true) {
     queryFn: ({ signal }) => apiCall('getRun', [workId, runId], { signal }),
     staleTime: Number.POSITIVE_INFINITY,
     enabled,
+  })
+}
+
+/** Illustrate runs for one section/entry (08 §6 `run_artifacts` index) — the provenance
+ *  footer's run links (04 §10). `artifact` is `"<kind>:<id>"` (03 §3.9). */
+export function useIllustrationRuns(workId: string, artifact: string, enabled = true, limit = 5) {
+  return useQuery({
+    queryKey: qk.runsByArtifact(workId, artifact),
+    queryFn: ({ signal }) => apiCall('listRuns', [workId], { query: { artifact, limit }, signal }),
+    enabled,
+  })
+}
+
+/** GET /api/illustration/health (08 §8) — the settings-page ComfyUI status row. */
+export function useIllustrationHealth() {
+  return useQuery({
+    queryKey: qk.illustrationHealth(),
+    queryFn: ({ signal }) => apiCall('illustrationHealth', [], { signal }),
   })
 }
 
@@ -381,6 +403,26 @@ export function useDeleteWorldImage(workId: string) {
     mutationFn: (entryId: string) => apiCall('deleteWorldImage', [workId, entryId]),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.world(workId) })
+    },
+  })
+}
+
+/** DELETE …/illustration (08 §5, §8): tombstones the slot. Optimistic — `enrichment.updated`
+ *  also patches the row over SSE, but the click should feel instant. */
+export function useDeleteSectionIllustration(workId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (sectionId: string) => apiCall('deleteSectionIllustration', [workId, sectionId]),
+    onMutate: async (sectionId) => {
+      await qc.cancelQueries({ queryKey: qk.sections(workId) })
+      const previous = qc.getQueryData<SectionRow[]>(qk.sections(workId))
+      qc.setQueryData<SectionRow[]>(qk.sections(workId), (old) =>
+        old?.map((row) => (row.id === sectionId ? { ...row, illustration: null } : row)),
+      )
+      return { previous }
+    },
+    onError: (_err, _sectionId, context) => {
+      if (context?.previous) qc.setQueryData(qk.sections(workId), context.previous)
     },
   })
 }

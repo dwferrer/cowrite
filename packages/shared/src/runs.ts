@@ -89,7 +89,15 @@ export const RunEvent = z.discriminatedUnion('type', [
     // Defaulted for pre-existing run files, which were all single-attempt joins.
     attempt: z.number().int().min(1).default(1),
   }),
-  z.object({ type: z.literal('attempt'), n: z.number().int(), reason: z.string() }),
+  z.object({
+    type: z.literal('attempt'),
+    n: z.number().int(),
+    reason: z.string(),
+    // Illustration loop (08 §4.4): the seed this attempt fed ComfyUI (reproducibility) and,
+    // on a critiqued attempt, its overall score. Absent on non-illustration retries.
+    seed: z.number().int().optional(),
+    score: z.number().optional(),
+  }),
   z.object({
     type: z.literal('usage'),
     promptTokens: z.number().int(),

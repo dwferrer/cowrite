@@ -1,4 +1,5 @@
-import type { ContextSnapshot, RunEvent } from '@cowrite/shared'
+import type { ContextSnapshot, CritiqueResult, RunEvent } from '@cowrite/shared'
+import { api, CritiqueResult as CritiqueResultSchema } from '@cowrite/shared'
 import { useEffect, useRef } from 'react'
 import { useRun } from '../api/queries.js'
 import { useDocUiStore } from '../state/docUiStore.js'
@@ -17,6 +18,12 @@ import { Button } from '../ui/Button.js'
  * - tool calls as timeline steps with human labels, raw input/output on expand;
  * - streamed output, retries, usage rows, proposal resolution;
  * - artifacts link back into the document (select + navigate).
+ *
+ * `illustrate-section` / `world-image` runs additionally get a dedicated Illustration section
+ * (docs/08-illustration.md §4.2, §4.3): the composed/revised prompts, each attempt's
+ * `vlm.critique` scores/problems/promptAdvice, and the committed image (08 §8). The loop emits a
+ * per-attempt `attempt` event carrying that attempt's seed (and score), so each attempt shows its
+ * recorded seed for reproducibility from the run file.
  */
 
 export interface RunViewerProps {
@@ -70,6 +77,116 @@ function Regions({ snapshot }: { snapshot: ContextSnapshot }) {
         </details>
       ) : null}
     </details>
+  )
+}
+
+/** A composed/revised `<image-prompt>` reply — distinguished from a critique reply by shape
+ *  (the critic always answers fenced JSON carrying `"verdict"`; the composer never does). */
+function isComposedPromptText(text: string): boolean {
+  const trimmed = text.trim()
+  return trimmed !== '' && !trimmed.includes('"verdict"')
+}
+
+function Illustration({
+  workId,
+  meta,
+  events,
+  artifacts,
+}: {
+  workId: string
+  meta: MetaEvent
+  events: RunEvent[]
+  artifacts: ResultEvent['artifacts']
+}) {
+  const prompts = events
+    .filter((e): e is Extract<RunEvent, { type: 'message' }> => e.type === 'message')
+    .filter((e) => e.role === 'assistant' && isComposedPromptText(e.text))
+  const critiques = events.filter(
+    (e): e is Extract<RunEvent, { type: 'toolCall' }> =>
+      e.type === 'toolCall' && e.name === 'vlm.critique',
+  )
+  const artifact = artifacts.find((a) => a.kind === 'illustration' || a.kind === 'world-image')
+  const imgSrc =
+    artifact?.sectionId !== undefined
+      ? api.getSectionIllustration.path(workId, artifact.sectionId)
+      : artifact?.entryId !== undefined
+        ? api.getWorldImage.path(workId, artifact.entryId)
+        : null
+
+  if (prompts.length === 0 && critiques.length === 0 && imgSrc === null) return null
+
+  return (
+    <div className="run-section run-section--nested" data-testid={testids.runIllustrationSection}>
+      <div style={{ fontWeight: 600, marginBottom: 'var(--space-2)' }}>Illustration</div>
+      {prompts.map((p, i) => (
+        <details
+          // biome-ignore lint/suspicious/noArrayIndexKey: run JSONL is immutable — the line index is a stable identity
+          key={`p:${i}`}
+          className="run-section run-section--nested"
+          data-testid={testids.runIllustrationPrompt}
+        >
+          <summary>{i === 0 ? 'Composed prompt' : `Revised prompt (${i + 1})`}</summary>
+          <pre className="run-raw">{p.text}</pre>
+        </details>
+      ))}
+      {critiques.map((c, i) => {
+        let raw: unknown = null
+        try {
+          raw = JSON.parse(c.output)
+        } catch {
+          // fall through to the raw-text rendering below
+        }
+        const parsed = CritiqueResultSchema.safeParse(raw)
+        const crit: CritiqueResult | null = parsed.success ? parsed.data : null
+        return (
+          <details
+            // biome-ignore lint/suspicious/noArrayIndexKey: run JSONL is immutable — the line index is a stable identity
+            key={`c:${i}`}
+            className="run-section run-section--nested"
+            data-testid={testids.runIllustrationCritique}
+          >
+            <summary>
+              Attempt {i + 1} — {crit ? `${crit.verdict}, ${crit.overall}/10` : 'unparsed'}
+            </summary>
+            {crit ? (
+              <>
+                <div style={{ color: 'var(--fg-muted)', fontSize: 12 }}>
+                  subject {crit.scores.subject} · consistency {crit.scores.consistency} · craft{' '}
+                  {crit.scores.craft} · mood {crit.scores.mood}
+                </div>
+                {crit.problems.length > 0 ? (
+                  <ul className="run-region-list">
+                    {crit.problems.map((problem) => (
+                      <li key={problem}>{problem}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {crit.promptAdvice ? (
+                  <div style={{ fontSize: 12 }}>advice: {crit.promptAdvice}</div>
+                ) : null}
+              </>
+            ) : (
+              <pre className="run-raw">{c.output}</pre>
+            )}
+          </details>
+        )
+      })}
+      {imgSrc !== null ? (
+        <img
+          data-testid={testids.runIllustrationArtifactImage}
+          src={imgSrc}
+          alt={
+            meta.spec.kind === 'illustrate-section' ? 'Committed illustration' : 'Committed image'
+          }
+          style={{
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-1)',
+            marginTop: 'var(--space-2)',
+            maxWidth: 240,
+          }}
+        />
+      ) : null}
+    </div>
   )
 }
 
@@ -154,6 +271,15 @@ export function RunViewer({ workId, runId, onClose }: RunViewerProps) {
 
         {meta?.contextSnapshot ? <Regions snapshot={meta.contextSnapshot} /> : null}
 
+        {meta && (meta.kind === 'illustrate-section' || meta.kind === 'world-image') ? (
+          <Illustration
+            workId={workId}
+            meta={meta}
+            events={events}
+            artifacts={result?.artifacts ?? []}
+          />
+        ) : null}
+
         <ol className="run-timeline">
           {events.map((event, i) => {
             // run JSONL is immutable — the line index is a stable identity
@@ -178,12 +304,23 @@ export function RunViewer({ workId, runId, onClose }: RunViewerProps) {
                     </details>
                   </li>
                 )
-              case 'attempt':
+              case 'attempt': {
+                // Illustration attempts carry a seed (and score on a critiqued attempt) for
+                // reproducibility (08 §4.4); a bare retry (writing lane) carries only a reason.
+                const scored = event.score !== undefined
+                const seedText = event.seed !== undefined ? ` · seed ${event.seed}` : ''
                 return (
-                  <li key={key} className="run-step run-step--warn">
-                    ● retry {event.n} — {event.reason}
+                  <li
+                    key={key}
+                    className={`run-step${scored ? '' : ' run-step--warn'}`}
+                    data-testid={testids.runAttempt}
+                  >
+                    ● attempt {event.n}
+                    {seedText}
+                    {scored ? ` · score ${event.score}` : ` — ${event.reason}`}
                   </li>
                 )
+              }
               case 'usage':
                 return (
                   <li key={key} className="run-step run-step--faint">

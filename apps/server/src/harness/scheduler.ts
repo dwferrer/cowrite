@@ -27,8 +27,11 @@ import type { BackgroundOutcome } from './backgroundTasks.js'
  * The staleness sweep runs on a tick while the work has ≥ 1 SSE
  * subscriber and the interactive lane has been idle ≥ 60 s, capped at 4 enqueues per
  * sweep window; the engine's `enrichment_wanted` channel draws on the same budget.
- * Illustration staleness is deliberately SKIPPED — Stage 5 (docs/10) lands the
- * `illustrate-section` pipeline; sweeping it now would enqueue a kind with no handler.
+ * Illustration (Stage 5, docs/08 §5): each enrich-section completion triggers an
+ * illustrate-section for that section when its image is stale/missing, and the sweep
+ * re-illustrates sections whose `illustrationStale` flag is set (word-delta / missing on a
+ * frozen leaf; tombstones and user uploads are skipped by the index). Both draw on the
+ * same sweep budget and are gated behind `illustrationReady` (comfyui + low lane).
  *
  * An unconfigured low lane surfaces cleanly: gates check `backgroundReady` BEFORE
  * creating tasks, so the scheduler backs off quietly (one log line) instead of
@@ -69,6 +72,19 @@ export interface SchedulerHost {
   }
   /** Cancel queued/running tasks touching these ids and wait for them to settle. */
   cancelByTargetAndSettle(targetIds: readonly string[]): Promise<void>
+  /** Would an illustrate-section submit succeed? (comfyui + low lane configured, spend ok).
+   *  Absent ⇒ illustration is unwired and the sweep skips it entirely (Stage-4 hosts). */
+  illustrationReady?(): boolean
+  /** Enqueue an illustrate-section on the app-wide illustration lane; `(kind, id)`-deduped
+   *  (05 §6.1). Returns the run outcome (when not deduped) so the scheduler can back off a
+   *  section whose workflow/box keeps failing — a broken graph must not re-submit every sweep
+   *  forever (§11). Absent ⇒ illustration is unwired. */
+  enqueueIllustrate?(sectionId: string): { outcome?: Promise<IllustrationSweepOutcome> } | undefined
+}
+
+/** The terminal status of a scheduler-initiated illustrate run, fed to the failure cooldown. */
+export interface IllustrationSweepOutcome {
+  status: 'ok' | 'error' | 'cancelled'
 }
 
 export interface SchedulerOptions {
@@ -122,6 +138,12 @@ export class WorkScheduler {
   /** Per-section enrich failure cooldown: consecutive failures → exponential
    *  not-before (base = one sweep window, cap ~1 h); reset on content change. */
   private readonly enrichFailures = new Map<string, { failures: number; notBeforeMs: number }>()
+  /** Per-section illustrate failure cooldown (§11): same exponential backoff as enrichment, so a
+   *  broken workflow / flaky ComfyUI box doesn't re-submit a real generate() every sweep. */
+  private readonly illustrationFailures = new Map<
+    string,
+    { failures: number; notBeforeMs: number }
+  >()
 
   constructor(
     storage: SchedulerStorage,
@@ -150,6 +172,10 @@ export class WorkScheduler {
         const sectionId = (event as { sectionId?: unknown }).sectionId
         if (event.type === 'enrichment_wanted' && typeof sectionId === 'string') {
           this.onEnrichmentWanted(sectionId)
+        }
+        // §5 default flow: a section freezes → enrich-section → on success, illustrate-section.
+        if (event.type === 'enrichment.completed' && typeof sectionId === 'string') {
+          this.onEnrichmentCompleted(sectionId)
         }
       }),
     )
@@ -184,9 +210,10 @@ export class WorkScheduler {
         this.armDebounce()
         return
       case 'section.changed':
-        // Content changed: the failure cooldown is about the OLD prose — reset it so
-        // the sweep may retry the fresh text immediately.
+        // Content changed: the failure cooldowns are about the OLD prose — reset them so
+        // the sweep may retry the fresh text immediately (§11).
         this.enrichFailures.delete(change.sectionId)
+        this.illustrationFailures.delete(change.sectionId)
         return
       case 'consolidation.applied':
         // One enqueue path for agent applies and heuristic splits (05 §6.2
@@ -379,14 +406,75 @@ export class WorkScheduler {
       this.warnNotReadyOnce('enrichment sweep')
       return
     }
-    // Stage-4 scope (docs/10): the 'summary' staleness scope is THE §6.5 spelling —
-    // leaf sections with stale/missing summaries. Illustration staleness is
-    // deliberately SKIPPED until Stage 5 lands the illustrate-section pipeline —
-    // enqueueing that kind today has no handler.
+    // The 'summary' staleness scope is THE §6.5 spelling — leaf sections with
+    // stale/missing summaries.
     for (const row of this.storage.staleSections('summary')) {
       if (this.sweepBudget <= 0) break
       if (this.tryEnqueueEnrich(row.id)) this.sweepBudget--
     }
+    // Stage 5 (§5 staleness): re-illustrate sections whose image moved > the word-delta
+    // threshold or went missing on a frozen leaf. The index's `illustrationStale` flag
+    // already skips tombstones and user uploads (02 §staleness); the illustration enqueues
+    // draw on the SAME sweep budget as enrichment (one spend bound).
+    if (this.host.illustrationReady?.() === true) {
+      for (const row of this.storage.staleSections('any')) {
+        if (this.sweepBudget <= 0) break
+        if (!row.illustrationStale) continue
+        if (this.tryEnqueueIllustrate(row.id)) this.sweepBudget--
+      }
+    }
+  }
+
+  /** §5 default flow: after an enrich-section commits, illustrate the section if its image
+   *  is now stale/missing (a freshly frozen leaf with no image). Draws on the sweep budget. */
+  private onEnrichmentCompleted(sectionId: string): void {
+    if (this.disposed) return
+    if (this.host.illustrationReady?.() !== true) return
+    this.refillBudget()
+    if (this.sweepBudget <= 0) return
+    const stale = this.storage
+      .staleSections('any')
+      .some((r) => r.id === sectionId && r.illustrationStale)
+    if (!stale) return
+    if (this.tryEnqueueIllustrate(sectionId)) this.sweepBudget--
+  }
+
+  private tryEnqueueIllustrate(sectionId: string): boolean {
+    if (this.undoSuppressed.has(sectionId)) return false // undo in flight for this section
+    // §11: back off a section whose illustrate keeps failing — don't re-submit every sweep.
+    const cooldown = this.illustrationFailures.get(sectionId)
+    if (cooldown !== undefined && this.now() < cooldown.notBeforeMs) return false
+    try {
+      const res = this.host.enqueueIllustrate?.(sectionId)
+      const outcome = res?.outcome
+      if (outcome !== undefined) {
+        void outcome.then((o) => {
+          if (this.disposed) return
+          if (o.status === 'error') this.recordIllustrateFailure(sectionId)
+          else if (o.status === 'ok') this.illustrationFailures.delete(sectionId)
+        })
+      }
+      return true
+    } catch (err) {
+      // config_missing / spend_stop raced the ready check, or the section vanished — quiet;
+      // the staleness badge persists and a later sweep retries (05 §11 background quiet).
+      this.warn(
+        `illustrate enqueue for ${sectionId} failed: ${err instanceof Error ? err.message : err}`,
+      )
+      this.recordIllustrateFailure(sectionId)
+      return false
+    }
+  }
+
+  /** Exponential per-section cooldown after a failed illustrate: base = one sweep window,
+   *  doubling per consecutive failure, capped at ~1 h; reset on content change / ok (§11). */
+  private recordIllustrateFailure(sectionId: string): void {
+    const failures = (this.illustrationFailures.get(sectionId)?.failures ?? 0) + 1
+    const backoffMs = Math.min(
+      this.sweepTickMs * 2 ** (failures - 1),
+      ENRICH_FAILURE_BACKOFF_CAP_MS,
+    )
+    this.illustrationFailures.set(sectionId, { failures, notBeforeMs: this.now() + backoffMs })
   }
 
   /** 06's `enrichment_wanted` channel: same budget, no idle gate (a task IS running). */

@@ -145,6 +145,7 @@ export function DocView({ workId, readonly = false }: DocViewProps) {
             depth={block.depth}
             fold={block.fold}
             onBeforeFoldChange={anchorToSection}
+            readonly={readonly}
           />
         )
       case 'sectionBody':

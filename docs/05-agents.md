@@ -859,9 +859,23 @@ loudly — permissive fallthrough is how mock tests rot. *Rejected:* VCR-style r
 The harness owns the illustration tasks' queue slot, run record, cancellation, and time budget;
 the pipeline (08) owns everything between:
 
+Everything the pipeline touches — models, ComfyUI, storage, image ops, the registry, loop knobs,
+templates — arrives through this one injected seam, so the loop/composer/critic are pure and unit
+tests supply fakes with no HTTP, no models, and no ComfyUI (08 §11). The five members named here
+(`lowClient`, `emit`, `progress`, `signal`, `remainingMs`) keep their exact spelling; 08's pipeline
+additionally needs the rest, so the harness supplies those too (the interface lives in
+`illustration/ctx.ts`):
+
 ```ts
 export interface RunContext {
+  runId: string;                         // taskId == runId; stamped into IllustrationMeta.runId
   lowClient: LlmClient;                  // accepts image_url content parts (low lane only)
+  comfy: ComfyClient;                    // the 08 §2.3 ComfyUI client (health, generate, interrupt)
+  storage: IllustrationStorage;          // intent reads + the single winner commit (08 §4.2, §6)
+  imageOps: ImageOps;                    // sharp-backed downscale (critic) + transcode-to-PNG (§10)
+  registry: WorkflowRegistry;            // resolves the route workflow; dangling → config_missing
+  loop: { maxAttempts: number; acceptScore: number };  // comfyui.loop knobs (defaults 3 / 7)
+  templates: TemplateSet;                // the loaded prompt set; promptsHash stamped by the harness
   emit(e: RunEvent): void;               // recorded on the harness's run file
   progress(p: { phase: PipelinePhase;   // 08's enum; forwarded as task.progress WorkEvents
                 attempt: number; maxAttempts: number; pct: number | null }): void;

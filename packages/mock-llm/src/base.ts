@@ -44,6 +44,8 @@ export interface MockHttpServer {
   url: string
   port: number
   timers: TimerPool
+  /** The raw server, exposed so a caller (the ComfyUI mock) can attach a WS `upgrade` handler. */
+  server: http.Server
   close: () => Promise<void>
 }
 
@@ -79,6 +81,7 @@ export async function startMockServer(handler: Handler, port = 0): Promise<MockH
     url: `http://127.0.0.1:${boundPort}`,
     port: boundPort,
     timers,
+    server,
     close: async () => {
       timers.clearAll()
       for (const socket of sockets) socket.destroy()

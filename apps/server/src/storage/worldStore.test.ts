@@ -3,7 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { IllustrationMeta } from '@cowrite/shared'
 import { ulid } from 'ulid'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as fsx from './lib/fsx.js'
 import { xxh64OfString } from './lib/hash.js'
 import { shortId, worldEntriesDir, worldImagesDir } from './lib/paths.js'
 import type { WorldEntry } from './storageTypes.js'
@@ -193,6 +194,34 @@ describe('putWorldImage', () => {
     await expect(
       putWorldImage(workDir, ulid(), Uint8Array.from([1]), illustrationFixture()),
     ).rejects.toBeInstanceOf(WorldEntryNotFoundError)
+  })
+
+  it('a crash mid first-generation leaves no orphaned, invisible PNG (§14)', async () => {
+    const entry = await upsertOk(workDir, { name: 'Mara', createdBy: 'user', body: 'x' })
+    expect(entry.meta.image).toBeNull()
+
+    const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
+    // Fail the frontmatter write (the entry .md that would make the image visible), simulating a
+    // crash mid-commit before the PNG is swapped into place.
+    const real = fsx.writeFileAtomic
+    const spy = vi.spyOn(fsx, 'writeFileAtomic').mockImplementation(async (p, data) => {
+      if (String(p).endsWith('.md')) throw new Error('disk full writing the entry frontmatter')
+      return real(p, data)
+    })
+    try {
+      await expect(
+        putWorldImage(workDir, entry.meta.id, png, illustrationFixture()),
+      ).rejects.toThrow('disk full')
+    } finally {
+      spy.mockRestore()
+    }
+
+    // The entry still shows no image (invisible == "no generation happened"), and — crucially —
+    // there is NO orphaned PNG left in world/images that nothing references.
+    expect((await getWorldEntry(workDir, entry.meta.id)).meta.image).toBeNull()
+    const finalPng = path.join(worldImagesDir(workDir), `${entry.meta.id}.png`)
+    await expect(fsp.stat(finalPng)).rejects.toThrow()
+    await expect(fsp.stat(`${finalPng}.staging`)).rejects.toThrow()
   })
 })
 

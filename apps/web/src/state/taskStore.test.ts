@@ -1,6 +1,6 @@
 import type { Task, TaskSpec } from '@cowrite/shared'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { specTarget, useTaskStore } from './taskStore.js'
+import { findIllustrationTask, specTarget, useTaskStore } from './taskStore.js'
 
 /**
  * Lane routing + slot lifecycle (docs/04-frontend.md §4.4): one interactive slot, a
@@ -245,6 +245,25 @@ describe('task.state attach-frame hydration (03 §8.3)', () => {
     const s = useTaskStore.getState()
     expect(s.interactive?.taskId).toBe(T1)
     expect(s.interactive?.stage).toBe('planning') // no snapshot text yet — planning line
+  })
+
+  it('a running illustration frame seeds the background map so the caption resumes (§19)', () => {
+    const spec: TaskSpec = { kind: 'illustrate-section', sectionId: S1 }
+    // A reconnect replays the illustration task.state, then its latest task.progress.
+    useTaskStore.getState().stateFrame(task(T2, spec, 'illustration'), 'illustration', {
+      kind: 'section',
+      id: S1,
+    })
+    useTaskStore
+      .getState()
+      .progress(T2, { phase: 'generating', attempt: 2, maxAttempts: 3, pct: 64 })
+    const view = findIllustrationTask(useTaskStore.getState().background, 'section', S1)
+    expect(view).not.toBeNull()
+    expect(view?.taskId).toBe(T2)
+    expect(view?.phase).toBe('generating')
+    expect(view?.pct).toBe(64)
+    // it must not touch the interactive slot
+    expect(useTaskStore.getState().interactive).toBeNull()
   })
 
   it('a running frame never clobbers the live slot for the same task', () => {

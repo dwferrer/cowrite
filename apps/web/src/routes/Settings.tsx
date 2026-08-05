@@ -6,6 +6,7 @@ import { type ApiBody, ApiError } from '../api/client.js'
 import {
   fetchConfig,
   useConfig,
+  useIllustrationHealth,
   useReloadConfig,
   useTestConfig,
   useUpdateConfig,
@@ -205,6 +206,67 @@ function ProbeResultLine({ result }: { result: ProbeResult }) {
   )
 }
 
+/** GET /api/illustration/health (08 §8): reachability + per-workflow registry validation +
+ *  route resolution — the status row 03 §9.4's ComfyUI setup card promises. */
+function ComfyHealthReport() {
+  const health = useIllustrationHealth()
+  if (health.isLoading) return null
+  if (health.isError || !health.data) {
+    return (
+      <p
+        data-testid={testids.settingsComfyHealth}
+        style={{ color: 'var(--fg-faint)', fontSize: 13 }}
+      >
+        Health report unavailable — configure and save a base URL first.
+      </p>
+    )
+  }
+  const { comfy, workflows, route } = health.data
+  return (
+    <div
+      data-testid={testids.settingsComfyHealth}
+      style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}
+    >
+      <div style={{ color: comfy.ok ? 'var(--ok)' : 'var(--danger)' }}>
+        ComfyUI: {comfy.ok ? 'reachable' : `unreachable${comfy.detail ? ` — ${comfy.detail}` : ''}`}
+      </div>
+      {workflows.map((wf) => (
+        <div
+          key={wf.name}
+          data-testid={testids.settingsComfyWorkflowRow}
+          style={{ color: wf.ok ? 'var(--fg-muted)' : 'var(--danger)' }}
+        >
+          {wf.label} ({wf.name}): {wf.ok ? 'ok' : (wf.error ?? 'invalid')}
+        </div>
+      ))}
+      <div style={{ color: 'var(--fg-muted)' }}>
+        routes: section → {route.section.name} ({route.section.ok ? 'ok' : 'broken'}) · world →{' '}
+        {route.world.name} ({route.world.ok ? 'ok' : 'broken'})
+      </div>
+    </div>
+  )
+}
+
+/** The %marker% node-title setup step (08 §2.2) — the one manual step a user must perform on
+ *  their exported workflow before Cowrite can use it. Surfaced prominently per 03 §9.4. */
+function ComfyMarkerHelp() {
+  return (
+    <details data-testid={testids.settingsComfyMarkerHelp}>
+      <summary style={{ color: 'var(--accent)', cursor: 'pointer', fontSize: 13 }}>
+        One-time setup: marking your workflow
+      </summary>
+      <div style={{ color: 'var(--fg-muted)', fontSize: 12, marginTop: 4 }}>
+        In ComfyUI, rename the node titles Cowrite should write into so they contain{' '}
+        <code>%prompt%</code> (the text-encode node), <code>%seed%</code> (the sampler — every
+        sampler that should share the seed), and optionally <code>%output%</code> (the save node,
+        only needed when the graph has more than one). Then export with "Save (API format)" into
+        your workflows folder. The workflow stays fully loadable and editable in ComfyUI — titles
+        are cosmetic to the executor.
+      </div>
+    </details>
+  )
+}
+
 interface EndpointCardProps {
   title: string
   description: string
@@ -290,6 +352,12 @@ function EndpointCard(props: EndpointCardProps) {
         </Button>
       </div>
       {props.testResult ? <ProbeResultLine result={props.testResult} /> : null}
+      {target === 'comfyui' ? (
+        <>
+          <ComfyMarkerHelp />
+          <ComfyHealthReport />
+        </>
+      ) : null}
     </section>
   )
 }

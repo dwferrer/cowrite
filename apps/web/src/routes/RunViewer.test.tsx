@@ -148,3 +148,90 @@ describe('RunViewer', () => {
     expect(onClose).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('RunViewer illustration rendering (08 §4.2, §4.3)', () => {
+  const R2 = '01ARZ3NDEKTSV4RRFFQ69G5FC2'
+
+  const illustrationRun: RunEvent[] = [
+    {
+      type: 'meta',
+      runId: R2,
+      kind: 'illustrate-section',
+      lane: 'low',
+      model: 'mock-vlm-low',
+      spec: { kind: 'illustrate-section', sectionId: SID },
+      params: { promptsHash: 'xxh64:beef0000beef0000' },
+      contextSnapshot: null,
+      startedAt: '2026-08-02T00:00:00.000Z',
+    },
+    { type: 'message', role: 'user', text: '<instructions>compose…</instructions>' },
+    { type: 'output', text: '<image-prompt>A lighthouse at dusk.</image-prompt>', attempt: 1 },
+    {
+      type: 'message',
+      role: 'assistant',
+      text: '<image-prompt>A lighthouse at dusk.</image-prompt>',
+    },
+    { type: 'message', role: 'user', text: 'critique instructions…\n[image attached]' },
+    {
+      type: 'message',
+      role: 'assistant',
+      text: '```json\n{"verdict":"accept","overall":8}\n```',
+    },
+    {
+      type: 'toolCall',
+      name: 'vlm.critique',
+      input: { prompt: 'A lighthouse at dusk.' },
+      output: JSON.stringify({
+        verdict: 'accept',
+        scores: { subject: 4, consistency: 4, craft: 4, mood: 4 },
+        overall: 8,
+        problems: [],
+        promptAdvice: '',
+      }),
+      durationMs: 1200,
+    },
+    {
+      type: 'result',
+      status: 'ok',
+      usageTotal: { promptTokens: 900, completionTokens: 120, estimated: false },
+      partialText: null,
+      artifacts: [{ kind: 'illustration', sectionId: SID, state: 'committed' }],
+      endedAt: '2026-08-02T00:00:05.000Z',
+    },
+  ]
+
+  function renderIllustrationViewer() {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
+    })
+    qc.setQueryData(qk.run(W, R2), illustrationRun)
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[`/w/${W}/runs/${R2}`]}>
+          <RunViewer workId={W} runId={R2} onClose={vi.fn()} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+  }
+
+  it('renders the composed prompt, the critique scores/problems/advice, and the committed image', () => {
+    renderIllustrationViewer()
+
+    const prompt = screen.getByTestId(testids.runIllustrationPrompt)
+    fireEvent.click(prompt.querySelector('summary') as HTMLElement)
+    expect(prompt.textContent).toContain('A lighthouse at dusk.')
+
+    const critique = screen.getByTestId(testids.runIllustrationCritique)
+    expect(critique.textContent).toContain('accept, 8/10')
+    fireEvent.click(critique.querySelector('summary') as HTMLElement)
+    expect(critique.textContent).toContain('subject 4')
+
+    const img = screen.getByTestId(testids.runIllustrationArtifactImage) as HTMLImageElement
+    expect(img.src).toContain(`/api/works/${W}/sections/${SID}/illustration`)
+  })
+
+  it('a non-illustration run renders no Illustration section', () => {
+    renderViewer()
+    expect(screen.queryByTestId(testids.runIllustrationSection)).toBeNull()
+  })
+})

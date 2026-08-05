@@ -367,9 +367,14 @@ export interface WorkHandle {
    * vanished). Throws WorldEntryNotFoundError for an unknown entry.
    */
   worldImagePath(entryId: string): { absPath: string; version: string } | null
-  listIllustrationMetas(): Promise<
-    Array<{ kind: 'section' | 'world'; id: string; meta: IllustrationMeta }>
-  >
+  /**
+   * Established-imagery lookup (08 §4.2, §7): illustration metas whose recorded `entities`
+   * intersect `entityIds`. Targeted — world images are keyed by entry id (read directly) and
+   * only index-flagged illustrated sections are read — so a compose never walks the whole tree.
+   */
+  listIllustrationMetasByEntities(
+    entityIds: string[],
+  ): Promise<Array<{ kind: 'section' | 'world'; id: string; meta: IllustrationMeta }>>
 
   // runs (§2.7, §10.7). Deviation from the §11 one-arg spelling: the sink needs the
   // run's start instant to pick the runs/<YYYY-MM>/ shard before any event arrives.
@@ -1023,24 +1028,34 @@ export async function openWork(
       }
       return null
     },
-    listIllustrationMetas: async () => {
+    listIllustrationMetasByEntities: async (entityIds) => {
+      const wanted = new Set(entityIds)
       const out: Array<{ kind: 'section' | 'world'; id: string; meta: IllustrationMeta }> = []
-      for (const node of await sections.walkSectionTree(dir)) {
-        const slot = node.meta.enrichments.illustration
-        if (slot !== null && !('suppressed' in slot)) {
-          out.push({ kind: 'section', id: node.meta.id, meta: slot })
-        }
-      }
-      for (const entry of await world.listWorldEntries(dir)) {
-        if (entry.meta.image === null) continue
-        const raw = await readIfExists(worldImageSidecarPath(dir, entry.meta.id))
+      if (wanted.size === 0) return out
+      // World images are keyed by entry id and their `entities` are exactly `[entryId]`, so a
+      // world image matches iff its entry is in `wanted`: read ONLY those sidecars (index tells
+      // us which requested entries actually have an image), never the whole world list.
+      for (const id of wanted) {
+        const row = db.getWorldEntry(id)
+        if (row === null || row.imagePath === null) continue
+        const raw = await readIfExists(worldImageSidecarPath(dir, id))
         if (raw === null) continue
         try {
-          const meta = IllustrationMetaSchema.parse(JSON.parse(raw))
-          out.push({ kind: 'world', id: entry.meta.id, meta })
+          out.push({ kind: 'world', id, meta: IllustrationMetaSchema.parse(JSON.parse(raw)) })
         } catch {
-          // a hand-mangled sidecar hides its meta but must not break the listing
+          // a hand-mangled sidecar hides its meta but must not break the lookup
         }
+      }
+      // Section illustrations carry the matched world-entry ids in `entities`, but there is no
+      // entity→section index; the index DOES flag which sections have an illustration, so read
+      // only those section.json files (not the whole tree) and keep the ones sharing an entity.
+      for (const srow of db.listSectionRows()) {
+        if (srow.illustrationHash === null) continue
+        const meta = await sections.tryReadSectionMeta(path.join(dir, ...srow.dirPath.split('/')))
+        const slot = meta?.enrichments.illustration
+        if (slot === null || slot === undefined || 'suppressed' in slot) continue
+        if (!slot.entities.some((e) => wanted.has(e))) continue
+        out.push({ kind: 'section', id: srow.id, meta: slot })
       }
       return out
     },

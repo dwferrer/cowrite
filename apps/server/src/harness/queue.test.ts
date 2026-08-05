@@ -93,6 +93,43 @@ describe('QueueLane', () => {
     expect(order).toEqual(['boundary', 'slow'])
   })
 
+  it('a jump-the-queue submit that dedupes onto a queued job reorders it ahead (§12)', async () => {
+    const lane = new QueueLane(1)
+    const gate = job()
+    const order: string[] = []
+    lane.enqueue({ id: 'running', start: () => gate.promise })
+    // A scheduler illustrate for s1 sits queued behind another scheduler job.
+    lane.enqueue({
+      id: 'sched-other',
+      dedupeKey: 'illustrate-section:s0',
+      start: async () => {
+        order.push('sched-other')
+      },
+    })
+    lane.enqueue({
+      id: 'sched-s1',
+      dedupeKey: 'illustrate-section:s1',
+      start: async () => {
+        order.push('sched-s1')
+      },
+    })
+    expect(lane.queuedIds()).toEqual(['sched-other', 'sched-s1'])
+    // The user hits "Illustrate" on s1 → dedupes onto the queued scheduler job, but must
+    // REORDER it ahead of sched-other rather than leaving it last (§12).
+    expect(
+      lane.enqueue({
+        id: 'user-s1',
+        dedupeKey: 'illustrate-section:s1',
+        jumpQueue: true,
+        start: async () => {},
+      }),
+    ).toEqual({ status: 'deduped', existingId: 'sched-s1' })
+    expect(lane.queuedIds()).toEqual(['sched-s1', 'sched-other'])
+    gate.resolve()
+    await lane.idle()
+    expect(order).toEqual(['sched-s1', 'sched-other'])
+  })
+
   it('a SYNCHRONOUS throw from job.start() still releases the dedupe key (leak regression)', async () => {
     const lane = new QueueLane(1)
     const boom = (): Promise<void> => {

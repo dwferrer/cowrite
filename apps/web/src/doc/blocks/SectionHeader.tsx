@@ -1,17 +1,20 @@
 import type { SectionRow } from '@cowrite/shared'
 import { useQueryClient } from '@tanstack/react-query'
-import { useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { apiCall } from '../../api/client.js'
-import { qk } from '../../api/queries.js'
+import { qk, useDeleteSectionIllustration } from '../../api/queries.js'
 import type { FoldLevel } from '../../state/docUiStore.js'
 import { usePanelStore } from '../../state/panelStore.js'
 import { testids } from '../../testids.js'
+import { useIllustrateSection } from '../illustrationTasks.js'
+import { RegenerateGuidanceBox } from './RegenerateGuidanceBox.js'
 
 /**
  * Section heading block (docs/04-frontend.md §5.2, §5.3, §6): title (or "Chapter N"), slim
- * rule, the fold widget (four dots + auto reset, pin glyph when non-auto), and the staleness
- * badge whose tooltip names exactly what is out of date. Hovering for 150 ms prefetches the
- * leaf's content so expanding feels instant (§5.6).
+ * rule, the fold widget (four dots + auto reset, pin glyph when non-auto), the staleness
+ * badge whose tooltip names exactly what is out of date, and — for leaf sections — the "⋯"
+ * menu that gains "Illustrate"/"Regenerate…" and "Remove illustration" (08 §5, §8; 04 §10).
+ * Hovering for 150 ms prefetches the leaf's content so expanding feels instant (§5.6).
  */
 
 const PREFETCH_HOVER_MS = 150
@@ -39,6 +42,112 @@ export interface SectionHeaderProps {
    * (§5.5 "expanding a section you clicked").
    */
   onBeforeFoldChange?: (sectionId: string) => void
+  readonly?: boolean
+}
+
+/** The "⋯" illustration menu (08 §5, §8; 04 §10): Illustrate / Regenerate… (+ guidance) /
+ *  Remove illustration. Leaf sections only — illustration is a leaf-level artifact (02 §6.5). */
+function IllustrationMenu({ workId, section }: { workId: string; section: SectionRow }) {
+  const [open, setOpen] = useState(false)
+  const [guidanceOpen, setGuidanceOpen] = useState(false)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const illustrate = useIllustrateSection(workId)
+  const removeIllustration = useDeleteSectionIllustration(workId)
+  const hasImage = section.illustration !== null
+
+  useEffect(() => {
+    if (!open && !guidanceOpen) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false)
+        setGuidanceOpen(false)
+      }
+    }
+    window.addEventListener('pointerdown', onPointerDown)
+    return () => window.removeEventListener('pointerdown', onPointerDown)
+  }, [open, guidanceOpen])
+
+  const submitGuidance = (guidance: string) => {
+    illustrate.run(section.id, guidance || undefined)
+    setGuidanceOpen(false)
+    setOpen(false)
+  }
+
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: click containment only — the button/input carry the semantics
+    <div
+      className="section-menu-wrap"
+      ref={wrapRef}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        className="section-menu-button"
+        data-testid={testids.sectionMenuButton}
+        aria-label="Section actions"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        ⋯
+      </button>
+      {open ? (
+        <div className="section-menu" data-testid={testids.sectionMenu} role="menu">
+          {!hasImage ? (
+            <button
+              type="button"
+              role="menuitem"
+              data-testid={testids.illustrateAction}
+              disabled={illustrate.pending}
+              onClick={() => {
+                illustrate.run(section.id)
+                setOpen(false)
+              }}
+            >
+              Illustrate
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                data-testid={testids.regenerateAction}
+                disabled={illustrate.pending}
+                onClick={() => setGuidanceOpen(true)}
+              >
+                Regenerate…
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                data-testid={testids.removeIllustrationAction}
+                disabled={removeIllustration.isPending}
+                onClick={() => {
+                  removeIllustration.mutate(section.id)
+                  setOpen(false)
+                }}
+              >
+                Remove illustration
+              </button>
+            </>
+          )}
+        </div>
+      ) : null}
+      {guidanceOpen ? (
+        <RegenerateGuidanceBox
+          boxTestId={testids.regenerateGuidanceBox}
+          inputTestId={testids.regenerateGuidanceInput}
+          submitTestId={testids.regenerateGuidanceSubmit}
+          cancelTestId={testids.regenerateGuidanceCancel}
+          placeholder="show the storm from the cliff, dusk light…"
+          submitLabel="Regenerate"
+          pending={illustrate.pending}
+          onSubmit={submitGuidance}
+          onCancel={() => setGuidanceOpen(false)}
+        />
+      ) : null}
+    </div>
+  )
 }
 
 export function sectionDisplayTitle(section: SectionRow, ordinal: number): string {
@@ -65,6 +174,7 @@ export function SectionHeader({
   depth,
   fold,
   onBeforeFoldChange,
+  readonly = false,
 }: SectionHeaderProps) {
   const qc = useQueryClient()
   const hoverTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -144,6 +254,7 @@ export function SectionHeader({
           </button>
         </span>
       ) : null}
+      {section.isLeaf && !readonly ? <IllustrationMenu workId={workId} section={section} /> : null}
     </div>
   )
 }

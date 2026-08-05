@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { type AppConfig, ConfigUpdate, type PublicConfig } from '@cowrite/shared'
+import { type AppConfig, ComfyConfig, ConfigUpdate, type PublicConfig } from '@cowrite/shared'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { AppError } from '../http/errors.js'
 import { type CliFlags, type Env, loadConfig } from './load.js'
@@ -107,6 +107,38 @@ describe('update() — §9.5 PUT semantics', () => {
     await service.update(update)
     expect(service.get().models.high).toBeNull()
     expect(service.public().setup.highConfigured).toBe(false)
+  })
+
+  it('seeds workflows.default when the user first configures a ComfyUI baseUrl (§18)', async () => {
+    const service = await makeService(FILE_WITH_HIGH)
+    const update = updateFromPublic(service.public())
+    update.comfyui = ComfyConfig.parse({ baseUrl: 'http://127.0.0.1:8188' })
+    expect(update.comfyui.workflows).toEqual({}) // the client sent no workflows
+
+    await service.update(update)
+    // The default routes now resolve: a `default` workflow entry was seeded so a bare-baseUrl
+    // save yields a working (green) health report instead of a permanent config_missing.
+    expect(service.get().comfyui?.workflows.default).toEqual({
+      file: 'default.json',
+      label: 'Default',
+    })
+    expect(service.get().comfyui?.route.section).toBe('default')
+    // and it persisted to the file.
+    expect(await fsp.readFile(configPath, 'utf8')).toContain('default.json')
+  })
+
+  it('leaves an existing default workflow untouched (§18)', async () => {
+    const service = await makeService(FILE_WITH_HIGH)
+    const update = updateFromPublic(service.public())
+    update.comfyui = ComfyConfig.parse({
+      baseUrl: 'http://127.0.0.1:8188',
+      workflows: { default: { file: 'my-sdxl.json', label: 'My SDXL' } },
+    })
+    await service.update(update)
+    expect(service.get().comfyui?.workflows.default).toEqual({
+      file: 'my-sdxl.json',
+      label: 'My SDXL',
+    })
   })
 
   it('hot-applies everything else and notifies onChange subscribers', async () => {

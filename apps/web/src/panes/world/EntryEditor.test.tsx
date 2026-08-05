@@ -1,6 +1,7 @@
 import type { WorldEntryDto } from '@cowrite/shared'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { qk } from '../../api/queries.js'
 import { testids } from '../../testids.js'
@@ -65,7 +66,9 @@ function renderEditor(onPatch: PatchResponder) {
   qc.setQueryData(qk.world(W), [entry])
   render(
     <QueryClientProvider client={qc}>
-      <EntryEditor workId={W} entry={entry} />
+      <MemoryRouter>
+        <EntryEditor workId={W} entry={entry} />
+      </MemoryRouter>
     </QueryClientProvider>,
   )
   return { qc, patchCalls }

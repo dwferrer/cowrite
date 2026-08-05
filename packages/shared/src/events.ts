@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { ErrorCode } from './api.js'
 import { Hash, IsoTime, Ulid } from './ids.js'
-import { IllustrationPhase } from './illustration.js'
+import { PipelinePhase } from './illustration.js'
 import { RunArtifact } from './runs.js'
 import { SectionRow } from './section.js'
 import { SnippetDto } from './snippet.js'
@@ -95,7 +95,7 @@ export const WorkEvent = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('task.progress'), // illustration pipeline (08)
     taskId: Ulid,
-    phase: IllustrationPhase, // 08's phase enum — one spelling
+    phase: PipelinePhase, // 08's phase enum — one spelling
 
     attempt: z.number().int().min(1),
     maxAttempts: z.number().int().min(1),

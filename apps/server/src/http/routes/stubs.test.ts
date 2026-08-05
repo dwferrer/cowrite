@@ -9,11 +9,10 @@ import {
 } from './testUtil.js'
 
 /**
- * Registered-but-stubbed routes (docs/03-api.md §6.2): the remaining Stage-5 routes
- * exist now and answer 501 with the §7 envelope carrying the `not_implemented` code.
- * Task/run/proposal routes went live with the Stage-3 harness, the consolidation
- * controls with the Stage-4 scheduler (both tested in src/harness/);
- * `/tasks/estimate` is M2 and deliberately absent (404).
+ * Registered routes that formerly 501'd (docs/03-api.md §6.2): the illustration health
+ * route went live with the Stage-5 pipeline and reports "not configured" (comfy off) when
+ * no `comfyui` block is set. Task/run/proposal routes went live with the Stage-3 harness,
+ * the consolidation controls with the Stage-4 scheduler; `/tasks/estimate` is M2 (404).
  */
 
 let ctx: TestCtx
@@ -28,24 +27,18 @@ afterEach(async () => {
 
 const w = `/api/works/${NO_SUCH_ID}`
 
-const STUBS: Array<{ method: 'GET' | 'POST'; url: string; payload?: Record<string, unknown> }> = [
-  { method: 'GET', url: '/api/illustration/health' },
-]
-
 describe('stub routes', () => {
-  it('answers 501 not_implemented with the envelope on every stub route', async () => {
-    for (const { method, url, payload } of STUBS) {
-      const res = await ctx.app.inject({
-        method,
-        url,
-        ...(payload === undefined ? {} : { payload }),
-      })
-      expect(res.statusCode, `${method} ${url}`).toBe(501)
-      expectEnvelope(res, 501, 'not_implemented')
-      expect((res.json() as { error: { message: string } }).error.message).toContain(
-        'not implemented',
-      )
+  it('GET /api/illustration/health reports "not configured" when comfyui is unset (200)', async () => {
+    const res = await ctx.app.inject({ method: 'GET', url: '/api/illustration/health' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as {
+      ok: boolean
+      comfy: { ok: boolean }
+      workflows: unknown[]
     }
+    expect(body.ok).toBe(false)
+    expect(body.comfy.ok).toBe(false)
+    expect(body.workflows).toEqual([])
   })
 
   it('POST /tasks validates the TaskSpec body before any handler logic (400)', async () => {
@@ -57,14 +50,14 @@ describe('stub routes', () => {
     expectEnvelope(res, 400, 'validation')
   })
 
-  it('POST /tasks answers 501 for kinds whose stage has not landed', async () => {
-    const work = await createWorkViaApi(ctx, 'Stubbed Kinds')
+  it('POST /tasks {illustrate-section} answers 409 config_missing when no lane is configured', async () => {
+    const work = await createWorkViaApi(ctx, 'Illustration Kinds')
     const res = await ctx.app.inject({
       method: 'POST',
       url: `/api/works/${work.id}/tasks`,
       payload: { kind: 'illustrate-section', sectionId: NO_SUCH_ID },
     })
-    expectEnvelope(res, 501, 'not_implemented')
+    expectEnvelope(res, 409, 'config_missing')
   })
 
   it('POST /tasks {enrich-section} is live (Stage 4): an unknown section answers 404', async () => {

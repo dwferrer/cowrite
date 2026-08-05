@@ -807,3 +807,180 @@
 .situation-rest {
   overflow-y: auto;
 }
+
+/* ---- illustration slot: shimmer + failure badge (08 §8, §10) ---- */
+
+.name-card__img-wrap,
+.section-illustration {
+  position: relative;
+}
+
+.section-illustration--thumb {
+  float: right;
+  margin: 0 0 var(--space-2) var(--space-3);
+  width: 96px;
+}
+
+.illustration-shimmer {
+  align-items: center;
+  background: oklch(0.15 0 0 / 0.55);
+  border-radius: inherit;
+  bottom: 0;
+  color: white;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  justify-content: center;
+  left: 0;
+  padding: var(--space-1);
+  position: absolute;
+  right: 0;
+  text-align: center;
+  top: 0;
+}
+
+.illustration-shimmer__pulse {
+  animation: cowrite-pulse 1.6s ease-in-out infinite;
+  background: currentColor;
+  border-radius: 999px;
+  height: 6px;
+  width: 6px;
+}
+
+.illustration-badge {
+  align-items: center;
+  background: var(--danger-bg);
+  border-radius: inherit;
+  bottom: 0;
+  color: var(--danger);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  gap: var(--space-1);
+  justify-content: center;
+  left: 0;
+  padding: var(--space-1);
+  position: absolute;
+  right: 0;
+  text-align: center;
+  top: 0;
+}
+
+.illustration-badge__retry {
+  background: none;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-1);
+  color: var(--danger);
+  cursor: pointer;
+  font: inherit;
+  padding: 1px 8px;
+}
+
+/* ---- section "⋯" menu (08 §5, §8; 04 §10) ---- */
+
+.section-menu-wrap {
+  margin-left: auto;
+  position: relative;
+}
+
+.section-menu-button {
+  background: none;
+  border: none;
+  border-radius: var(--radius-1);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+}
+
+.section-menu-button:hover {
+  background: var(--bg-sunken);
+}
+
+.section-menu {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-1);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  min-width: 160px;
+  padding: var(--space-1);
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+}
+
+.section-menu button {
+  background: none;
+  border: none;
+  border-radius: var(--radius-1);
+  color: var(--fg);
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+}
+
+.section-menu button:hover {
+  background: var(--bg-sunken);
+}
+
+.regenerate-guidance-box {
+  align-items: center;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-1);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding: var(--space-2);
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  width: 280px;
+  z-index: 20;
+}
+
+/* ---- illustration lightbox (04 §10) ---- */
+
+.illustration-lightbox {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2);
+  box-shadow: var(--shadow-2);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  gap: var(--space-3);
+  max-height: 90vh;
+  max-width: 90vw;
+  overflow-y: auto;
+  padding: var(--space-4);
+}
+
+.illustration-lightbox__header {
+  align-items: center;
+  display: flex;
+  font-weight: 600;
+  gap: var(--space-2);
+}
+
+.illustration-lightbox__img {
+  border-radius: var(--radius-1);
+  max-height: 70vh;
+  max-width: 100%;
+}
+
+.illustration-lightbox__footer {
+  color: var(--fg-muted);
+  display: flex;
+  gap: var(--space-3);
+}

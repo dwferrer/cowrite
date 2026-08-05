@@ -163,7 +163,12 @@ export class QueueLane {
   enqueue(job: LaneJob): EnqueueResult {
     if (job.dedupeKey !== undefined) {
       const existingId = this.idByKey.get(job.dedupeKey)
-      if (existingId !== undefined) return { status: 'deduped', existingId }
+      if (existingId !== undefined) {
+        // A jump-the-queue submit (a user "Illustrate") that dedupes onto a still-queued
+        // scheduler job must REORDER that job ahead, not merely return it un-jumped (§12).
+        if (job.jumpQueue === true) this.promoteQueued(existingId)
+        return { status: 'deduped', existingId }
+      }
       this.idByKey.set(job.dedupeKey, job.id)
       this.keyById.set(job.id, job.dedupeKey)
     }
@@ -179,6 +184,20 @@ export class QueueLane {
       this.queued.push(job)
     }
     return { status: 'queued' }
+  }
+
+  /** Move a still-queued job ahead of the non-jumping jobs and mark it a jumper, so a later
+   *  user submit that deduped onto it takes priority (§12). A no-op if it is already running
+   *  (or gone) — a running job cannot be reordered. */
+  private promoteQueued(id: string): void {
+    const at = this.queued.findIndex((q) => q.id === id)
+    if (at === -1) return
+    const [job] = this.queued.splice(at, 1)
+    if (job === undefined) return
+    job.jumpQueue = true
+    const insertAt = this.queued.findIndex((q) => q.jumpQueue !== true)
+    if (insertAt === -1) this.queued.push(job)
+    else this.queued.splice(insertAt, 0, job)
   }
 
   /** Remove a queued job (cancel-by-removal); running jobs cancel via their own signal. */

@@ -158,6 +158,42 @@ describe('Settings', () => {
     expect(body.candidate.models.high.apiKey).toBeNull() // untouched ⇒ keep stored key
   })
 
+  it('the ComfyUI card surfaces the marker setup step and the health report', async () => {
+    stubFetch((url) => {
+      if (url === '/api/config')
+        return { status: 200, body: JSON.parse(JSON.stringify(makeConfig())) }
+      if (url === '/api/illustration/health') {
+        return {
+          status: 200,
+          body: {
+            ok: false,
+            comfy: { ok: true },
+            workflows: [
+              { name: 'default', label: 'Default (SDXL scene)', ok: false, error: 'mark %prompt%' },
+            ],
+            route: {
+              section: { name: 'default', ok: false },
+              world: { name: 'default', ok: false },
+            },
+          },
+        }
+      }
+      return undefined
+    })
+    renderSettings()
+
+    const comfy = await screen.findByTestId(testids.settingsCardComfy)
+    expect(within(comfy).getByTestId(testids.settingsComfyMarkerHelp).textContent).toContain(
+      '%prompt%',
+    )
+    const healthReport = await within(comfy).findByTestId(testids.settingsComfyHealth)
+    expect(healthReport.textContent).toContain('reachable')
+    expect(within(comfy).getByTestId(testids.settingsComfyWorkflowRow).textContent).toContain(
+      'mark %prompt%',
+    )
+    expect(healthReport.textContent).toContain('broken')
+  })
+
   it('saves the full document via PUT and renders the restartRequired notice', async () => {
     const config = makeConfig()
     const fetchMock = stubFetch((url, init) => {

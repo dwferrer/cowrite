@@ -42,7 +42,10 @@ async function main(): Promise<void> {
   const comfy =
     only === 'llm'
       ? undefined
-      : await createMockComfy({ port: portFrom('--comfy-port', 'MOCK_COMFY_PORT') })
+      : await createMockComfy({
+          port: portFrom('--comfy-port', 'MOCK_COMFY_PORT'),
+          autoSucceed: true,
+        })
 
   const announce: Record<string, { url: string; port: number }> = {}
   if (llm) announce.llm = { url: llm.url, port: llm.port }

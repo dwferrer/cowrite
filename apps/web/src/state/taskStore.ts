@@ -1,5 +1,6 @@
 import type { QueueLane, RunArtifact, Task, TaskSpec } from '@cowrite/shared'
 import { create } from 'zustand'
+import { useShallow } from 'zustand/react/shallow'
 
 /**
  * Task display state (docs/04-frontend.md §4.4) — the real store, Stage 3.
@@ -56,6 +57,22 @@ export interface BackgroundTask {
   pct?: number | null
 }
 
+/** A terminal `task.failed` recorded for an illustration target (08 §8, 04 §10) — survives
+ *  past the background map's own deletion so the section/entry can render a failure badge
+ *  with a retry action instead of quietly reverting to the placeholder. */
+export interface IllustrationFailure {
+  code: string
+  message: string
+  retryable: boolean
+}
+
+const ILLUSTRATION_KINDS = new Set(['illustrate-section', 'world-image'])
+
+/** Map key for `illustrationFailures`: one entry per section/entry target. */
+export function illustrationFailureKey(targetKind: 'section' | 'entry', id: string): string {
+  return `${targetKind}:${id}`
+}
+
 /** A keep-partial / conflict offer pending user resolution via the proposal routes (04 §8.4). */
 export interface ProposalOffer {
   taskId: string
@@ -104,6 +121,8 @@ export interface TaskState {
   interactive: InteractiveTask | null
   background: Map<string, BackgroundTask>
   proposal: ProposalOffer | null
+  /** Illustration target key (`illustrationFailureKey`) → its last `task.failed` (08 §8). */
+  illustrationFailures: Map<string, IllustrationFailure>
 
   queued(task: Task, position: number): void
   started(task: Task, lane: QueueLane, target: TaskTarget): void
@@ -138,6 +157,8 @@ export interface TaskState {
   ): void
   cancelled(taskId: string, partialText: string | null): void
   clearProposal(): void
+  /** Dismiss a recorded illustration failure without submitting a new task (badge close). */
+  clearIllustrationFailure(key: string): void
   reset(): void
 }
 
@@ -151,20 +172,36 @@ function bufferedText(task: InteractiveTask): string {
   return first.done ? '' : first.value
 }
 
+/** Drop the target's recorded illustration failure — a fresh submit means "try again" (08 §8). */
+function clearedIllustrationFailures(
+  current: Map<string, IllustrationFailure>,
+  target: TaskTarget,
+): Map<string, IllustrationFailure> {
+  if (target.id === undefined || (target.kind !== 'section' && target.kind !== 'entry')) {
+    return current
+  }
+  const key = illustrationFailureKey(target.kind, target.id)
+  if (!current.has(key)) return current
+  const next = new Map(current)
+  next.delete(key)
+  return next
+}
+
 export const useTaskStore = create<TaskState>()((set, get) => ({
   interactive: null,
   background: new Map(),
   proposal: null,
+  illustrationFailures: new Map(),
 
   queued: (task, position) => {
     if (task.lane === 'interactive') return // interactive never queues (409 busy instead)
+    const target = specTarget(task.spec)
     const background = new Map(get().background)
-    background.set(task.id, {
-      kind: task.spec.kind,
-      target: specTarget(task.spec),
-      queuedPosition: position,
+    background.set(task.id, { kind: task.spec.kind, target, queuedPosition: position })
+    set({
+      background,
+      illustrationFailures: clearedIllustrationFailures(get().illustrationFailures, target),
     })
-    set({ background })
   },
 
   started: (task, lane, target) => {
@@ -189,7 +226,10 @@ export const useTaskStore = create<TaskState>()((set, get) => ({
     }
     const background = new Map(get().background)
     background.set(task.id, { kind: task.spec.kind, target })
-    set({ background })
+    set({
+      background,
+      illustrationFailures: clearedIllustrationFailures(get().illustrationFailures, target),
+    })
   },
 
   setStage: (taskId, stage) => {
@@ -308,11 +348,20 @@ export const useTaskStore = create<TaskState>()((set, get) => ({
       })
       return
     }
-    // background failures stay quiet (badge/activity only, 04 §4.3)
-    if (background.has(taskId)) {
+    // background failures stay quiet (badge/activity only, 04 §4.3) — EXCEPT the illustration
+    // pipeline, whose target renders a small failure badge with a retry action (08 §8, 04 §10).
+    const entry = background.get(taskId)
+    if (entry !== undefined) {
       const next = new Map(background)
       next.delete(taskId)
-      set({ background: next })
+      const illustrationFailures =
+        ILLUSTRATION_KINDS.has(entry.kind) && entry.target.id !== undefined
+          ? new Map(get().illustrationFailures).set(
+              illustrationFailureKey(entry.target.kind as 'section' | 'entry', entry.target.id),
+              { code: error.code, message: error.message, retryable: error.retryable },
+            )
+          : get().illustrationFailures
+      set({ background: next, illustrationFailures })
     }
   },
 
@@ -351,7 +400,12 @@ export const useTaskStore = create<TaskState>()((set, get) => ({
     if (!terminal) {
       // A live task: seed the slot if it is empty (or held a different task) — the
       // accumulated text arrives as the `task.snapshot` that follows the frame.
-      if (lane === 'interactive' && interactive?.taskId !== task.id) {
+      if (lane === 'interactive') {
+        if (interactive?.taskId !== task.id) get().started(task, lane, target)
+      } else if (!get().background.has(task.id)) {
+        // A live background/illustration task on SSE reconnect (§19): seed the background map so
+        // a refreshed tab resumes the illustration caption; the `task.progress` frame that
+        // follows fills in the phase/attempt/pct.
         get().started(task, lane, target)
       }
       return
@@ -389,5 +443,76 @@ export const useTaskStore = create<TaskState>()((set, get) => ({
 
   clearProposal: () => set({ proposal: null }),
 
-  reset: () => set({ interactive: null, background: new Map(), proposal: null }),
+  clearIllustrationFailure: (key) => {
+    const current = get().illustrationFailures
+    if (!current.has(key)) return
+    const next = new Map(current)
+    next.delete(key)
+    set({ illustrationFailures: next })
+  },
+
+  reset: () =>
+    set({
+      interactive: null,
+      background: new Map(),
+      proposal: null,
+      illustrationFailures: new Map(),
+    }),
 }))
+
+// ---------------------------------------------------------------------------
+// Illustration selectors (08 §8, 04 §10): a section/entry's live pipeline progress and its
+// last recorded failure, read by the shimmer overlay + failure badge (doc/blocks/
+// IllustrationOverlay.tsx) so the image-slot components stay free of Map-scanning logic.
+// ---------------------------------------------------------------------------
+
+export interface IllustrationTaskView {
+  taskId: string
+  phase?: string
+  attempt?: number
+  maxAttempts?: number
+  pct?: number | null
+}
+
+/** The live `illustrate-section` / `world-image` background task targeting this id, if any. */
+export function findIllustrationTask(
+  background: ReadonlyMap<string, BackgroundTask>,
+  targetKind: 'section' | 'entry',
+  id: string,
+): IllustrationTaskView | null {
+  for (const [taskId, task] of background) {
+    if (
+      ILLUSTRATION_KINDS.has(task.kind) &&
+      task.target.kind === targetKind &&
+      task.target.id === id
+    ) {
+      return {
+        taskId,
+        phase: task.phase,
+        attempt: task.attempt,
+        maxAttempts: task.maxAttempts,
+        pct: task.pct,
+      }
+    }
+  }
+  return null
+}
+
+export function useIllustrationTask(
+  targetKind: 'section' | 'entry',
+  id: string,
+): IllustrationTaskView | null {
+  // `findIllustrationTask` builds a fresh object every call — shallow-compare it (not
+  // Object.is) so an unrelated store update (e.g. a different task's progress) does not
+  // re-render this target, and so the selector itself does not loop useSyncExternalStore.
+  return useTaskStore(useShallow((s) => findIllustrationTask(s.background, targetKind, id)))
+}
+
+export function useIllustrationFailure(
+  targetKind: 'section' | 'entry',
+  id: string,
+): IllustrationFailure | null {
+  return useTaskStore(
+    (s) => s.illustrationFailures.get(illustrationFailureKey(targetKind, id)) ?? null,
+  )
+}

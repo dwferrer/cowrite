@@ -1,6 +1,7 @@
 import type { SectionRow } from '@cowrite/shared'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { usePanelStore } from '../../state/panelStore.js'
 import { testids } from '../../testids.js'
@@ -35,13 +36,41 @@ function section(over: Partial<SectionRow> = {}): SectionRow {
   }
 }
 
-function renderHeader(props: Partial<Parameters<typeof SectionHeader>[0]> = {}) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+function renderHeader(
+  props: Partial<Parameters<typeof SectionHeader>[0]> = {},
+  qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  }),
+) {
   return render(
     <QueryClientProvider client={qc}>
-      <SectionHeader workId={W} section={section()} ordinal={3} depth={0} fold="short" {...props} />
+      <MemoryRouter>
+        <SectionHeader
+          workId={W}
+          section={section()}
+          ordinal={3}
+          depth={0}
+          fold="short"
+          {...props}
+        />
+      </MemoryRouter>
     </QueryClientProvider>,
   )
+}
+
+function stubFetch(
+  handler: (url: string, init?: RequestInit) => { status: number; body: unknown },
+) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const result = handler(String(input), init)
+    return {
+      ok: result.status >= 200 && result.status < 300,
+      status: result.status,
+      json: () => Promise.resolve(result.body),
+    }
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
 }
 
 beforeEach(() => {
@@ -51,6 +80,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  vi.unstubAllGlobals()
 })
 
 describe('staleTooltip', () => {
@@ -126,5 +156,130 @@ describe('SectionHeader', () => {
   it('interior sections carry no fold widget', () => {
     renderHeader({ section: section({ isLeaf: false, kind: 'part' }), fold: 'full' })
     expect(screen.queryByTestId(testids.foldWidget)).toBeNull()
+  })
+})
+
+describe('SectionHeader illustration menu (08 §5, §8; 04 §10)', () => {
+  it('interior sections and readonly headers carry no "⋯" menu', () => {
+    renderHeader({ section: section({ isLeaf: false, kind: 'part' }) })
+    expect(screen.queryByTestId(testids.sectionMenuButton)).toBeNull()
+    cleanup()
+    renderHeader({ readonly: true })
+    expect(screen.queryByTestId(testids.sectionMenuButton)).toBeNull()
+  })
+
+  it('an un-illustrated leaf section offers "Illustrate", which posts illustrate-section', async () => {
+    const fetchMock = stubFetch((url) =>
+      url === `/api/works/${W}/tasks`
+        ? {
+            status: 202,
+            body: {
+              id: 'T1',
+              workId: W,
+              spec: { kind: 'illustrate-section', sectionId: S1 },
+              lane: 'illustration',
+              status: 'queued',
+              queuedAt: 'now',
+              startedAt: null,
+              endedAt: null,
+              error: null,
+              partialText: null,
+              unresolvedProposal: null,
+            },
+          }
+        : { status: 404, body: {} },
+    )
+    renderHeader()
+    fireEvent.click(screen.getByTestId(testids.sectionMenuButton))
+    expect(screen.queryByTestId(testids.regenerateAction)).toBeNull()
+    fireEvent.click(screen.getByTestId(testids.illustrateAction))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([u]) => String(u) === `/api/works/${W}/tasks`)
+      expect(call).toBeDefined()
+      const body = JSON.parse((call?.[1] as RequestInit).body as string)
+      expect(body).toEqual({ kind: 'illustrate-section', sectionId: S1 })
+    })
+  })
+
+  it('an illustrated section offers Regenerate…, which opens a guidance box and submits it', async () => {
+    const fetchMock = stubFetch((url) =>
+      url === `/api/works/${W}/tasks`
+        ? {
+            status: 202,
+            body: {
+              id: 'T1',
+              workId: W,
+              spec: { kind: 'illustrate-section', sectionId: S1, guidance: 'dusk light' },
+              lane: 'illustration',
+              status: 'queued',
+              queuedAt: 'now',
+              startedAt: null,
+              endedAt: null,
+              error: null,
+              partialText: null,
+              unresolvedProposal: null,
+            },
+          }
+        : { status: 404, body: {} },
+    )
+    renderHeader({
+      section: section({
+        illustration: { version: 'v1', width: 1024, height: 683 },
+      }),
+    })
+    fireEvent.click(screen.getByTestId(testids.sectionMenuButton))
+    expect(screen.queryByTestId(testids.illustrateAction)).toBeNull()
+    fireEvent.click(screen.getByTestId(testids.regenerateAction))
+
+    const input = await screen.findByTestId(testids.regenerateGuidanceInput)
+    fireEvent.change(input, { target: { value: 'dusk light' } })
+    fireEvent.click(screen.getByTestId(testids.regenerateGuidanceSubmit))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([u]) => String(u) === `/api/works/${W}/tasks`)
+      expect(call).toBeDefined()
+      const body = JSON.parse((call?.[1] as RequestInit).body as string)
+      expect(body).toEqual({
+        kind: 'illustrate-section',
+        sectionId: S1,
+        guidance: 'dusk light',
+      })
+    })
+    expect(screen.queryByTestId(testids.regenerateGuidanceBox)).toBeNull()
+  })
+
+  it('Escape closes the guidance box without submitting', async () => {
+    renderHeader({
+      section: section({ illustration: { version: 'v1', width: 1024, height: 683 } }),
+    })
+    fireEvent.click(screen.getByTestId(testids.sectionMenuButton))
+    fireEvent.click(screen.getByTestId(testids.regenerateAction))
+    const input = await screen.findByTestId(testids.regenerateGuidanceInput)
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(screen.queryByTestId(testids.regenerateGuidanceBox)).toBeNull()
+  })
+
+  it('Remove illustration calls the DELETE route', async () => {
+    const fetchMock = stubFetch((url, init) =>
+      url === `/api/works/${W}/sections/${S1}/illustration` && init?.method === 'DELETE'
+        ? { status: 204, body: undefined }
+        : { status: 404, body: {} },
+    )
+    renderHeader({
+      section: section({ illustration: { version: 'v1', width: 1024, height: 683 } }),
+    })
+    fireEvent.click(screen.getByTestId(testids.sectionMenuButton))
+    fireEvent.click(screen.getByTestId(testids.removeIllustrationAction))
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([u, i]) =>
+            String(u) === `/api/works/${W}/sections/${S1}/illustration` &&
+            (i as RequestInit)?.method === 'DELETE',
+        ),
+      ).toBe(true)
+    })
   })
 })

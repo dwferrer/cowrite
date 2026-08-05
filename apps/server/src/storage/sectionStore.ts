@@ -378,11 +378,24 @@ export async function putIllustration(
 ): Promise<void> {
   const node = await findSection(workDirPath, sectionId, dirPathHint)
   const valid = IllustrationMeta.parse(meta)
-  await writeFileAtomic(illustrationPath(node.dirPath), png)
-  await writeSectionMeta(node.dirPath, {
-    ...node.meta,
-    enrichments: { ...node.meta.enrichments, illustration: valid },
-  })
+  // Crash-consistent commit (§14): stage the new PNG bytes off to the side, write the
+  // section.json meta, and only then swap the PNG into place with a single rename. A failure
+  // writing the meta leaves BOTH the live illustration.png and section.json at their OLD state
+  // (the staged bytes are discarded) — never new bytes with stale meta. The cache-buster
+  // (`illustrationHash`) is derived from the committed PNG bytes at reindex, so it can never go
+  // stale against what is served.
+  const finalPng = illustrationPath(node.dirPath)
+  const stagedPng = `${finalPng}.staging`
+  try {
+    await writeFileAtomic(stagedPng, png)
+    await writeSectionMeta(node.dirPath, {
+      ...node.meta,
+      enrichments: { ...node.meta.enrichments, illustration: valid },
+    })
+    await fsp.rename(stagedPng, finalPng)
+  } finally {
+    await fsp.rm(stagedPng, { force: true }).catch(() => undefined)
+  }
 }
 
 /**

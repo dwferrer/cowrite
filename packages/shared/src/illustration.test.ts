@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   ComfyConfig,
+  CritiqueResult,
   IllustrationHealthRes,
   IllustrationMeta,
-  IllustrationPhase,
+  PipelinePhase,
 } from './illustration.js'
 
 const agentMeta = {
@@ -54,9 +55,9 @@ describe('IllustrationMeta', () => {
   })
 })
 
-describe('IllustrationPhase', () => {
-  it('locks the 08 §4 pipeline vocabulary (task.progress speaks it)', () => {
-    expect(IllustrationPhase.options).toEqual([
+describe('PipelinePhase', () => {
+  it('locks the 08 §8 pipeline vocabulary (task.progress speaks it)', () => {
+    expect(PipelinePhase.options).toEqual([
       'composing',
       'submitting',
       'queued',
@@ -65,6 +66,51 @@ describe('IllustrationPhase', () => {
       'revising',
       'committing',
     ])
+  })
+})
+
+describe('CritiqueResult (08 §4.3)', () => {
+  const sample = {
+    verdict: 'revise',
+    scores: { subject: 4, consistency: 3, craft: 5, mood: 2 },
+    overall: 6.5,
+    problems: ['the lighthouse is absent', 'sky reads midday, not dusk'],
+    promptAdvice: 'add the lighthouse on the far headland; dim the sky to storm-dusk',
+  } as const
+
+  it('round-trips a sample critique', () => {
+    expect(CritiqueResult.parse(sample)).toEqual(sample)
+  })
+
+  it('accepts the neutral repair fallback shape', () => {
+    const parsed = CritiqueResult.parse({
+      verdict: 'revise',
+      scores: { subject: 2, consistency: 2, craft: 3, mood: 2 },
+      overall: 5,
+      problems: [],
+      promptAdvice: '',
+    })
+    expect(parsed.verdict).toBe('revise')
+  })
+
+  it('rejects out-of-range axis scores', () => {
+    expect(
+      CritiqueResult.safeParse({ ...sample, scores: { ...sample.scores, subject: 6 } }).success,
+    ).toBe(false)
+    expect(
+      CritiqueResult.safeParse({ ...sample, scores: { ...sample.scores, mood: -1 } }).success,
+    ).toBe(false)
+  })
+
+  it('rejects out-of-range overall, >5 problems, overlong promptAdvice, bad verdict', () => {
+    expect(CritiqueResult.safeParse({ ...sample, overall: 11 }).success).toBe(false)
+    expect(
+      CritiqueResult.safeParse({ ...sample, problems: ['a', 'b', 'c', 'd', 'e', 'f'] }).success,
+    ).toBe(false)
+    expect(CritiqueResult.safeParse({ ...sample, promptAdvice: 'x'.repeat(601) }).success).toBe(
+      false,
+    )
+    expect(CritiqueResult.safeParse({ ...sample, verdict: 'accepted' }).success).toBe(false)
   })
 })
 

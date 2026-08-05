@@ -292,18 +292,23 @@ export const IllustrationTimeouts = z.object({
 });
 
 export const ComfyConfig = z.object({
-  baseUrl: z.string().url(),
+  baseUrl: z.url(),
   workflowsDir: z.string().optional(),           // default resolves to <configDir>/workflows
   workflows: z.record(z.string().regex(/^[a-z0-9-]+$/), WorkflowEntryConfig).default({}),
+  // zod 4: a nested-object default must be a COMPLETE output object, so `.default({})` on an
+  // object whose members have their own `.default(...)` mis-types; `.prefault({})` feeds `{}`
+  // through the child parse instead, materializing the full effective object (see config.ts).
   route: z.object({
     section: z.string().default("default"),
     world:   z.string().default("default"),
-  }).default({}),
+  }).prefault({}),
   loop: z.object({
     maxAttempts: z.number().int().min(1).max(6).default(3),
     acceptScore: z.number().min(0).max(10).default(7),
-  }).default({}),
-  timeouts: IllustrationTimeouts.partial().default({}),
+  }).prefault({}),
+  // `.prefault({})` (not `.partial().default({})`): zod 4 re-materializes defaults under
+  // `.partial()`, and these ARE the effective defaults, so prefault keeps the wire semantics.
+  timeouts: IllustrationTimeouts.prefault({}),
 });
 ```
 
@@ -586,7 +591,7 @@ Slot transitions (all through `StorageService`, §6):
 |---|---|
 | Loop commit / user upload | `IllustrationMeta` (replaces whatever was there, including a tombstone) |
 | Delete | `{ suppressed: true, deletedAt }` |
-| "Illustrate" on a suppressed section | `clearSuppression(id)` (slot → `null`), then the task is enqueued |
+| **User** "Illustrate" on a suppressed section | `clearSuppression(id)` (slot → `null`), then the task is enqueued — **only a user-initiated illustrate clears a tombstone**; the scheduler sweep never does (it skips tombstones entirely, §10), so the harness calls `clearSuppression` only when the task's initiator is the user (`harness/service.ts`) |
 | World-image delete | slot/sidecar removed outright — world images are only ever generated on explicit request, so no tombstone is needed |
 
 ---
@@ -785,19 +790,20 @@ or dependency-injected and unit-testable without HTTP.
 | Queue/exec timeout | Interrupt/dequeue our job, fail the attempt → same policy as `execution_error`. |
 | Run budget exhausted | Budget gate skips further attempts; mid-attempt exhaustion interrupts ComfyUI and **commits the best scored candidate so far** (§4.4). Fails only when no attempt ever scored. |
 | VLM critique unparseable | One repair retry; then neutral `{verdict: "revise", overall: 5}` — the loop proceeds; never wedges. |
-| Composer emits tag-less/overlong output | Harness tag-block repair turn covers the `<image-prompt>` block (05 §output contracts); >150-word prompts pass through with a logged warning (diffusion text encoders truncate gracefully). |
+| Composer emits tag-less/overlong output | The pipeline is a harness guest with its OWN loop, so it runs its own single repair turn on a missing `<image-prompt>` block (composer.ts, not the harness runner) — and if that still misses, uses the whole trimmed response (never wedges on a tag miss); >150-word prompts pass through with a logged warning (diffusion text encoders truncate gracefully). |
 | Task aborted (user cancel / work close) | `ctx.signal` propagates: interrupt ComfyUI, drop in-memory candidates, run ends `cancelled`; the previously committed image is untouched (commit is the only write). |
 | Commit target gone (section merged/split/deleted or work restructured during the ~30–300 s run) | `putIllustration` fails; the run fails quietly with detail `commit_target_missing`, no retry — the staleness sweep re-enqueues for whichever section now owns that text (missing illustration on a frozen leaf counts as stale, 02 §staleness). |
 | Image bytes huge / not PNG | 32 MB cap on `/view` reads; non-PNG output from exotic save nodes is transcoded via `sharp`, failure ⇒ attempt fails. |
 | Server crash mid-run | Harness startup finalizer marks the run `crash`; no partial files exist (memory-only candidates, atomic commit). Section keeps its old image (or none — in which case missing-counts-as-stale re-queues it). |
 | Same section re-illustrated while a sweep job is queued | Harness lane dedupe by `(kind, targetId)` (05 §scheduler) — no duplicate jobs. |
 | Suppressed / user-pinned image hit by the sweep | Never enqueued: the sweep skips tombstones and `source: "user"` metas (02 §staleness). |
+| Scheduler-initiated illustrate keeps failing on one section | Each failed (non-deduped) scheduler illustrate feeds a **per-section illustrate failure cooldown** (`harness/scheduler.ts`) — the same exponential backoff as the enrichment cooldown (base = one sweep window, capped ~1 h), so a section that fails every attempt isn't retried on every sweep. A content edit to that section resets the cooldown (it was about the old prose); a user-initiated illustrate ignores it. |
 
 ---
 
 ## 11. Mock ComfyUI server and test plan
 
-`packages/mock-llm/src/comfy.ts` — a Fastify + `ws` server implementing the §2.1 surface, driven
+`packages/mock-llm/src/comfy.ts` — a `node:http` + `ws` server implementing the §2.1 surface, driven
 by the same ordered-scenario mechanism as the mock LLM (unmatched request ⇒ loud test failure;
 09-testing.md owns the shared fixture story):
 
@@ -815,7 +821,11 @@ export const MockComfyStep = z.object({
     z.object({ type: z.literal("rejectSubmit"), nodeErrors: z.record(z.string(), z.unknown()) }),
     z.object({ type: z.literal("executionError"), nodeId: z.string(), message: z.string() }),
     z.object({ type: z.literal("dropWs") }),                  // kill the socket mid-run → polling path
-    z.object({ type: z.literal("hang"), forMs: z.number() }), // exercise timeouts + budget gate
+    z.object({ type: z.literal("hang"), ms: z.number().optional() }), // delay execution_start by
+                                                              // `ms` (default 0), then hang
+                                                              // INDEFINITELY (readyAt = Infinity):
+                                                              // only /interrupt or /queue {delete}
+                                                              // ends it — timeouts + budget gate
   ]),
 });
 ```

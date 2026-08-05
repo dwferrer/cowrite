@@ -1,4 +1,4 @@
-import type { LlmStep } from '@cowrite/mock-llm'
+import type { ComfyStep, LlmStep } from '@cowrite/mock-llm'
 import type { APIRequestContext } from '@playwright/test'
 import { expect } from '@playwright/test'
 
@@ -15,6 +15,10 @@ export const E2E_URL = `http://127.0.0.1:${E2E_PORT}`
  *  2699 is taken: the restart spec (60) boots its own server there. */
 export const E2E_MOCK_LLM_PORT = 2700
 export const MOCK_LLM_URL = `http://127.0.0.1:${E2E_MOCK_LLM_PORT}`
+/** Fixed port for the server's in-process mock ComfyUI (COWRITE_MOCK_LLM=1 boots both mocks;
+ *  MOCK_COMFY_PORT pins this one — 08 §11, 09 §2.3, Stage 5). */
+export const E2E_MOCK_COMFY_PORT = 2702
+export const MOCK_COMFY_URL = `http://127.0.0.1:${E2E_MOCK_COMFY_PORT}`
 
 export function e2eDataDir(): string {
   const dir = process.env.COWRITE_E2E_DATA_DIR
@@ -145,6 +149,7 @@ export interface SectionRowLite {
   shortSummary: string | null
   longSummary: string | null
   stale: { short: boolean; long: boolean; illustration: boolean }
+  illustration: { version: string; width: number; height: number } | null
 }
 
 export async function listSections(
@@ -203,4 +208,174 @@ export async function assertLlmDrained(request: APIRequestContext): Promise<void
   const state = (await res.json()) as { pending: number; consumed: number; errors: string[] }
   expect(state.errors).toEqual([])
   expect(state.pending).toBe(0)
+}
+
+// ---------------------------------------------------------------------------
+// Illustration plumbing (docs/08-illustration.md §4.2, §4.3; Stage 5). The in-process mock
+// ComfyUI always boots alongside the mock LLM (COWRITE_MOCK_LLM=1) with `autoSucceed: true`
+// (09 §2.3), so the happy-path illustrate/world-image flows need no ComfyUI scripting at
+// all — only the low lane's two calls (compose, then critique) need scripting.
+// ---------------------------------------------------------------------------
+
+/** Reset the mock ComfyUI's strict scenario queue (call at the top of every illustrate test). */
+export async function resetComfy(request: APIRequestContext): Promise<void> {
+  const res = await request.post(`${MOCK_COMFY_URL}/__mock/reset`)
+  expect(res.ok()).toBe(true)
+}
+
+/** Enqueue scripted ComfyUI steps; an unscripted request auto-succeeds instantly instead
+ *  (server boots the mock with `autoSucceed: true`) — script explicitly to control timing. */
+export async function scriptComfy(request: APIRequestContext, steps: ComfyStep[]): Promise<void> {
+  const res = await request.post(`${MOCK_COMFY_URL}/__mock/scenario`, { data: steps })
+  expect(res.ok()).toBe(true)
+}
+
+/** End-of-test gate: every scripted ComfyUI step fired and no request ever mismatched. */
+export async function assertComfyDrained(request: APIRequestContext): Promise<void> {
+  const res = await request.get(`${MOCK_COMFY_URL}/__mock/state`)
+  expect(res.ok()).toBe(true)
+  const state = (await res.json()) as { pending: number; consumed: number; errors: string[] }
+  expect(state.errors).toEqual([])
+  expect(state.pending).toBe(0)
+}
+
+/** A well-formed `<image-prompt>` reply — mirrors the server's illustration/testkit.ts helper
+ *  so the mock LLM's composed-prompt response parses on the first turn (no repair round). */
+export function illustrationPromptText(paragraph: string): string {
+  return `Sure, here is the prompt:\n<image-prompt>\n${paragraph}\n</image-prompt>`
+}
+
+/** A full `CritiqueResult` as a fenced JSON block (08 §4.3), defaults for the unstated axes. */
+export function illustrationCritiqueText(c: {
+  verdict: 'accept' | 'revise'
+  overall: number
+  problems?: string[]
+  promptAdvice?: string
+  scores?: { subject: number; consistency: number; craft: number; mood: number }
+}): string {
+  const body = {
+    verdict: c.verdict,
+    scores: c.scores ?? { subject: 4, consistency: 4, craft: 4, mood: 4 },
+    overall: c.overall,
+    problems: c.problems ?? [],
+    promptAdvice: c.promptAdvice ?? '',
+  }
+  return `Here is my review:\n\`\`\`json\n${JSON.stringify(body, null, 2)}\n\`\`\``
+}
+
+/**
+ * Create one leaf section via the real consolidation pipeline (boundary + enrich, both
+ * scripted on the low lane) so illustration specs have a committed, non-stale leaf to
+ * illustrate. Returns the section id and the auto-illustration's committed version.
+ *
+ * IMPORTANT: the scheduler auto-triggers `illustrate-section` the moment enrich-section
+ * completes on a section whose image is stale/missing (05 §6.2, 08 §5) — which every fresh
+ * chapter's is, and both `comfyui` and the low lane are always configured under
+ * `COWRITE_MOCK_LLM=1`, so that auto-run is unavoidable here. This helper does NOT script it
+ * — like every other unscripted background trigger, the mock's improviser (09 §2.3) answers
+ * its compose/critique calls quietly (always an immediate accept) and ComfyUI's leg needs no
+ * scripting either (`autoSucceed`). It just waits for the auto-run to commit BEFORE
+ * returning, so callers never race it. Callers that want a blank slate call
+ * `resetSectionIllustration`.
+ */
+export async function createLeafSection(
+  request: APIRequestContext,
+  workId: string,
+  title: string,
+): Promise<{ sectionId: string; illustrationVersion: string }> {
+  await patchConsolidation(request, workId, MANUAL_CONSOLIDATION)
+  const snippets: Array<{ id: string }> = []
+  for (let i = 0; i < 6; i++) {
+    snippets.push(await createSnippet(request, workId, `${PAGE} (${title} ${i + 1})`))
+  }
+  // MANUAL_CONSOLIDATION.activeWindowSnippets protects the last 2 snippets from eligibility
+  // (02 §6.2) — cut inside the eligible prefix, mirroring the known-good 81-spec pattern.
+  const cut = snippets[2]
+  if (!cut) throw new Error('missing snippet')
+  await scriptLlm(request, [
+    { type: 'respond', text: boundariesBlock([[cut.id, title]]), match: { model: 'mock-low' } },
+    {
+      type: 'respond',
+      text: enrichBlock(
+        title,
+        `${title}, in brief.`,
+        `${title}, at length — enough to write from.`,
+      ),
+      match: { model: 'mock-low' },
+    },
+  ])
+  await consolidateNow(request, workId)
+
+  // Poll until the leaf is present, enrichment has cleared its staleness, AND the guaranteed
+  // auto-illustrate has committed — an "enriched chapter" ready for a caller's OWN scripted
+  // scenario without racing the scheduler's.
+  const found = { id: '', version: '' }
+  await expect
+    .poll(
+      async () => {
+        const rows = await listSections(request, workId)
+        const row = rows.find((r) => r.isLeaf && r.title === title)
+        if (row === undefined || row.stale.short || row.stale.long || row.illustration === null) {
+          return null
+        }
+        found.id = row.id
+        found.version = row.illustration.version
+        return found
+      },
+      { timeout: 20_000 },
+    )
+    .not.toBeNull()
+  if (found.id === '') throw new Error('leaf section never enriched/auto-illustrated')
+  return { sectionId: found.id, illustrationVersion: found.version }
+}
+
+/** Suppress (tombstone) a section's illustration — "Remove illustration" (08 §5) — so a
+ *  spec can start from a genuinely blank slate after `createLeafSection`'s guaranteed
+ *  auto-illustrate. "Illustrate" on a suppressed section clears the tombstone and re-runs. */
+export async function resetSectionIllustration(
+  request: APIRequestContext,
+  workId: string,
+  sectionId: string,
+): Promise<void> {
+  const res = await request.delete(`/api/works/${workId}/sections/${sectionId}/illustration`)
+  expect(res.status(), await res.text()).toBe(204)
+}
+
+/** Submit `illustrate-section` directly through the API (setup-speed path — UI-level specs
+ *  drive the menu themselves). */
+export async function illustrateSection(
+  request: APIRequestContext,
+  workId: string,
+  sectionId: string,
+  guidance?: string,
+): Promise<void> {
+  const res = await request.post(`/api/works/${workId}/tasks`, {
+    data: { kind: 'illustrate-section', sectionId, ...(guidance ? { guidance } : {}) },
+  })
+  expect(res.status(), await res.text()).toBe(202)
+}
+
+/** Poll until the section's committed illustration version changes from `after` (null on the
+ *  very first commit). Returns the new version. */
+export async function waitForIllustrationVersion(
+  request: APIRequestContext,
+  workId: string,
+  sectionId: string,
+  after: string | null,
+): Promise<string> {
+  let version: string | null = null
+  await expect
+    .poll(
+      async () => {
+        const rows = await listSections(request, workId)
+        const row = rows.find((r) => r.id === sectionId)
+        const v = row?.illustration?.version ?? null
+        version = v !== null && v !== after ? v : null
+        return version
+      },
+      { timeout: 30_000 },
+    )
+    .not.toBeNull()
+  if (version === null) throw new Error('illustration never committed')
+  return version
 }

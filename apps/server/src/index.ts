@@ -4,15 +4,15 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import { createMockLlm, type MockLlm } from '@cowrite/mock-llm'
-import type { AppConfig } from '@cowrite/shared'
+import { createMockComfy, createMockLlm, type MockComfy, type MockLlm } from '@cowrite/mock-llm'
+import type { AppConfig, ComfyConfig } from '@cowrite/shared'
 import { parseArgs } from './cli.js'
 import { formatConfigIssues, resolveEffectiveConfig } from './config/effective.js'
 import { ensureFirstRun } from './config/firstRun.js'
 import type { CliFlags } from './config/load.js'
 import { configRoutes } from './config/routes.js'
 import { ConfigService } from './config/service.js'
-import { withMockModels } from './harness/mockLlm.js'
+import { buildMockComfyConfig, withMockComfy, withMockModels } from './harness/mockLlm.js'
 import { AgentHarness } from './harness/service.js'
 import { buildApp } from './http/app.js'
 import { resourceRoutes } from './http/routes/index.js'
@@ -138,13 +138,26 @@ async function main(): Promise<void> {
 
   // COWRITE_MOCK_LLM=1 / --mock (docs/09 §2.3): boot the scriptable mock in-process and
   // point both model lanes at it, so e2e and manual dev run without real endpoints.
-  // MOCK_LLM_PORT pins the listen port (0/unset = ephemeral) so cross-process suites
-  // (Playwright) can script `POST /__mock/scenario` at a known address.
+  // MOCK_LLM_PORT / MOCK_COMFY_PORT pin the listen ports (0/unset = ephemeral) so
+  // cross-process suites (Playwright) can script `POST /__mock/scenario` at a known
+  // address for either mock.
+  const pinnedPort = (envVar: string): number => {
+    const raw = Number(process.env[envVar] ?? '0')
+    return Number.isInteger(raw) && raw > 0 && raw <= 65535 ? raw : 0
+  }
   let mockLlm: MockLlm | null = null
+  let mockComfy: MockComfy | null = null
+  let mockComfyConfig: ComfyConfig | null = null
   if (mock) {
-    const rawPort = Number(process.env.MOCK_LLM_PORT ?? '0')
-    const port = Number.isInteger(rawPort) && rawPort > 0 && rawPort <= 65535 ? rawPort : 0
-    mockLlm = await createMockLlm({ port })
+    mockLlm = await createMockLlm({ port: pinnedPort('MOCK_LLM_PORT') })
+    // The in-process mock ComfyUI (docs/08 §11, 09 §2.3): always-succeed so the whole app —
+    // and e2e — illustrates offline. Its one `default` workflow lives in a hermetic dir the
+    // harness seeds with the shipped sample.
+    mockComfy = await createMockComfy({ autoSucceed: true, port: pinnedPort('MOCK_COMFY_PORT') })
+    mockComfyConfig = buildMockComfyConfig(
+      mockComfy.url,
+      path.join(config.storage.dataDir, '.mock-comfy-workflows'),
+    )
   }
 
   // Boot-pinned values (§9.7 restartRequired): host, port, dataDir.
@@ -162,14 +175,26 @@ async function main(): Promise<void> {
   const service = new ConfigService(loaded, { flags })
   const storage = createStorage(dataDir)
   const works = new WorkRegistry(storage)
-  // The harness reads config live per task submit; in mock mode both lanes point at the
-  // in-process mock (config-pointing only — everything else is the saved config).
-  const effectiveConfig = (): AppConfig =>
-    mockLlm === null ? service.get() : withMockModels(service.get(), mockLlm.url)
+  // The harness reads config live per task submit; in mock mode both lanes AND the comfyui
+  // block point at the in-process mocks (config-pointing only — everything else is saved
+  // config). The mock comfyui object is a stable reference so the harness's runtime cache
+  // never rebuilds spuriously (§3 hot-apply).
+  const effectiveConfig = (): AppConfig => {
+    if (mockLlm === null) return service.get()
+    const withModels = withMockModels(service.get(), mockLlm.url)
+    return mockComfyConfig === null ? withModels : withMockComfy(withModels, mockComfyConfig)
+  }
+  const configDir = path.dirname(configPath)
   const harness = new AgentHarness({
     config: effectiveConfig,
     budgets: () => service.get().budgets,
+    illustration: { configDir },
   })
+  // Build the illustration registry + ComfyUI client now, and rebuild on every config
+  // hot-apply / reload (§3): a broken/dangling workflow is per-workflow and task-time,
+  // never a boot failure.
+  harness.reloadIllustration()
+  service.onChange(() => harness.reloadIllustration())
   // Work close cancels that work's lanes before the stream/handle tear down (05 §6.2).
   works.onClose((open) => harness.closeWork(open))
   const app = buildApp({
@@ -219,6 +244,9 @@ async function main(): Promise<void> {
   if (mockLlm !== null) {
     console.log(`  mock     in-process mock LLM at ${mockLlm.url} (both lanes; /__mock/* control)`)
   }
+  if (mockComfy !== null) {
+    console.log(`  mock     in-process mock ComfyUI at ${mockComfy.url} (always-succeed)`)
+  }
   console.log(`  ➜ ${url}`)
 
   if (config.server.openBrowser && flags.noOpen !== true && process.stdout.isTTY) {
@@ -234,6 +262,7 @@ async function main(): Promise<void> {
       await works.closeAll().catch(() => {})
       await app.close().catch(() => {})
       await mockLlm?.close().catch(() => {})
+      await mockComfy?.close().catch(() => {})
       process.exit(0)
     })()
   }

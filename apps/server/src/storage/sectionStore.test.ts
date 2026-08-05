@@ -3,7 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { IllustrationMeta, SectionMeta } from '@cowrite/shared'
 import { ulid } from 'ulid'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as fsx from './lib/fsx.js'
 import { xxh64OfString } from './lib/hash.js'
 import { sectionDirName, sectionsDir } from './lib/paths.js'
 import {
@@ -375,6 +376,37 @@ describe('illustration slot (§2.5 three states)', () => {
       PNG_BYTES,
     )
     expect((await readSectionMeta(dir)).enrichments.illustration).toEqual(illo)
+  })
+
+  it('a failure writing the meta leaves the OLD png AND OLD meta — never mixed (§14)', async () => {
+    const meta = newMeta('a0')
+    const dir = await makeSection(sectionsDir(workDir), 10, 'ch', meta, 'x')
+    // Commit an initial illustration (the "old" committed state).
+    const oldIllo = illustrationFixture()
+    await putIllustration(workDir, meta.id, PNG_BYTES, oldIllo)
+
+    // Now a regen whose section.json meta write fails mid-commit (simulated crash between
+    // the staged-PNG write and the meta write).
+    const newPng = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9])
+    const newIllo = { ...oldIllo, seed: 999, prompt: 'a totally different image' }
+    const real = fsx.writeFileAtomic
+    const spy = vi.spyOn(fsx, 'writeFileAtomic').mockImplementation(async (p, data) => {
+      if (String(p).endsWith('section.json')) throw new Error('disk full during meta write')
+      return real(p, data)
+    })
+    try {
+      await expect(putIllustration(workDir, meta.id, newPng, newIllo)).rejects.toThrow('disk full')
+    } finally {
+      spy.mockRestore()
+    }
+
+    // Consistency: the live PNG is still the OLD bytes and section.json still holds the OLD meta
+    // — the failed commit did not leave new bytes with stale meta, and no staging file leaked.
+    expect(new Uint8Array(await fsp.readFile(path.join(dir, 'illustration.png')))).toEqual(
+      PNG_BYTES,
+    )
+    expect((await readSectionMeta(dir)).enrichments.illustration).toEqual(oldIllo)
+    await expect(fsp.stat(path.join(dir, 'illustration.png.staging'))).rejects.toThrow()
   })
 
   it('suppressIllustration removes the PNG and writes the tombstone', async () => {

@@ -25,6 +25,9 @@ export const TEMPLATE_NAMES = [
   'boundaries', // §6.6 — full background prompt (Stage 4 fills it)
   'refresh', // §6.7 — the refresh turn with {{refreshTail}}
   'repair', // §6.8 — the one corrective turn with {{blockList}}
+  'illustrate-compose', // 07 §8 / 08 §4.2 — the composer <instructions> region
+  'illustrate-revise', // 07 §8 / 08 §4.3 — the reviser, with {{previousPrompt}} {{advice}}
+  'illustrate-critique', // 07 §8 / 08 §4.3 — the VLM critic JSON contract, with {{prompt}}
 ] as const
 export type TemplateName = (typeof TEMPLATE_NAMES)[number]
 
@@ -45,6 +48,11 @@ export const PROMPT_DRIVING_TEMPLATES = [
   'boundaries',
   'refresh',
   'repair',
+  // The illustration pipeline (Stage 5) drives these on the low lane, so their bytes must be
+  // attributable in run meta like every other template (08 §4.2–§4.3).
+  'illustrate-compose',
+  'illustrate-revise',
+  'illustrate-critique',
 ] as const satisfies readonly TemplateName[]
 
 /** Which templates each interactive Stage-3 kind fills (05 handlers consume this seam). */

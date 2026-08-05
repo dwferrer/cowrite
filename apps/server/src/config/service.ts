@@ -133,6 +133,11 @@ export class ConfigService {
         high: resolveEndpoint(update.models.high, this.fileConfig.models.high),
         low: resolveEndpoint(update.models.low, this.fileConfig.models.low),
       },
+      // Seed a `workflows.default` entry when the user first configures ComfyUI (§18): the
+      // default `route.section`/`route.world` point at "default", so without this a bare
+      // baseUrl save leaves the routes dangling (a permanent config_missing). The sample
+      // default.json is copied to workflowsDir at runtime build.
+      comfyui: seedDefaultWorkflow(update.comfyui),
     }
     const parsed = AppConfig.safeParse(document)
     if (!parsed.success) {
@@ -173,6 +178,23 @@ export class ConfigService {
     this.overrides = merged.overrides
     for (const listener of this.listeners) listener(this.snapshot)
     return { config: this.public(), restartRequired }
+  }
+}
+
+/** The default workflow name — matches `route.*`'s default and the copied sample filename. */
+const DEFAULT_WORKFLOW_NAME = 'default'
+
+/** Ensure `comfyui.workflows.default` exists so the default routes resolve (§18). Leaves an
+ *  already-configured `default` (or a null comfyui) untouched. */
+function seedDefaultWorkflow(comfy: ConfigUpdate['comfyui']): ConfigUpdate['comfyui'] {
+  if (comfy === null) return null
+  if (Object.hasOwn(comfy.workflows, DEFAULT_WORKFLOW_NAME)) return comfy
+  return {
+    ...comfy,
+    workflows: {
+      ...comfy.workflows,
+      [DEFAULT_WORKFLOW_NAME]: { file: 'default.json', label: 'Default' },
+    },
   }
 }
 

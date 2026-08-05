@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineConfig, devices } from '@playwright/test'
-import { E2E_MOCK_LLM_PORT, E2E_PORT, E2E_URL } from './e2e/util'
+import { E2E_MOCK_COMFY_PORT, E2E_MOCK_LLM_PORT, E2E_PORT, E2E_URL } from './e2e/util'
 
 /**
  * Playwright e2e config (docs/09-testing.md §6.1) — Windows-portable by construction:
@@ -43,6 +43,10 @@ export default defineConfig({
       // both lanes at it; the fixed port lets specs script POST /__mock/scenario.
       COWRITE_MOCK_LLM: '1',
       MOCK_LLM_PORT: String(E2E_MOCK_LLM_PORT),
+      // Stage 5 (docs/08 §11, 09 §2.3): the in-process mock ComfyUI boots alongside the
+      // mock LLM under the same flag; a fixed port lets illustration specs script its
+      // `/__mock/scenario` (timing, rejectSubmit, executionError) the same way.
+      MOCK_COMFY_PORT: String(E2E_MOCK_COMFY_PORT),
     },
     url: `${E2E_URL}/api/health`, // readiness probe (docs/03-api.md §3.12)
     reuseExistingServer: false,

@@ -144,7 +144,10 @@ export const MockComfyStep = z.object({      // one POST /prompt job
     z.object({ type: z.literal("rejectSubmit"), nodeErrors: z.record(z.string(), z.unknown()) }),
     z.object({ type: z.literal("executionError"), nodeId: z.string(), message: z.string() }),
     z.object({ type: z.literal("dropWs") }),                   // forces the /history polling path
-    z.object({ type: z.literal("hang"), forMs: z.number() }),
+    z.object({ type: z.literal("hang"), ms: z.number().optional() }), // delay execution_start by
+                                                              // `ms` (default 0), then hang
+                                                              // indefinitely — /interrupt or
+                                                              // /queue {delete} is the only exit
   ]),
 });
 ```
@@ -176,8 +179,8 @@ await request.post("/__mock/llm/enqueue", { data: scenarioJson });
 | Export | Transport | Tier | Notes |
 |---|---|---|---|
 | `FakeLlmClient(scenario)` | none — implements 05's `LlmClient` directly | pure unit (runner loop, tag parser, retry ladder, abort propagation) | same `MockStep` schema; deltas can be re-chunked at arbitrary boundaries for split-anywhere parser tests |
-| `createMockLlm()` | Fastify on an ephemeral port; `POST /v1/chat/completions` (SSE streaming, `stream_options.include_usage`), `GET /v1/models` (config probe target, 03 §3.12) | integration, e2e, manual | one server, both lanes: tests configure `models.high.model = "mock-high"`, `models.low.model = "mock-low"` so routing is assertable via `match.model` |
-| `createMockComfy()` | Fastify + `ws` on an ephemeral port; the full 08 §2.1 subset: `/prompt`, `/ws`, `/history/:id`, `/view`, `/system_stats`, `/interrupt`, `/queue` delete | integration, e2e, manual | honors interrupt/dequeue (emits `execution_interrupted`); serves fixture PNGs |
+| `createMockLlm()` | `node:http` on an ephemeral port; `POST /v1/chat/completions` (SSE streaming, `stream_options.include_usage`), `GET /v1/models` (config probe target, 03 §3.12) | integration, e2e, manual | one server, both lanes: tests configure `models.high.model = "mock-high"`, `models.low.model = "mock-low"` so routing is assertable via `match.model` |
+| `createMockComfy()` | `node:http` + `ws` on an ephemeral port; the full 08 §2.1 subset: `/prompt`, `/ws`, `/history/:id`, `/view`, `/system_stats`, `/interrupt`, `/queue` delete | integration, e2e, manual | honors interrupt/dequeue (emits `execution_interrupted`); serves fixture PNGs. `createMockComfy({ autoSucceed: true })` is an opt-in: an unscripted `POST /prompt` on an empty queue renders a plain always-succeed image instead of failing loudly — the demo/e2e posture (`pnpm mock:comfy`, `--mock`), never the hermetic-test default, which keeps the strict "unmatched request is a bug" behavior |
 
 ### 2.4 Wiring per tier
 
